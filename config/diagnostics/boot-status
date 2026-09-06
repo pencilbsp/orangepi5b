@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+mkdir -p /run/issue.d
+{
+ printf 'Orange Pi 5B boot diagnostic — Ubuntu 26.04\n'
+ printf 'Kernel: %s\n' "$(uname -r)"
+ printf 'Ethernet IPv4 addresses:\n'
+ ip -4 -o address show scope global | awk '{print "  " $2 ": " $4}'
+ printf 'SSH service: '
+ systemctl is-active ssh.service || true
+ printf 'SSH listeners:\n'
+ ss -H -ltn '( sport = :22 )' 2>/dev/null | awk '{print "  " $0}' || true
+ printf 'Login: ubuntu (initial password: ubuntu; change required)\n'
+} > /run/issue.d/20-orangepi5b.issue
+logger -t orangepi5b-boot 'Userspace reached; updating console network status'

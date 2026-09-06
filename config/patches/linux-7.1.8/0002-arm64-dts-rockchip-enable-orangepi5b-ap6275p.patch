@@ -1,0 +1,111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Orange Pi 5B Builder <builder@localhost>
+Date: Sun, 6 Sep 2026 00:00:00 +0000
+Subject: [PATCH] arm64: dts: rockchip: enable Orange Pi 5B AP6275P
+
+Orange Pi 5B carries an AP6275P wireless module. The Wi-Fi side is a
+BCM43752 device on RK3588S PCIe 2.0 lane 2; the Bluetooth side is a
+BCM4362A2 controller wired to UART9.
+
+Describe the board wiring so the upstream brcmfmac PCIe driver and hci_bcm
+serdev path can bind without a board-specific hciattach service.
+---
+ arch/arm64/boot/dts/rockchip/rk3588s-orangepi-5b.dts | 85 ++++++++++++++++++++
+ 1 file changed, 85 insertions(+)
+
+--- a/arch/arm64/boot/dts/rockchip/rk3588s-orangepi-5b.dts	2026-08-09 18:26:58.000000000 +0000
++++ b/arch/arm64/boot/dts/rockchip/rk3588s-orangepi-5b.dts	2026-09-06 10:41:11.433435253 +0000
+@@ -12,8 +12,93 @@
+ 		mmc0 = &sdhci;
+ 		mmc1 = &sdmmc;
+ 	};
++
++	vcc3v3_pcie20: regulator-vcc3v3-pcie20 {
++		compatible = "regulator-fixed";
++		regulator-name = "vcc3v3_pcie20";
++		regulator-boot-on;
++		regulator-always-on;
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		startup-delay-us = <50000>;
++		vin-supply = <&vcc_3v3_s3>;
++	};
++};
++
++&pinctrl {
++	pcfg_input_enable: pcfg-input-enable {
++		bias-disable;
++		input-enable;
++	};
++
++	wireless-bluetooth {
++		bt_reset_pin: bt-reset-pin {
++			rockchip,pins = <3 RK_PA6 RK_FUNC_GPIO &pcfg_pull_none>;
++		};
++
++		bt_wake_pin: bt-wake-pin {
++			rockchip,pins = <0 RK_PC6 RK_FUNC_GPIO &pcfg_pull_up>;
++		};
++
++		bt_wake_host_irq: bt-wake-host-irq {
++			rockchip,pins = <0 RK_PC5 RK_FUNC_GPIO &pcfg_input_enable>;
++		};
++	};
+ };
+ 
+ &sdhci {
+ 	status = "okay";
+ };
++
++&pcie2x1l2 {
++	reset-gpios = <&gpio3 RK_PD1 GPIO_ACTIVE_HIGH>;
++	vpcie3v3-supply = <&vcc3v3_pcie20>;
++	status = "okay";
++
++	pcie@0,0 {
++		reg = <0x400000 0 0 0 0>;
++		#address-cells = <3>;
++		#size-cells = <2>;
++		ranges;
++		device_type = "pci";
++		bus-range = <0x40 0x4f>;
++
++		wifi: wifi@0,0 {
++			compatible = "pci14e4,449d";
++			reg = <0x410000 0 0 0 0>;
++			clocks = <&hym8563>;
++			clock-names = "lpo";
++		};
++	};
++};
++
++&gpio0 {
++	wifi-reg-on-h {
++		gpio-hog;
++		gpios = <RK_PD0 GPIO_ACTIVE_HIGH>;
++		output-high;
++		line-name = "wifi-reg-on-h";
++	};
++};
++
++&uart9 {
++	pinctrl-names = "default";
++	pinctrl-0 = <&uart9m2_xfer &uart9m2_ctsn &uart9m2_rtsn>;
++	status = "okay";
++
++	bluetooth {
++		compatible = "brcm,bcm43438-bt";
++		clocks = <&hym8563>;
++		clock-names = "lpo";
++		interrupt-parent = <&gpio0>;
++		interrupts = <RK_PC5 IRQ_TYPE_LEVEL_HIGH>;
++		interrupt-names = "host-wakeup";
++		device-wakeup-gpios = <&gpio0 RK_PC6 GPIO_ACTIVE_HIGH>;
++		shutdown-gpios = <&gpio3 RK_PA6 GPIO_ACTIVE_HIGH>;
++		max-speed = <1500000>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&bt_wake_host_irq &bt_wake_pin &bt_reset_pin>;
++		vbat-supply = <&vcc_3v3_s3>;
++		vddio-supply = <&vcc_1v8_s3>;
++	};
++};

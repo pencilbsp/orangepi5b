@@ -1,0 +1,11 @@
+[Unit]
+Description=Expand Orange Pi 5B root filesystem
+After=local-fs.target
+ConditionVirtualization=!container
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/orangepi5b/orangepi5b-grow-rootfs
+
+[Install]
+WantedBy=multi-user.target

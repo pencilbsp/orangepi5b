@@ -1,0 +1,6 @@
+[Unit]
+Description=Record Orange Pi 5B userspace and network status
+After=systemd-networkd.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/orangepi5b-boot-status

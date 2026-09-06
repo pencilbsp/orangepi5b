@@ -1,0 +1,17 @@
+# Build artifacts and generated images
+/build/
+/cache/
+/output/
+/sources/
+/*.log
+/*.log.*
+/output/**/*.img
+/output/**/*.img.xz
+
+# Local reference material, not required by build scripts
+/*.pdf
+
+# Local editor/OS noise
+.DS_Store
+*.swp
+*~

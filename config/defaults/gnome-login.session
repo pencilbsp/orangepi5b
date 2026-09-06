@@ -1,0 +1,13 @@
+# Overrides /usr/share/gnome-session/sessions/gnome-login.session for the GDM
+# greeter only: the greeter's XDG_DATA_DIRS puts /usr/share/gdm/greeter first,
+# so this copy wins there and the stock file still applies everywhere else.
+#
+# org.gnome.SettingsDaemon.Sharing is dropped. It segfaults on every greeter
+# start on this board -- a NetworkManager callback reaches
+# g_desktop_app_info_launch_uris_as_manager() and dies inside it -- and being a
+# RequiredComponent, gnome-session respawns it about a dozen times per boot.
+# A login screen has no user whose sharing services need managing, so the only
+# thing lost is the crash.
+[GNOME Session]
+Name=Display Manager
+RequiredComponents=org.gnome.Shell;org.gnome.SettingsDaemon.A11ySettings;org.gnome.SettingsDaemon.Color;org.gnome.SettingsDaemon.Datetime;org.gnome.SettingsDaemon.Housekeeping;org.gnome.SettingsDaemon.Keyboard;org.gnome.SettingsDaemon.MediaKeys;org.gnome.SettingsDaemon.Power;org.gnome.SettingsDaemon.PrintNotifications;org.gnome.SettingsDaemon.Rfkill;org.gnome.SettingsDaemon.ScreensaverProxy;org.gnome.SettingsDaemon.Smartcard;org.gnome.SettingsDaemon.Sound;org.gnome.SettingsDaemon.Wacom;

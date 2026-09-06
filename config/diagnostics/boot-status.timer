@@ -1,0 +1,8 @@
+[Unit]
+Description=Refresh console IP addresses
+[Timer]
+OnBootSec=10s
+OnUnitActiveSec=30s
+Unit=orangepi5b-boot-status.service
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,41 @@
+#!/bin/sh
+
+set -eu
+
+root_source="$(findmnt -n -o SOURCE /)"
+case "${root_source}" in
+	/dev/*) ;;
+	*) exit 0 ;;
+esac
+
+# lsblk pads its output, and growpart rejects a partition number that carries
+# whitespace ("partition-number must be a number"), so strip it.
+parent="$(lsblk -n -o PKNAME "${root_source}" | head -n 1 | tr -d '[:space:]')"
+partition="$(lsblk -n -o PARTN "${root_source}" | head -n 1 | tr -d '[:space:]')"
+
+if [ -z "${parent}" ] || [ -z "${partition}" ]; then
+	exit 0
+fi
+
+# On every boot after the first the partition already fills the disk, which is
+# not an error. growpart reports that as NOCHANGE but its exit status for it is
+# not consistent across versions (0.33 returns 1), so match the message rather
+# than the code. A real failure has to surface: discarding it once left a board
+# running on the 8 GB the image was written with, on a 64 GB eMMC, while the
+# unit still reported success.
+status=0
+output="$(growpart "/dev/${parent}" "${partition}" 2>&1)" || status=$?
+
+case "${output}" in
+*NOCHANGE*)
+	;;
+*)
+	if [ "${status}" -ne 0 ]; then
+		echo "growpart /dev/${parent} ${partition} failed:" >&2
+		echo "${output}" >&2
+		exit 1
+	fi
+	;;
+esac
+
+resize2fs "${root_source}"
