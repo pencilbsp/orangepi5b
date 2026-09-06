@@ -10,6 +10,7 @@ Mục tiêu của dự án này là một image mới, gọn và dễ kiểm ch�
 - SSH bật sẵn và SSH host keys được sinh lại trên thiết bị khi boot; tài khoản người dùng được tạo bằng GNOME Initial Setup ở lần boot đầu.
 - Panthor/Mali firmware được ship qua `linux-firmware-misc`; kernel bật firmware loader `.zst` để GNOME Wayland có render node ngay từ boot.
 - AP6275P Wi-Fi/Bluetooth được bật bằng DT board patch, firmware Broadcom riêng và BlueZ/NetworkManager userspace.
+- Ptyxis là Terminal app duy nhất; `gnome-terminal` bị purge sau khi cài desktop để tránh hai launcher cùng tên.
 
 
 ## Build
@@ -68,6 +69,10 @@ Image không embed tài khoản người dùng mặc định. GDM bật
 
 SSH service vẫn được bật và host keys vẫn được sinh lại khi boot, nhưng SSH chỉ
 login được sau khi wizard đã tạo tài khoản người dùng.
+
+## Package trim profile
+
+`config/boot.packages` là danh sách package cần cài. Sau khi desktop package đã resolve dependency/recommends, `scripts/install-rootfs.sh` purge thêm các package trong `config/boot.purge-packages`. Hiện tại danh sách này bỏ `gnome-terminal`/`gnome-terminal-data` vì Ubuntu 26.04 desktop-minimal đã kéo `ptyxis`, và `ptyxis` cung cấp `x-terminal-emulator`.
 
 ## Kernel slim profile
 

@@ -42,6 +42,10 @@ mkdir -p "$ROOT/cache/debs"
 shopt -s nullglob
 cp "$R"/var/cache/apt/archives/*.deb "$ROOT/cache/debs/" || true
 chroot "$R" apt-get -y --no-install-suggests install "${packages[@]}"
+mapfile -t purge_packages < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$ROOT/config/boot.purge-packages")
+if ((${#purge_packages[@]})); then
+  chroot "$R" apt-get -y purge "${purge_packages[@]}"
+fi
 # Minimal board settings for this GNOME boot/display baseline.
 install -D -m 0644 "$ROOT/config/rootfs/orangepi5b-display.conf" "$R/usr/share/initramfs-tools/modules.d/orangepi5b-display.conf"
 install -D -m 0644 "$ROOT/config/rootfs/orangepi5b-ap6275p.conf" "$R/usr/lib/modules-load.d/orangepi5b-ap6275p.conf"

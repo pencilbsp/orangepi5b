@@ -1,0 +1,5 @@
+# Packages pulled in by ubuntu-desktop-minimal/recommends but not shipped in
+# this Orange Pi 5B desktop baseline.
+# Ptyxis is kept as the single Terminal app and provides x-terminal-emulator.
+gnome-terminal
+gnome-terminal-data
