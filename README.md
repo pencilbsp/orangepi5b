@@ -72,7 +72,7 @@ login được sau khi wizard đã tạo tài khoản người dùng.
 
 ## Package trim profile
 
-`config/boot.packages` là danh sách package cần cài. Sau khi desktop package đã resolve dependency/recommends, `scripts/install-rootfs.sh` purge thêm các package trong `config/boot.purge-packages`. Hiện tại danh sách này bỏ `gnome-terminal`/`gnome-terminal-data` vì Ubuntu 26.04 desktop-minimal đã kéo `ptyxis`, và `ptyxis` cung cấp `x-terminal-emulator`.
+`config/boot.packages` là danh sách package cần cài. Sau khi desktop package đã resolve dependency/recommends, `scripts/install-rootfs.sh` purge thêm các package trong `config/boot.purge-packages`. Hiện tại danh sách này bỏ `gnome-terminal`/`gnome-terminal-data` vì Ubuntu 26.04 desktop-minimal đã kéo `ptyxis`, và `ptyxis` cung cấp `x-terminal-emulator`. Cuối bước rootfs, script chạy `apt-get clean` và xoá apt lists/pkgcache để không ship cache build vào image runtime.
 
 ## Kernel slim profile
 

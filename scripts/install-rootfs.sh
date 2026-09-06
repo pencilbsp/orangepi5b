@@ -157,6 +157,11 @@ fi
 chroot "$R" systemctl set-default graphical.target
 chroot "$R" systemctl enable gdm3 NetworkManager ssh.service bluetooth.service orangepi5b-boot-status.timer orangepi5b-grow-rootfs.service || true
 chroot "$R" dpkg-query -W '-f=${binary:Package}\t${Version}\n' > "$ROOT/output/packages.tsv"
+# The host keeps downloaded debs in cache/debs. Do not ship apt build caches
+# inside the runtime image; compressed .deb files barely shrink further in .xz.
+chroot "$R" apt-get clean
+rm -rf "$R/var/cache/apt/archives/partial"/* "$R/var/lib/apt/lists"/*
+rm -f "$R/var/cache/apt/pkgcache.bin" "$R/var/cache/apt/srcpkgcache.bin"
 rm -f "$R/usr/sbin/policy-rc.d" "$R/usr/bin/qemu-aarch64-static"
 : > "$R/etc/machine-id"
 rm -f "$R/var/lib/dbus/machine-id"
