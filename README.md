@@ -73,9 +73,9 @@ login được sau khi wizard đã tạo tài khoản người dùng.
 
 Build dùng `config/kernel-slim.disable` để cắt bớt driver không cần cho baseline Orange Pi 5B desktop:
 
-- Giữ Rockchip boot/storage, onboard LAN STMMAC/Motorcomm, USB, HDMI/DRM Rockchip, Panthor GPU, Rockchip media codecs/RGA và Broadcom Wi-Fi family.
-- Tắt các vendor Ethernet/WLAN khác, tuner/DVB/radio/SDR, GPU/DRM/bridge/panel không liên quan, XEN/CXL/Infiniband, filesystem cổ/cluster và test/debug suites.
-- Build script có guard để fail sớm nếu mất driver bắt buộc hoặc nếu vendor/panel thừa bị bật lại ngoài ý muốn.
+- Giữ Rockchip boot/storage, onboard LAN STMMAC/Motorcomm, USB host/storage/HID, USB-C/Type-C FUSB302, HDMI/DRM Rockchip, Panthor GPU, Rockchip media codecs/RGA, Broadcom Wi-Fi/Bluetooth, HDMI/ES8328/USB/Bluetooth audio và RTC HYM8563/RK808.
+- Tắt các ARM64 platform family ngoài Rockchip, vendor Ethernet/WLAN khác, tuner/DVB/radio/SDR, camera CSI/HDMI-RX capture, VM/VFIO/KVM/virtio leaf drivers, ChromeOS EC, GNSS, SAS/server storage, GPU/DRM/bridge/panel không liên quan, XEN/CXL/Infiniband, filesystem cổ/cluster và test/debug suites.
+- Build script có guard để fail sớm nếu mất driver bắt buộc hoặc nếu vendor/panel/audio/RTC/PHY thừa bị bật lại ngoài ý muốn.
 
 ## Patch policy
 

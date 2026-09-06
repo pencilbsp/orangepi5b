@@ -77,6 +77,38 @@ disable_enabled_group DRM_PANEL_ \
  DRM_PANEL_EDP \
  DRM_PANEL_BRIDGE \
  DRM_PANEL_ORIENTATION_QUIRKS
+disable_enabled_group SND_SOC_ \
+ SND_SOC_GENERIC_DMAENGINE_PCM \
+ SND_SOC_COMPRESS \
+ SND_SOC_TOPOLOGY \
+ SND_SOC_USB \
+ SND_SOC_I2C_AND_SPI \
+ SND_SOC_ROCKCHIP_I2S \
+ SND_SOC_ROCKCHIP_I2S_TDM \
+ SND_SOC_ROCKCHIP_SAI \
+ SND_SOC_ROCKCHIP_SPDIF \
+ SND_SOC_BT_SCO \
+ SND_SOC_HDMI_CODEC \
+ SND_SOC_ES8328 \
+ SND_SOC_ES8328_I2C \
+ SND_SOC_SIMPLE_AMPLIFIER \
+ SND_SOC_SIMPLE_MUX \
+ SND_SOC_SPDIF
+disable_enabled_group RTC_DRV_ \
+ RTC_DRV_HYM8563 \
+ RTC_DRV_RK808
+disable_enabled_group PHY_ \
+ PHY_PACKAGE \
+ PHY_ROCKCHIP_EMMC \
+ PHY_ROCKCHIP_INNO_HDMI \
+ PHY_ROCKCHIP_INNO_USB2 \
+ PHY_ROCKCHIP_INNO_DSIDPHY \
+ PHY_ROCKCHIP_NANENG_COMBO_PHY \
+ PHY_ROCKCHIP_PCIE \
+ PHY_ROCKCHIP_SAMSUNG_HDPTX \
+ PHY_ROCKCHIP_SNPS_PCIE3 \
+ PHY_ROCKCHIP_TYPEC \
+ PHY_ROCKCHIP_USBDP
 
 # Re-assert Orange Pi 5B essentials after the slim profile so an accidental
 # future disable entry fails safely instead of producing a silent black screen.
@@ -102,6 +134,18 @@ disable_enabled_group DRM_PANEL_ \
  --module BT_RFCOMM \
  --module BT_BNEP \
  --module BT_HIDP \
+ --module SND_USB_AUDIO \
+ --module SND_SIMPLE_CARD \
+ --module SND_AUDIO_GRAPH_CARD \
+ --module SND_SOC_ROCKCHIP_I2S \
+ --module SND_SOC_ROCKCHIP_I2S_TDM \
+ --module SND_SOC_HDMI_CODEC \
+ --module SND_SOC_ES8328 \
+ --module SND_SOC_ES8328_I2C \
+ --module SND_SOC_SIMPLE_AMPLIFIER \
+ --module SND_SOC_BT_SCO \
+ --module RTC_DRV_HYM8563 \
+ --module RTC_DRV_RK808 \
  --enable DRM \
  --module DRM_ROCKCHIP \
  --module DRM_DW_HDMI_QP \
@@ -138,8 +182,20 @@ done
 for symbol in BRCMFMAC_PCIE BT_HCIUART_SERDEV BT_HCIUART_H4 BT_HCIUART_BCM; do
  grep -qx "CONFIG_${symbol}=y" "$K/.config" || { echo "Required AP6275P bus/protocol support missing: $symbol"; exit 1; }
 done
+for symbol in SND_USB_AUDIO SND_SIMPLE_CARD SND_AUDIO_GRAPH_CARD SND_SOC_ROCKCHIP_I2S SND_SOC_ROCKCHIP_I2S_TDM SND_SOC_HDMI_CODEC SND_SOC_ES8328 SND_SOC_ES8328_I2C SND_SOC_SIMPLE_AMPLIFIER SND_SOC_BT_SCO; do
+ grep -Eq "^CONFIG_${symbol}=[ym]$" "$K/.config" || { echo "Required audio driver missing: $symbol"; exit 1; }
+done
+for symbol in RTC_DRV_HYM8563 RTC_DRV_RK808; do
+ grep -Eq "^CONFIG_${symbol}=[ym]$" "$K/.config" || { echo "Required RTC/PMIC driver missing: $symbol"; exit 1; }
+done
 for symbol in FW_LOADER_COMPRESS FW_LOADER_COMPRESS_ZSTD; do
  grep -qx "CONFIG_${symbol}=y" "$K/.config" || { echo "Required compressed firmware support missing: $symbol"; exit 1; }
+done
+for symbol in SND_HDA DRM_NOUVEAU DRM_PANFROST DRM_POWERVR KVM VFIO CORESIGHT GNSS CHROME_PLATFORMS CROS_EC SCSI_HISI_SAS SCSI_MPT3SAS VIDEO_SYNOPSYS_HDMIRX VIDEO_CADENCE_CSI2RX VIDEO_ROCKCHIP_CIF KEYBOARD_ATKBD HW_RANDOM_VIRTIO RPMSG_VIRTIO; do
+ if grep -Eq "^CONFIG_${symbol}=[ym]$" "$K/.config"; then
+  echo "Unexpected driver left enabled in slim image: $symbol"
+  exit 1
+ fi
 done
 if grep -Eq '^CONFIG_DEBUG_INFO=[ym]$' "$K/.config"; then
  echo "Debug info should be disabled in slim image"
