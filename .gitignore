@@ -15,3 +15,9 @@
 .DS_Store
 *.swp
 *~
+
+# Spike build products, not part of the image
+/spike/**/out/
+
+# Board connection details, contains credentials
+/target.json

@@ -1,0 +1,1378 @@
+RK3588S Orange Pi 5B HDMI Fixed Rate Link support.
+
+Upstream drives the RK3588 HDMI TX over TMDS only, which caps the link at a
+600 MHz character rate. Everything past that is refused before it reaches the
+driver, so 4K60 at 10 bpc (742.5 MHz) and 4K120 in any full-chroma format are
+simply absent from the mode list.
+
+Rockchip's own kernel runs this exact board at 4K120 4:4:4 over FRL, so the
+ceiling is a software one. This adds the missing link:
+
+  - drm_hdmi_state_helper: let a mode past the TMDS ceiling when both ends can
+    carry it over FRL, and pick the slowest standard FRL rate that fits. The
+    vendor driver instead always requests the sink maximum and then clamps the
+    result to 40 Gbps; choosing by payload keeps link margin and still allows
+    FRL6 for modes that genuinely need it, such as 4K120 at 10 bpc, which wants
+    40.1 Gbps and so does not fit the vendor ceiling at all.
+  - drm_bridge/drm_connector: carry the source side FRL capability.
+  - dw-hdmi-qp: FRL op mode, HDMI 2.1 link training (LTS1..LTS3 and LTSP with
+    the FRL_START handshake), and TxFFE stepping when the sink asks for more
+    equalisation.
+  - dw_hdmi_qp-rockchip: choose TMDS or FRL during atomic_check, program the
+    PHY accordingly, and drive the RK3588 GRF HDMI21 bit.
+  - phy-rockchip-samsung-hdptx: apply TxFFE on the FRL lane setup.
+
+Ordering matters and is taken from the vendor driver: the controller enters FRL
+op mode before the PHY is powered, and link training runs only after the mode
+is fully programmed. Training against a half configured pipeline reaches "all
+lanes trained" and then the sink asks to retrain forever, with no picture.
+
+Bringing the link back up after the display has blanked needs more patience
+than a first-time modeset, and that took several rounds to get right:
+
+  - A sink leaving standby takes seconds to answer DDC at all. SCDC reads fail
+    outright or report version 0 until it is awake, so training waits for it.
+  - It then answers SCDC well before it will agree to be trained. One measured
+    wake replied to LTS1 immediately and raised FLT_ready only five seconds
+    after the PHY began sending, hence the eight second LTS2 wait.
+  - DDC keeps glitching for a while after the first successful reply, so the
+    SCDC transfers retry rather than failing a whole round over one EIO.
+  - Training therefore runs from a worker, not from atomic_enable, which would
+    otherwise stall the modeset for the whole wait. The worker retries a failed
+    bring-up: without that, one transient failure left the display dark until
+    something else forced a modeset, which is what made a blanked screen
+    impossible to wake.
+
+The worker also watches SCDC for FLT_update once the link is up, which is how a
+sink asks to be retrained after losing lock. Nothing was watching that flag.
+
+diff -Naur '--exclude=.git' '--exclude=*.orig' '--exclude=*.rej' '--exclude=include-prefixes' a/include/linux/phy/phy-hdmi.h b/include/linux/phy/phy-hdmi.h
+--- a/include/linux/phy/phy-hdmi.h
++++ b/include/linux/phy/phy-hdmi.h
+@@ -19,6 +19,8 @@
+  * @tmds_char_rate: HDMI TMDS Character Rate in Hertz.
+  * @frl.rate_per_lane: HDMI FRL Rate per Lane in Gbps.
+  * @frl.lanes: HDMI FRL lanes count.
++ * @frl.ffe_lv: HDMI FRL TxFFE level, 0-3.
++ * @frl.ffe_mode: HDMI FRL TxFFE enables, BIT(0) pre-shoot, BIT(1) de-emphasis.
+  *
+  * This structure is used to represent the configuration state of a HDMI phy.
+  */
+@@ -29,6 +31,8 @@
+ 		struct {
+ 			u8 rate_per_lane;
+ 			u8 lanes;
++			u8 ffe_lv;
++			u8 ffe_mode;
+ 		} frl;
+ 	};
+ };
+diff -Naur '--exclude=.git' '--exclude=*.orig' '--exclude=*.rej' '--exclude=include-prefixes' a/include/drm/drm_bridge.h b/include/drm/drm_bridge.h
+--- a/include/drm/drm_bridge.h
++++ b/include/drm/drm_bridge.h
+@@ -1202,6 +1202,12 @@
+ 	unsigned int max_bpc;
+ 
+ 	/**
++	 * @max_frl_rate_per_lane: Maximum HDMI FRL rate per lane the bridge
++	 * can drive, in Gbps. Zero for TMDS-only bridges.
++	 */
++	unsigned int max_frl_rate_per_lane;
++
++	/**
+ 	 * @hdmi_cec_dev: device to be used as a containing device for CEC
+ 	 * functions.
+ 	 */
+diff -Naur '--exclude=.git' '--exclude=*.orig' '--exclude=*.rej' '--exclude=include-prefixes' a/include/drm/drm_connector.h b/include/drm/drm_connector.h
+--- a/include/drm/drm_connector.h
++++ b/include/drm/drm_connector.h
+@@ -1945,6 +1945,13 @@
+ 	unsigned long supported_formats;
+ 
+ 	/**
++	 * @max_frl_rate_per_lane: Maximum FRL rate per lane the source can
++	 * drive, in Gbps. Zero means the source is TMDS only, which makes
++	 * @drm_display_info.max_tmds_clock a hard ceiling on the pixel clock.
++	 */
++	unsigned int max_frl_rate_per_lane;
++
++	/**
+ 	 * @funcs: HDMI connector Control Functions
+ 	 */
+ 	const struct drm_connector_hdmi_funcs *funcs;
+diff -Naur '--exclude=.git' '--exclude=*.orig' '--exclude=*.rej' '--exclude=include-prefixes' a/include/drm/display/drm_hdmi_state_helper.h b/include/drm/display/drm_hdmi_state_helper.h
+--- a/include/drm/display/drm_hdmi_state_helper.h
++++ b/include/drm/display/drm_hdmi_state_helper.h
+@@ -30,4 +30,10 @@
+ drm_hdmi_connector_mode_valid(struct drm_connector *connector,
+ 			      const struct drm_display_mode *mode);
+ 
++unsigned long long drm_hdmi_frl_link_rate(const struct drm_connector *connector);
++unsigned long long drm_hdmi_frl_payload_rate(unsigned long long tmds_char_rate);
++int drm_hdmi_frl_select_rate(const struct drm_connector *connector,
++			     unsigned long long tmds_char_rate,
++			     u8 *lanes, u8 *rate_per_lane);
++
+ #endif // DRM_HDMI_STATE_HELPER_H_
+diff -Naur '--exclude=.git' '--exclude=*.orig' '--exclude=*.rej' '--exclude=include-prefixes' a/include/drm/bridge/dw_hdmi_qp.h b/include/drm/bridge/dw_hdmi_qp.h
+--- a/include/drm/bridge/dw_hdmi_qp.h
++++ b/include/drm/bridge/dw_hdmi_qp.h
+@@ -7,6 +7,8 @@
+ #ifndef __DW_HDMI_QP__
+ #define __DW_HDMI_QP__
+ 
++#include <linux/types.h>
++
+ struct device;
+ struct drm_encoder;
+ struct dw_hdmi_qp;
+@@ -17,6 +19,12 @@
+ 	void (*disable)(struct dw_hdmi_qp *hdmi, void *data);
+ 	enum drm_connector_status (*read_hpd)(struct dw_hdmi_qp *hdmi, void *data);
+ 	void (*setup_hpd)(struct dw_hdmi_qp *hdmi, void *data);
++	/*
++	 * Adjust the transmit FFE while the link is up. Called from FRL link
++	 * training when the sink asks for more equalisation.
++	 */
++	void (*set_ffe)(struct dw_hdmi_qp *hdmi, void *data, u8 ffe_lv,
++			u8 ffe_mode);
+ };
+ 
+ struct dw_hdmi_qp_plat_data {
+@@ -29,6 +37,8 @@
+ 	unsigned int supported_formats;
+ 	/* Maximum bits per color channel: 8, 10 or 12 */
+ 	unsigned int max_bpc;
++	/* Maximum FRL rate per lane in Gbps, 0 for TMDS only */
++	unsigned int max_frl_rate_per_lane;
+ };
+ 
+ struct dw_hdmi_qp *dw_hdmi_qp_bind(struct platform_device *pdev,
+@@ -36,4 +46,10 @@
+ 				   const struct dw_hdmi_qp_plat_data *plat_data);
+ void dw_hdmi_qp_suspend(struct device *dev, struct dw_hdmi_qp *hdmi);
+ void dw_hdmi_qp_resume(struct device *dev, struct dw_hdmi_qp *hdmi);
++
++/*
++ * FRL bring-up spike. Not part of the normal modeset path: the platform glue
++ * calls this from a sysfs trigger after it has switched the PHY to FRL mode.
++ * Returns 0 when link training reaches LTSP, a negative errno otherwise.
++ */
+ #endif /* __DW_HDMI_QP__ */
+diff -Naur '--exclude=.git' '--exclude=*.orig' '--exclude=*.rej' '--exclude=include-prefixes' a/drivers/gpu/drm/display/drm_bridge_connector.c b/drivers/gpu/drm/display/drm_bridge_connector.c
+--- a/drivers/gpu/drm/display/drm_bridge_connector.c
++++ b/drivers/gpu/drm/display/drm_bridge_connector.c
+@@ -986,6 +986,9 @@
+ 					       max_bpc);
+ 		if (ret)
+ 			return ERR_PTR(ret);
++
++		connector->hdmi.max_frl_rate_per_lane =
++			bridge_connector->bridge_hdmi->max_frl_rate_per_lane;
+ 	} else {
+ 		ret = drmm_connector_init(drm, connector,
+ 					  &drm_bridge_connector_funcs,
+diff -Naur '--exclude=.git' '--exclude=*.orig' '--exclude=*.rej' '--exclude=include-prefixes' a/drivers/gpu/drm/display/drm_hdmi_state_helper.c b/drivers/gpu/drm/display/drm_hdmi_state_helper.c
+--- a/drivers/gpu/drm/display/drm_hdmi_state_helper.c
++++ b/drivers/gpu/drm/display/drm_hdmi_state_helper.c
+@@ -547,6 +547,104 @@
+ 	return false;
+ }
+ 
++/**
++ * drm_hdmi_frl_link_rate - FRL rate usable between this source and sink
++ * @connector: connector to query
++ *
++ * Returns the aggregate FRL bandwidth in bits per second that both ends can
++ * sustain, or 0 when either end is TMDS only.
++ */
++unsigned long long drm_hdmi_frl_link_rate(const struct drm_connector *connector)
++{
++	const struct drm_hdmi_info *sink = &connector->display_info.hdmi;
++	unsigned int rate_per_lane;
++
++	if (!connector->hdmi.max_frl_rate_per_lane)
++		return 0;
++
++	if (!sink->max_lanes || !sink->max_frl_rate_per_lane)
++		return 0;
++
++	rate_per_lane = min_t(unsigned int, sink->max_frl_rate_per_lane,
++			      connector->hdmi.max_frl_rate_per_lane);
++
++	return (unsigned long long)sink->max_lanes * rate_per_lane * 1000000000ULL;
++}
++EXPORT_SYMBOL(drm_hdmi_frl_link_rate);
++
++/**
++ * drm_hdmi_frl_payload_rate - FRL bandwidth a TMDS character rate needs
++ * @tmds_char_rate: character rate the mode would need on a TMDS link
++ *
++ * A TMDS character period carries 24 bits of pixel data, and FRL wraps that in
++ * 16b/18b coding, so the link has to carry an eighth more than the raw payload.
++ */
++unsigned long long drm_hdmi_frl_payload_rate(unsigned long long tmds_char_rate)
++{
++	return DIV_ROUND_UP_ULL(tmds_char_rate * 24 * 18, 16);
++}
++EXPORT_SYMBOL(drm_hdmi_frl_payload_rate);
++
++/* HDMI 2.1 FRL rates, ascending. */
++static const struct {
++	u8 lanes;
++	u8 rate_per_lane;
++} drm_hdmi_frl_rates[] = {
++	{ 3,  3 },	/* FRL1,  9 Gbps */
++	{ 3,  6 },	/* FRL2, 18 Gbps */
++	{ 4,  6 },	/* FRL3, 24 Gbps */
++	{ 4,  8 },	/* FRL4, 32 Gbps */
++	{ 4, 10 },	/* FRL5, 40 Gbps */
++	{ 4, 12 },	/* FRL6, 48 Gbps */
++};
++
++/**
++ * drm_hdmi_frl_select_rate - pick an FRL configuration for a mode
++ * @connector: connector the mode will run on
++ * @tmds_char_rate: character rate the mode would need on a TMDS link
++ * @lanes: filled with the lane count to train
++ * @rate_per_lane: filled with the per-lane rate in Gbps
++ *
++ * Chooses the slowest standard FRL rate that carries the payload and that both
++ * ends support. Running no faster than necessary keeps link margin, which is
++ * the opposite of what the vendor driver does: it always asks for the sink's
++ * maximum and then clamps the result to 40 Gbps.
++ *
++ * Returns 0 on success, -ERANGE when no supported rate is fast enough.
++ */
++int drm_hdmi_frl_select_rate(const struct drm_connector *connector,
++			     unsigned long long tmds_char_rate,
++			     u8 *lanes, u8 *rate_per_lane)
++{
++	const struct drm_hdmi_info *sink = &connector->display_info.hdmi;
++	unsigned long long needed = drm_hdmi_frl_payload_rate(tmds_char_rate);
++	unsigned int src_max = connector->hdmi.max_frl_rate_per_lane;
++	int i;
++
++	if (!src_max || !sink->max_lanes || !sink->max_frl_rate_per_lane)
++		return -ERANGE;
++
++	for (i = 0; i < ARRAY_SIZE(drm_hdmi_frl_rates); i++) {
++		u8 l = drm_hdmi_frl_rates[i].lanes;
++		u8 r = drm_hdmi_frl_rates[i].rate_per_lane;
++
++		if (l > sink->max_lanes || r > sink->max_frl_rate_per_lane ||
++		    r > src_max)
++			continue;
++
++		if ((unsigned long long)l * r * 1000000000ULL < needed)
++			continue;
++
++		*lanes = l;
++		*rate_per_lane = r;
++
++		return 0;
++	}
++
++	return -ERANGE;
++}
++EXPORT_SYMBOL(drm_hdmi_frl_select_rate);
++
+ static enum drm_mode_status
+ hdmi_clock_valid(const struct drm_connector *connector,
+ 		 const struct drm_display_mode *mode,
+@@ -555,8 +653,17 @@
+ 	const struct drm_connector_hdmi_funcs *funcs = connector->hdmi.funcs;
+ 	const struct drm_display_info *info = &connector->display_info;
+ 
+-	if (info->max_tmds_clock && clock > info->max_tmds_clock * 1000)
+-		return MODE_CLOCK_HIGH;
++	if (info->max_tmds_clock && clock > info->max_tmds_clock * 1000) {
++		unsigned long long frl_rate = drm_hdmi_frl_link_rate(connector);
++
++		/*
++		 * Above the TMDS ceiling the mode is only reachable over a
++		 * Fixed Rate Link. Let it through when both ends can carry the
++		 * payload; the driver still gets the final say below.
++		 */
++		if (!frl_rate || drm_hdmi_frl_payload_rate(clock) > frl_rate)
++			return MODE_CLOCK_HIGH;
++	}
+ 
+ 	if (funcs && funcs->tmds_char_rate_valid) {
+ 		enum drm_mode_status status;
+diff -Naur '--exclude=.git' '--exclude=*.orig' '--exclude=*.rej' '--exclude=include-prefixes' a/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.h b/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.h
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.h
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.h
+@@ -848,4 +848,17 @@
+ #define EARCRX_1_INT_CLEAR				0x4828
+ #define EARCRX_1_INT_FORCE				0x482c
+ 
++/*
++ * Sink-side SCDC offsets used by FRL link training (HDMI 2.1 SCDC map).
++ * Prefixed SCDC_SINK_ to avoid clashing with the controller-side SCDC_*
++ * register block above, which lives at 0x140..0x150.
++ */
++#define SCDC_SINK_CONFIG_1				0x31
++#define SCDC_SINK_STATUS_FLAGS_0_FLT_READY		BIT(6)
++#define SCDC_SINK_UPDATE_0_SOURCE_TEST			BIT(3)
++#define SCDC_SINK_UPDATE_0_FRL_START			BIT(4)
++#define SCDC_SINK_UPDATE_0_FLT_UPDATE			BIT(5)
++#define SCDC_SINK_SOURCE_TEST_CONFIG			0x35
++#define SCDC_SINK_STATUS_FLAGS_2			0x42
++
+ #endif /* __DW_HDMI_QP_H__ */
+diff -Naur '--exclude=.git' '--exclude=*.orig' '--exclude=*.rej' '--exclude=include-prefixes' a/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.c b/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.c
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.c
+@@ -7,7 +7,9 @@
+  * Author: Cristian Ciocaltea <cristian.ciocaltea@collabora.com>
+  */
+ #include <linux/completion.h>
++#include <linux/delay.h>
+ #include <linux/hdmi.h>
++#include <linux/jiffies.h>
+ #include <linux/export.h>
+ #include <linux/i2c.h>
+ #include <linux/irq.h>
+@@ -177,6 +179,17 @@
+ 
+ 	unsigned long tmds_char_rate;
+ 	bool no_hpd;
++
++	/* FRL link training state */
++	bool flt_no_timeout;
++	u8 flt_ffe_lv;
++	u8 frl_lanes;
++	u8 frl_rate_per_lane;
++	bool frl_up;
++	unsigned int frl_attempts;
++	struct delayed_work frl_work;
++	/* Serialises the supervisor against enable/disable */
++	struct mutex frl_lock;
+ };
+ 
+ static void dw_hdmi_qp_write(struct dw_hdmi_qp *hdmi, unsigned int val,
+@@ -904,11 +917,599 @@
+ 	return out_fmts;
+ }
+ 
++/*
++ * FRL bring-up spike.
++ *
++ * Answers exactly one question: can this board train a Fixed Rate Link with
++ * the attached sink?  It implements LTS1..LTS3 of the HDMI 2.1 link training
++ * state machine and stops as soon as the sink reports a pass (LTSP).
++ *
++ * Deliberately not implemented, because the spike does not need them:
++ *   - LTS4, the sink-requested rate change: reported as a failure instead.
++ *   - TxFFE level adjustment: the sink's "raise TxFFE" request is refused,
++ *     which costs link margin but keeps the PHY out of the picture.
++ *   - The LTSP poll loop that watches for the sink dropping the link later.
++ *   - Audio, DSC, and any interaction with the atomic modeset path.
++ *   - Any way back to TMDS. Once this has run, the next atomic_check fails
++ *     with -EINVAL because the PHY is in FRL mode while DRM still asks for a
++ *     TMDS char rate, and the CRTC is torn down. Reboot to recover; do not
++ *     try to undo it by poking the controller, which by then is unclocked.
++ *
++ * The caller (platform glue) is responsible for putting the PHY into FRL
++ * mode and re-powering it before calling in here.
++ */
++
++/*
++ * How much TxFFE headroom we tell the sink we have. Declaring 0 means the sink
++ * has no way to ask for more equalisation, which is fine at 6 Gbps per lane
++ * and fatal above it: the sink simply gives up and resets, taking SCDC with
++ * it. Rockchip's BSP exposes the same value as a per-board DT property.
++ */
++static unsigned int frl_max_ffe_lv = 3;
++module_param(frl_max_ffe_lv, uint, 0644);
++MODULE_PARM_DESC(frl_max_ffe_lv, "FRL max TxFFE level advertised to the sink, 0-3");
++
++/*
++ * A sink leaving standby is slow twice over. It takes seconds to answer DDC at
++ * all, and then answers SCDC well before it will agree to be trained: one
++ * measured wake replied to LTS1 immediately and only raised FLT_ready five
++ * seconds after the PHY began sending. Both waits happen in the worker rather
++ * than in atomic_enable, which would otherwise stall the modeset for all of it.
++ */
++#define FRL_SINK_READY_TIMEOUT_MS	6000
++#define FRL_LTS2_TIMEOUT_MS		8000
++#define FRL_LTS3_TIMEOUT_MS		2000
++
++/* Attempts before giving up on bringing the link back. */
++#define FRL_TRAIN_ATTEMPTS		5
++#define FRL_RETRY_DELAY_MS		500
++
++/* How often to ask the sink whether the link still needs attention. */
++#define FRL_SUPERVISE_INTERVAL_MS	200
++
++#define FFE_PRE_SHOOT_ENABLE		BIT(0)
++#define FFE_DE_EMPHASIS_ENABLE		BIT(1)
++#define FFE_BOTH_ENABLE			(FFE_PRE_SHOOT_ENABLE | FFE_DE_EMPHASIS_ENABLE)
++
++static void dw_hdmi_qp_frl_set_ffe(struct dw_hdmi_qp *hdmi, u8 ffe_lv, u8 ffe_mode)
++{
++	if (!hdmi->phy.ops->set_ffe)
++		return;
++
++	hdmi->phy.ops->set_ffe(hdmi, hdmi->phy.data, ffe_lv, ffe_mode);
++}
++
++/*
++ * The sink asks for the "all lanes pattern 3" code when it wants the source to
++ * keep whatever it is already sending. Re-writing the register in that case
++ * would restart the pattern, so feed the current value back instead.
++ */
++static void dw_hdmi_qp_frl_set_ltp(struct dw_hdmi_qp *hdmi, u32 value)
++{
++	if (!hdmi->flt_no_timeout && value == 0x3333f)
++		value = dw_hdmi_qp_read(hdmi, FLT_CONFIG1);
++
++	dw_hdmi_qp_write(hdmi, value, FLT_CONFIG1);
++}
++
++static unsigned int dw_hdmi_qp_frl_rate_mask(unsigned int lanes,
++					     unsigned int rate_per_lane)
++{
++	switch (lanes * rate_per_lane) {
++	case 9:		/* 3 Gbps x 3 lanes */
++		return 1;
++	case 18:	/* 6 Gbps x 3 lanes */
++		return 2;
++	case 24:	/* 6 Gbps x 4 lanes */
++		return 3;
++	case 32:	/* 8 Gbps x 4 lanes */
++		return 4;
++	case 40:	/* 10 Gbps x 4 lanes */
++		return 5;
++	case 48:	/* 12 Gbps x 4 lanes */
++		return 6;
++	}
++
++	return 0;
++}
++
++/*
++ * DDC keeps glitching for a while after a sink answers for the first time
++ * coming out of standby: a read fails with EIO, the next one works. Dropping a
++ * whole training round over one of those costs a second of black screen, so
++ * retry the transfer instead.
++ */
++#define FRL_SCDC_ATTEMPTS		3
++
++static int dw_hdmi_qp_scdc_read(struct dw_hdmi_qp *hdmi, u8 reg, u8 *val)
++{
++	int i, ret = -EIO;
++
++	for (i = 0; i < FRL_SCDC_ATTEMPTS; i++) {
++		ret = drm_scdc_readb(hdmi->bridge.ddc, reg, val);
++		if (ret >= 0)
++			return ret;
++
++		usleep_range(1000, 2000);
++	}
++
++	return ret;
++}
++
++static int dw_hdmi_qp_scdc_write(struct dw_hdmi_qp *hdmi, u8 reg, u8 val)
++{
++	int i, ret = -EIO;
++
++	for (i = 0; i < FRL_SCDC_ATTEMPTS; i++) {
++		ret = drm_scdc_writeb(hdmi->bridge.ddc, reg, val);
++		if (ret >= 0)
++			return ret;
++
++		usleep_range(1000, 2000);
++	}
++
++	return ret;
++}
++
++static int dw_hdmi_qp_frl_lts1(struct dw_hdmi_qp *hdmi)
++{
++	unsigned long deadline;
++	u8 val = 0;
++	int ret;
++
++	/* Park the video datapath while the link is retrained. */
++	dw_hdmi_qp_mod(hdmi, AVP_DATAPATH_VIDEO_SWDISABLE,
++		       AVP_DATAPATH_VIDEO_SWDISABLE, GLOBAL_SWDISABLE);
++	dw_hdmi_qp_write(hdmi, BIT(6), GLOBAL_SWRESET_REQUEST);
++
++	deadline = jiffies + msecs_to_jiffies(FRL_SINK_READY_TIMEOUT_MS);
++	do {
++		ret = dw_hdmi_qp_scdc_read(hdmi, SCDC_SINK_VERSION, &val);
++		if (ret >= 0 && val)
++			break;
++
++		msleep(100);
++	} while (time_before(jiffies, deadline));
++
++	if (ret < 0) {
++		dev_err(hdmi->dev, "FRL: sink never answered SCDC: %d\n", ret);
++		return ret;
++	}
++
++	if (!val) {
++		dev_err(hdmi->dev, "FRL: sink stuck at SCDC version 0\n");
++		return -ENODEV;
++	}
++
++	ret = dw_hdmi_qp_scdc_write(hdmi, SCDC_SOURCE_VERSION, 1);
++	if (ret < 0) {
++		dev_err(hdmi->dev, "FRL: SCDC write failed: %d\n", ret);
++		return ret;
++	}
++
++	hdmi->flt_no_timeout = false;
++	if (!dw_hdmi_qp_scdc_read(hdmi, SCDC_SINK_SOURCE_TEST_CONFIG, &val))
++		hdmi->flt_no_timeout = val & BIT(5);
++
++	dev_info(hdmi->dev, "FRL: LTS1 done, flt_no_timeout=%d\n",
++		 hdmi->flt_no_timeout);
++
++	return 0;
++}
++
++static int dw_hdmi_qp_frl_lts2(struct dw_hdmi_qp *hdmi, unsigned int rate_mask)
++{
++	unsigned long deadline = jiffies +
++				 msecs_to_jiffies(FRL_LTS2_TIMEOUT_MS);
++	u8 val = 0;
++	int ret;
++
++	do {
++		ret = dw_hdmi_qp_scdc_read(hdmi, SCDC_STATUS_FLAGS_0, &val);
++		if (ret < 0)
++			return ret;
++
++		if (val & SCDC_SINK_STATUS_FLAGS_0_FLT_READY)
++			break;
++
++		msleep(20);
++	} while (time_before(jiffies, deadline));
++
++	if (!(val & SCDC_SINK_STATUS_FLAGS_0_FLT_READY)) {
++		dev_err(hdmi->dev,
++			"FRL: sink never raised FLT_ready (SCDC 0x40 = 0x%02x)\n",
++			val);
++		return -ETIMEDOUT;
++	}
++
++	/* Tell the sink which rate we will train and how much TxFFE we have. */
++	hdmi->flt_ffe_lv = 0;
++	dw_hdmi_qp_frl_set_ffe(hdmi, 0, FFE_BOTH_ENABLE);
++
++	ret = dw_hdmi_qp_scdc_write(hdmi, SCDC_SINK_CONFIG_1,
++			      (frl_max_ffe_lv & 0x3) << 4 | rate_mask);
++	if (ret < 0)
++		return ret;
++
++	ret = dw_hdmi_qp_scdc_write(hdmi, SCDC_CONFIG_0, 0);
++	if (ret < 0)
++		return ret;
++
++	dev_info(hdmi->dev, "FRL: LTS2 done, advertised max TxFFE level %u\n",
++		 frl_max_ffe_lv & 0x3);
++
++	return 0;
++}
++
++static int dw_hdmi_qp_frl_lts3(struct dw_hdmi_qp *hdmi)
++{
++	unsigned long deadline = jiffies +
++				 msecs_to_jiffies(FRL_LTS3_TIMEOUT_MS);
++	u8 ffe_mode_prev = 0;
++	bool ffe_test = false;
++	u8 upd, flags1, flags2;
++	u8 ltp[4];
++	int ret;
++
++	while (time_before(jiffies, deadline) || hdmi->flt_no_timeout) {
++		/* The spec wants the source to poll at least every 2 ms. */
++		usleep_range(400, 600);
++
++		ret = dw_hdmi_qp_scdc_read(hdmi, SCDC_UPDATE_0, &upd);
++		if (ret < 0)
++			return ret;
++
++		if (upd & SCDC_SINK_UPDATE_0_SOURCE_TEST) {
++			u8 cfg = 0;
++
++			ret = drm_scdc_readb(hdmi->bridge.ddc,
++					     SCDC_SINK_SOURCE_TEST_CONFIG, &cfg);
++			if (ret < 0)
++				return ret;
++
++			hdmi->flt_no_timeout = cfg & BIT(5);
++
++			/*
++			 * In the FFE test case the sink drives which parts of
++			 * the equaliser it wants exercised via bits 2:1.
++			 */
++			if (ffe_test) {
++				u8 ffe_mode = (cfg >> 1) & 0x3;
++
++				if (ffe_mode != ffe_mode_prev || ffe_mode_prev)
++					dw_hdmi_qp_frl_set_ffe(hdmi,
++							       hdmi->flt_ffe_lv,
++							       ffe_mode);
++				else
++					dw_hdmi_qp_frl_set_ffe(hdmi,
++							       hdmi->flt_ffe_lv,
++							       FFE_BOTH_ENABLE);
++
++				ffe_mode_prev = ffe_mode;
++			}
++		}
++
++		if (!(upd & (SCDC_SINK_UPDATE_0_FRL_START |
++			     SCDC_SINK_UPDATE_0_FLT_UPDATE))) {
++			if (upd & SCDC_SINK_UPDATE_0_SOURCE_TEST)
++				drm_scdc_writeb(hdmi->bridge.ddc,
++						SCDC_UPDATE_0, upd);
++			continue;
++		}
++
++		if (!(upd & SCDC_SINK_UPDATE_0_FLT_UPDATE))
++			continue;
++
++		ret = dw_hdmi_qp_scdc_read(hdmi, SCDC_STATUS_FLAGS_1,
++				     &flags1);
++		if (!ret)
++			ret = drm_scdc_readb(hdmi->bridge.ddc,
++					     SCDC_SINK_STATUS_FLAGS_2, &flags2);
++		if (ret < 0)
++			return ret;
++
++		ltp[0] = flags1 & 0xf;
++		ltp[1] = flags1 >> 4;
++		ltp[2] = flags2 & 0xf;
++		ltp[3] = flags2 >> 4;
++
++		dev_info(hdmi->dev,
++			 "FRL: LTP request ln0=%x ln1=%x ln2=%x ln3=%x (ffe_lv=%u)\n",
++			 ltp[0], ltp[1], ltp[2], ltp[3], hdmi->flt_ffe_lv);
++
++		/* One lane on pattern 4 and the rest on 2 means FFE test. */
++		if ((ltp[0] == 4 && ltp[1] == 2 && ltp[2] == 2 && ltp[3] == 2) ||
++		    (ltp[0] == 2 && ltp[1] == 4 && ltp[2] == 2 && ltp[3] == 2) ||
++		    (ltp[0] == 2 && ltp[1] == 2 && ltp[2] == 4 && ltp[3] == 2) ||
++		    (ltp[0] == 2 && ltp[1] == 2 && ltp[2] == 2 && ltp[3] == 4))
++			ffe_test = true;
++
++		if (!ltp[0] && !ltp[1] && !ltp[2] && !ltp[3]) {
++			dw_hdmi_qp_write(hdmi, 0, FLT_CONFIG1);
++			dw_hdmi_qp_scdc_write(hdmi, SCDC_UPDATE_0, upd);
++			dev_info(hdmi->dev,
++				 "FRL: LTS3 passed at TxFFE level %u\n",
++				 hdmi->flt_ffe_lv);
++			return 0;
++		}
++
++		if (ltp[0] == 0xf || ltp[1] == 0xf ||
++		    ltp[2] == 0xf || ltp[3] == 0xf) {
++			dev_err(hdmi->dev,
++				"FRL: sink requested a lower rate (LTS4), not implemented\n");
++			return -EAGAIN;
++		}
++
++		if (ltp[0] == 0xe || ltp[1] == 0xe ||
++		    ltp[2] == 0xe || ltp[3] == 0xe) {
++			if (hdmi->flt_ffe_lv >= (frl_max_ffe_lv & 0x3)) {
++				dev_err(hdmi->dev,
++					"FRL: sink wants more TxFFE but level %u is our max\n",
++					hdmi->flt_ffe_lv);
++				return -ERANGE;
++			}
++
++			hdmi->flt_ffe_lv++;
++			ffe_mode_prev = FFE_BOTH_ENABLE;
++			dw_hdmi_qp_frl_set_ffe(hdmi, hdmi->flt_ffe_lv,
++					       FFE_BOTH_ENABLE);
++			dev_info(hdmi->dev, "FRL: raised TxFFE to level %u\n",
++				 hdmi->flt_ffe_lv);
++		} else {
++			dw_hdmi_qp_frl_set_ltp(hdmi,
++					       ltp[3] << 16 | ltp[2] << 12 |
++					       ltp[1] << 8 | ltp[0] << 4 | 0xf);
++		}
++
++		dw_hdmi_qp_scdc_write(hdmi, SCDC_UPDATE_0, upd);
++	}
++
++	dev_err(hdmi->dev, "FRL: LTS3 timed out at TxFFE level %u\n",
++		hdmi->flt_ffe_lv);
++
++	return -ETIMEDOUT;
++}
++
++/*
++ * LTSP: link training has passed, now the actual FRL stream has to be started.
++ *
++ * The sink drives this through SCDC_UPDATE_0. FRL_START means "begin sending",
++ * FLT_UPDATE means "not good enough, train again". Skipping this phase is why
++ * an earlier version of the spike reached "training passed" and still left the
++ * monitor reporting no signal: the handshake completed but the stream never
++ * began, and the sink sat there raising FLT_UPDATE forever.
++ */
++static int dw_hdmi_qp_frl_ltsp(struct dw_hdmi_qp *hdmi)
++{
++	unsigned long deadline = jiffies + msecs_to_jiffies(2000);
++	u8 val = 0;
++	int i, ret;
++
++	while (time_before(jiffies, deadline)) {
++		usleep_range(400, 600);
++
++		ret = dw_hdmi_qp_scdc_read(hdmi, SCDC_UPDATE_0, &val);
++		if (ret < 0)
++			return ret;
++
++		if (!(val & (SCDC_SINK_UPDATE_0_FRL_START |
++			     SCDC_SINK_UPDATE_0_FLT_UPDATE)))
++			continue;
++
++		if (val & SCDC_SINK_UPDATE_0_FRL_START) {
++			/* Let pixels through and start the FRL packet scheduler. */
++			dw_hdmi_qp_mod(hdmi, 0, AVP_DATAPATH_VIDEO_SWDISABLE,
++				       GLOBAL_SWDISABLE);
++			dw_hdmi_qp_scdc_write(hdmi, SCDC_UPDATE_0,
++					SCDC_SINK_UPDATE_0_FRL_START);
++			dw_hdmi_qp_write(hdmi, 2, PKTSCHED_PKT_CONTROL0);
++			dw_hdmi_qp_mod(hdmi, PKTSCHED_GCP_TX_EN,
++				       PKTSCHED_GCP_TX_EN, PKTSCHED_PKT_EN);
++
++			/* Nudge the sink with NULL packets; BSP does this too. */
++			for (i = 0; i < 200; i++) {
++				dw_hdmi_qp_mod(hdmi, PKTSCHED_NULL_TX_EN,
++					       PKTSCHED_NULL_TX_EN, PKTSCHED_PKT_EN);
++				usleep_range(50, 60);
++				dw_hdmi_qp_mod(hdmi, 0, PKTSCHED_NULL_TX_EN,
++					       PKTSCHED_PKT_EN);
++				usleep_range(50, 60);
++			}
++
++			dev_info(hdmi->dev, "FRL: FRL stream started\n");
++
++			return 0;
++		}
++
++		/* Sink wants another training round. */
++		dw_hdmi_qp_mod(hdmi, AVP_DATAPATH_VIDEO_SWDISABLE,
++			       AVP_DATAPATH_VIDEO_SWDISABLE, GLOBAL_SWDISABLE);
++		dw_hdmi_qp_scdc_write(hdmi, SCDC_UPDATE_0,
++				SCDC_SINK_UPDATE_0_FLT_UPDATE);
++
++		return -EAGAIN;
++	}
++
++	dev_err(hdmi->dev,
++		"FRL: timed out waiting for FRL start (SCDC 0x10 = 0x%02x)\n",
++		val);
++
++	return -ETIMEDOUT;
++}
++
++/*
++ * Put the controller into FRL op mode. Must run before the PHY is powered on:
++ * Rockchip's BSP sets the op mode first and only then enables the PHY, and
++ * bringing the serialiser up in TMDS op mode and switching underneath it is
++ * not something the hardware is documented to tolerate.
++ */
++static void dw_hdmi_qp_frl_set_opmode(struct dw_hdmi_qp *hdmi, unsigned int lanes)
++{
++	dw_hdmi_qp_mod(hdmi, lanes == 4 ? OPMODE_FRL_4LANES : 0,
++		       OPMODE_FRL_4LANES, LINK_CONFIG0);
++	dw_hdmi_qp_mod(hdmi, OPMODE_FRL, OPMODE_FRL, LINK_CONFIG0);
++}
++
++static int dw_hdmi_qp_frl_train(struct dw_hdmi_qp *hdmi, unsigned int lanes,
++				unsigned int rate_per_lane);
++
++/*
++ * After the stream starts the sink is still in charge: if it loses lock it
++ * raises FLT_update and waits for the source to retrain. Without anyone
++ * watching that flag the picture drops out and comes back on its own, which is
++ * what 12 Gbps per lane does when it trains at the lowest TxFFE level and then
++ * has to carry real traffic. Retraining here also lets the sink walk the TxFFE
++ * up, which is the mechanism that is supposed to fix exactly this.
++ */
++static void dw_hdmi_qp_frl_supervise(struct work_struct *work)
++{
++	struct dw_hdmi_qp *hdmi = container_of(to_delayed_work(work),
++					       struct dw_hdmi_qp, frl_work);
++	u8 upd = 0;
++
++	/*
++	 * Everything below touches controller registers and the DDC, so it must
++	 * not overlap a modeset. Disable clears frl_lanes under this lock and
++	 * only then waits for us, which is what keeps the teardown from pulling
++	 * the clocks out from under a retrain.
++	 */
++	mutex_lock(&hdmi->frl_lock);
++
++	if (!hdmi->frl_lanes || !hdmi->curr_conn) {
++		mutex_unlock(&hdmi->frl_lock);
++		return;
++	}
++
++	if (!hdmi->frl_up) {
++		if (hdmi->frl_attempts >= FRL_TRAIN_ATTEMPTS) {
++			dev_err(hdmi->dev,
++				"FRL: link stayed down after %u attempts\n",
++				hdmi->frl_attempts);
++			mutex_unlock(&hdmi->frl_lock);
++			return;
++		}
++
++		hdmi->frl_attempts++;
++		if (hdmi->frl_attempts > 1)
++			dev_info(hdmi->dev,
++				 "FRL: retrying link training (attempt %u)\n",
++				 hdmi->frl_attempts);
++
++		if (!dw_hdmi_qp_frl_train(hdmi, hdmi->frl_lanes,
++					  hdmi->frl_rate_per_lane))
++			hdmi->frl_up = true;
++
++		goto reschedule;
++	}
++
++	if (dw_hdmi_qp_scdc_read(hdmi, SCDC_UPDATE_0, &upd) >= 0 &&
++	    (upd & SCDC_SINK_UPDATE_0_FLT_UPDATE)) {
++		dev_info(hdmi->dev,
++			 "FRL: sink lost lock, retraining from TxFFE level %u\n",
++			 hdmi->flt_ffe_lv);
++
++		/* Park the video while the link is retrained. */
++		dw_hdmi_qp_mod(hdmi, AVP_DATAPATH_VIDEO_SWDISABLE,
++			       AVP_DATAPATH_VIDEO_SWDISABLE, GLOBAL_SWDISABLE);
++		dw_hdmi_qp_scdc_write(hdmi, SCDC_UPDATE_0,
++				SCDC_SINK_UPDATE_0_FLT_UPDATE);
++
++		if (dw_hdmi_qp_frl_lts3(hdmi) || dw_hdmi_qp_frl_ltsp(hdmi)) {
++			/* Hand it to the retry path rather than leaving it dark. */
++			hdmi->frl_up = false;
++			hdmi->frl_attempts = 0;
++		}
++	}
++
++reschedule:
++	if (hdmi->frl_lanes && hdmi->curr_conn)
++		schedule_delayed_work(&hdmi->frl_work,
++				      msecs_to_jiffies(hdmi->frl_up ?
++						       FRL_SUPERVISE_INTERVAL_MS :
++						       FRL_RETRY_DELAY_MS));
++
++	mutex_unlock(&hdmi->frl_lock);
++}
++
++static int dw_hdmi_qp_frl_train(struct dw_hdmi_qp *hdmi, unsigned int lanes,
++				unsigned int rate_per_lane)
++{
++	unsigned int rate_mask = dw_hdmi_qp_frl_rate_mask(lanes, rate_per_lane);
++	int round, ret;
++
++	if (!rate_mask) {
++		dev_err(hdmi->dev, "FRL: no FRL rate for %u lanes x %u Gbps\n",
++			lanes, rate_per_lane);
++		return -EINVAL;
++	}
++
++	if (!hdmi->bridge.ddc) {
++		dev_err(hdmi->dev, "FRL: no DDC adapter\n");
++		return -ENODEV;
++	}
++
++	/*
++	 * Every register access below assumes the controller is clocked, which
++	 * is only true while a modeset is up. Touching it after the CRTC has
++	 * been torn down wedges the AXI bus and hangs the machine hard, with
++	 * nothing in the log. curr_conn is set in atomic_enable and cleared in
++	 * atomic_disable, so it is a cheap proxy for "the controller is alive".
++	 */
++	if (!hdmi->curr_conn) {
++		dev_err(hdmi->dev, "FRL: no active modeset, refusing\n");
++		return -ENODEV;
++	}
++
++	dev_info(hdmi->dev, "FRL: training %u lanes x %u Gbps (FRL rate %u)\n",
++		 lanes, rate_per_lane, rate_mask);
++
++	/* Let the PHY output settle before starting link training. */
++	msleep(50);
++
++	ret = dw_hdmi_qp_frl_lts1(hdmi);
++	if (ret)
++		goto fail;
++
++	ret = dw_hdmi_qp_frl_lts2(hdmi, rate_mask);
++	if (ret)
++		goto fail;
++
++	for (round = 0; round < 5; round++) {
++		ret = dw_hdmi_qp_frl_lts3(hdmi);
++		if (ret)
++			goto fail;
++
++		ret = dw_hdmi_qp_frl_ltsp(hdmi);
++		if (!ret)
++			break;
++		if (ret != -EAGAIN)
++			goto fail;
++
++		dev_info(hdmi->dev,
++			 "FRL: sink asked to retrain, round %d\n", round + 2);
++	}
++
++	if (ret) {
++		dev_err(hdmi->dev, "FRL: sink kept asking to retrain\n");
++		goto fail;
++	}
++
++	dev_info(hdmi->dev, "FRL link up: %u lanes x %u Gbps (TxFFE level %u)\n",
++		 lanes, rate_per_lane, hdmi->flt_ffe_lv);
++
++	return 0;
++
++fail:
++	dev_err(hdmi->dev, "FRL link training failed: %d\n", ret);
++
++	return ret;
++}
+ static void dw_hdmi_qp_bridge_atomic_enable(struct drm_bridge *bridge,
+ 					    struct drm_atomic_state *state)
+ {
+ 	struct dw_hdmi_qp *hdmi = bridge->driver_private;
+ 	struct drm_connector_state *conn_state;
++	u8 frl_lanes = 0, frl_rate_per_lane = 0;
+ 	unsigned int op_mode;
+ 
+ 	hdmi->curr_conn = drm_atomic_get_new_connector_for_encoder(state, bridge->encoder);
+@@ -926,8 +1527,20 @@
+ 		op_mode = 0;
+ 		hdmi->tmds_char_rate = conn_state->hdmi.tmds_char_rate;
+ 
+-		if (conn_state->hdmi.tmds_char_rate > HDMI14_MAX_TMDSCLK)
++		if (conn_state->hdmi.tmds_char_rate > HDMI20_MAX_TMDSRATE) {
++			/*
++			 * Above the TMDS ceiling this is a Fixed Rate Link.
++			 * FRL carries its own scrambling, and the op mode has
++			 * to be set before the PHY is brought up.
++			 */
++			if (!drm_hdmi_frl_select_rate(hdmi->curr_conn,
++						      conn_state->hdmi.tmds_char_rate,
++						      &frl_lanes,
++						      &frl_rate_per_lane))
++				dw_hdmi_qp_frl_set_opmode(hdmi, frl_lanes);
++		} else if (conn_state->hdmi.tmds_char_rate > HDMI14_MAX_TMDSCLK) {
+ 			dw_hdmi_qp_enable_scramb(hdmi);
++		}
+ 	} else {
+ 		dev_dbg(hdmi->dev, "%s mode=DVI\n", __func__);
+ 		op_mode = OPMODE_DVI;
+@@ -939,6 +1552,30 @@
+ 	dw_hdmi_qp_mod(hdmi, op_mode, OPMODE_DVI, LINK_CONFIG0);
+ 
+ 	drm_atomic_helper_connector_hdmi_update_infoframes(hdmi->curr_conn, state);
++
++	/*
++	 * Link training runs last, once the controller is fully configured for
++	 * the mode: the sink evaluates the actual stream before it agrees to
++	 * start, and will just keep asking to retrain if it is handed anything
++	 * else.
++	 */
++	if (frl_lanes) {
++		mutex_lock(&hdmi->frl_lock);
++
++		hdmi->frl_lanes = frl_lanes;
++		hdmi->frl_rate_per_lane = frl_rate_per_lane;
++		hdmi->frl_attempts = 0;
++		hdmi->frl_up = false;
++
++		/*
++		 * Training waits on the sink and can take seconds after a
++		 * standby, so it runs in the worker. Blocking the modeset for
++		 * that long stalls every client waiting on the commit.
++		 */
++		schedule_delayed_work(&hdmi->frl_work, 0);
++
++		mutex_unlock(&hdmi->frl_lock);
++	}
+ }
+ 
+ static void dw_hdmi_qp_bridge_atomic_disable(struct drm_bridge *bridge,
+@@ -948,7 +1585,19 @@
+ 
+ 	hdmi->tmds_char_rate = 0;
+ 
++	/*
++	 * Must stop before the PHY goes down: the worker touches controller
++	 * registers and the DDC, and doing that on an unclocked controller
++	 * wedges the SoC with nothing in the log.
++	 */
++	mutex_lock(&hdmi->frl_lock);
++	hdmi->frl_lanes = 0;
++	hdmi->frl_up = false;
++	mutex_unlock(&hdmi->frl_lock);
++	cancel_delayed_work_sync(&hdmi->frl_work);
++
+ 	dw_hdmi_qp_disable_scramb(hdmi);
++	dw_hdmi_qp_mod(hdmi, 0, OPMODE_FRL | OPMODE_FRL_4LANES, LINK_CONFIG0);
+ 
+ 	hdmi->curr_conn = NULL;
+ 
+@@ -1005,8 +1654,19 @@
+ 	}
+ 
+ 	if (rate > HDMI20_MAX_TMDSRATE) {
+-		dev_dbg(hdmi->dev, "Unsupported TMDS char rate: %lld\n", rate);
+-		return MODE_CLOCK_HIGH;
++		/*
++		 * Beyond TMDS the mode has to fit a Fixed Rate Link. The sink
++		 * side was already checked by the HDMI helpers, so only the
++		 * controller's own ceiling is left to apply here.
++		 */
++		unsigned long long frl_rate = 4ULL *
++			bridge->max_frl_rate_per_lane * 1000000000ULL;
++
++		if (!bridge->max_frl_rate_per_lane ||
++		    drm_hdmi_frl_payload_rate(rate) > frl_rate) {
++			dev_dbg(hdmi->dev, "Unsupported char rate: %lld\n", rate);
++			return MODE_CLOCK_HIGH;
++		}
+ 	}
+ 
+ 	return MODE_OK;
+@@ -1508,6 +2168,8 @@
+ 	if (plat_data->max_bpc)
+ 		hdmi->bridge.max_bpc = plat_data->max_bpc;
+ 
++	hdmi->bridge.max_frl_rate_per_lane = plat_data->max_frl_rate_per_lane;
++
+ 	hdmi->bridge.ddc = dw_hdmi_qp_i2c_adapter(hdmi);
+ 	if (IS_ERR(hdmi->bridge.ddc))
+ 		return ERR_CAST(hdmi->bridge.ddc);
+@@ -1532,6 +2194,9 @@
+ 	}
+ #endif
+ 
++	mutex_init(&hdmi->frl_lock);
++	INIT_DELAYED_WORK(&hdmi->frl_work, dw_hdmi_qp_frl_supervise);
++
+ 	ret = devm_drm_bridge_add(dev, &hdmi->bridge);
+ 	if (ret)
+ 		return ERR_PTR(ret);
+diff -Naur '--exclude=.git' '--exclude=*.orig' '--exclude=*.rej' '--exclude=include-prefixes' a/drivers/gpu/drm/rockchip/dw_hdmi_qp-rockchip.c b/drivers/gpu/drm/rockchip/dw_hdmi_qp-rockchip.c
+--- a/drivers/gpu/drm/rockchip/dw_hdmi_qp-rockchip.c
++++ b/drivers/gpu/drm/rockchip/dw_hdmi_qp-rockchip.c
+@@ -8,7 +8,9 @@
+  */
+ 
+ #include <linux/clk.h>
++#include <linux/device.h>
+ #include <linux/gpio/consumer.h>
++#include <linux/kstrtox.h>
+ #include <linux/hw_bitfield.h>
+ #include <linux/mfd/syscon.h>
+ #include <linux/media-bus-format.h>
+@@ -21,6 +23,7 @@
+ 
+ #include <drm/bridge/dw_hdmi_qp.h>
+ #include <drm/display/drm_hdmi_helper.h>
++#include <drm/display/drm_hdmi_state_helper.h>
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_bridge_connector.h>
+ #include <drm/drm_of.h>
+@@ -71,7 +74,12 @@
+ #define RK3588_HDMI0_LEVEL_INT		BIT(16)
+ #define RK3588_HDMI1_LEVEL_INT		BIT(24)
+ #define RK3588_GRF_VO1_CON3		0x000c
++#define RK3588_GRF_VO1_CON4		0x0010
+ #define RK3588_GRF_VO1_CON6		0x0018
++#define RK3588_GRF_VO1_CON7		0x001c
++#define RK3588_HDMI21_MASK		BIT(0)
++
++#define HDMI20_MAX_TMDS_RATE		600000000ULL
+ #define RK3588_COLOR_DEPTH_MASK		GENMASK(7, 4)
+ #define RK3588_8BPC			0x0
+ #define RK3588_10BPC			0x6
+@@ -97,6 +105,9 @@
+ 	struct dw_hdmi_qp *hdmi;
+ 	struct phy *phy;
+ 	struct gpio_desc *frl_enable_gpio;
++	/* FRL config currently programmed into the PHY, 0 lanes means TMDS */
++	u8 frl_lanes;
++	u8 frl_rate_per_lane;
+ 	struct delayed_work hpd_work;
+ 	int port_id;
+ 	const struct rockchip_hdmi_qp_ctrl_ops *ctrl_ops;
+@@ -117,13 +128,21 @@
+ 	return container_of(rkencoder, struct rockchip_hdmi_qp, encoder);
+ }
+ 
++static void rockchip_hdmi_qp_set_link_mode(struct rockchip_hdmi_qp *hdmi,
++					   bool frl)
++{
++	regmap_write(hdmi->vo_regmap,
++		     hdmi->port_id ? RK3588_GRF_VO1_CON7 : RK3588_GRF_VO1_CON4,
++		     FIELD_PREP_WM16(RK3588_HDMI21_MASK, frl ? 1 : 0));
++}
++
+ static void dw_hdmi_qp_rockchip_encoder_enable(struct drm_encoder *encoder)
+ {
+ 	struct rockchip_hdmi_qp *hdmi = to_rockchip_hdmi_qp(encoder);
+ 	struct drm_crtc *crtc = encoder->crtc;
+ 
+-	/* Unconditionally switch to TMDS as FRL is not yet supported */
+-	gpiod_set_value_cansleep(hdmi->frl_enable_gpio, 0);
++	gpiod_set_value_cansleep(hdmi->frl_enable_gpio, hdmi->frl_lanes ? 1 : 0);
++	rockchip_hdmi_qp_set_link_mode(hdmi, hdmi->frl_lanes != 0);
+ 
+ 	if (!crtc || !crtc->state)
+ 		return;
+@@ -185,7 +204,47 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	phy_cfg.hdmi.tmds_char_rate = conn_state->hdmi.tmds_char_rate;
++	/*
++	 * Above the TMDS ceiling the mode only fits over a Fixed Rate Link, so
++	 * the PHY has to be told which link it is driving before it is handed a
++	 * rate: the two use different PLLs and the rate means different things.
++	 */
++	if (conn_state->hdmi.tmds_char_rate > HDMI20_MAX_TMDS_RATE) {
++		u8 lanes, rate_per_lane;
++
++		ret = drm_hdmi_frl_select_rate(conn_state->connector,
++					       conn_state->hdmi.tmds_char_rate,
++					       &lanes, &rate_per_lane);
++		if (ret) {
++			dev_err(hdmi->dev, "No FRL rate carries %llu Hz\n",
++				conn_state->hdmi.tmds_char_rate);
++			return ret;
++		}
++
++		ret = phy_set_mode_ext(hdmi->phy, PHY_MODE_HDMI,
++				       PHY_HDMI_MODE_FRL);
++		if (ret)
++			return ret;
++
++		phy_cfg.hdmi.frl.lanes = lanes;
++		phy_cfg.hdmi.frl.rate_per_lane = rate_per_lane;
++		phy_cfg.hdmi.frl.ffe_lv = 0;
++		phy_cfg.hdmi.frl.ffe_mode = 0x3;
++
++		hdmi->frl_lanes = lanes;
++		hdmi->frl_rate_per_lane = rate_per_lane;
++	} else {
++		ret = phy_set_mode_ext(hdmi->phy, PHY_MODE_HDMI,
++				       PHY_HDMI_MODE_TMDS);
++		if (ret)
++			return ret;
++
++		phy_cfg.hdmi.tmds_char_rate = conn_state->hdmi.tmds_char_rate;
++
++		hdmi->frl_lanes = 0;
++		hdmi->frl_rate_per_lane = 0;
++	}
++
+ 	phy_cfg.hdmi.bpc = conn_state->hdmi.output_bpc;
+ 
+ 	ret = phy_configure(hdmi->phy, &phy_cfg);
+@@ -249,7 +308,34 @@
+ 	regmap_write(hdmi->regmap, RK3588_GRF_SOC_CON2, val);
+ }
+ 
++static void dw_hdmi_qp_rk3588_phy_set_ffe(struct dw_hdmi_qp *dw_hdmi, void *data,
++					 u8 ffe_lv, u8 ffe_mode)
++{
++	struct rockchip_hdmi_qp *hdmi = data;
++	union phy_configure_opts phy_cfg = {};
++	int ret;
++
++	if (!hdmi->frl_lanes)
++		return;
++
++	/*
++	 * phy_configure() is the only channel to the PHY, so the whole FRL
++	 * config has to be resent, not just the FFE part.
++	 */
++	phy_cfg.hdmi.bpc = 8;
++	phy_cfg.hdmi.frl.lanes = hdmi->frl_lanes;
++	phy_cfg.hdmi.frl.rate_per_lane = hdmi->frl_rate_per_lane;
++	phy_cfg.hdmi.frl.ffe_lv = ffe_lv;
++	phy_cfg.hdmi.frl.ffe_mode = ffe_mode;
++
++	ret = phy_configure(hdmi->phy, &phy_cfg);
++	if (ret)
++		dev_err(hdmi->dev, "failed to set TxFFE level %u: %d\n",
++			ffe_lv, ret);
++}
++
+ static const struct dw_hdmi_qp_phy_ops rk3588_hdmi_phy_ops = {
++	.set_ffe	= dw_hdmi_qp_rk3588_phy_set_ffe,
+ 	.init		= dw_hdmi_qp_rk3588_phy_init,
+ 	.disable	= dw_hdmi_qp_rk3588_phy_disable,
+ 	.read_hpd	= dw_hdmi_qp_rk3588_read_hpd,
+@@ -482,6 +568,8 @@
+ 	unsigned int num_ports;
+ 	unsigned int port_ids[MAX_HDMI_PORT_NUM];
+ 	unsigned int supported_formats;
++	/* Maximum FRL rate per lane in Gbps, 0 for TMDS only */
++	unsigned int max_frl_rate_per_lane;
+ 	const struct rockchip_hdmi_qp_ctrl_ops *ctrl_ops;
+ 	const struct dw_hdmi_qp_phy_ops *phy_ops;
+ };
+@@ -504,6 +592,13 @@
+ 	},
+ 	.supported_formats = BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444) |
+ 			     BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR420),
++	/*
++	 * The HDPTX PHY has PLL settings up to 12 Gbps per lane. Rockchip's own
++	 * driver clamps this to 10 with the comment "in the current version,
++	 * support max 40G frl"; FRL6 is left enabled here because the hardware
++	 * has never actually been shown to fail at it.
++	 */
++	.max_frl_rate_per_lane = 12,
+ 	.ctrl_ops = &rk3588_hdmi_ctrl_ops,
+ 	.phy_ops = &rk3588_hdmi_phy_ops,
+ };
+@@ -573,6 +668,7 @@
+ 	plat_data.phy_data = hdmi;
+ 	plat_data.max_bpc = 10;
+ 	plat_data.supported_formats = cfg->supported_formats;
++	plat_data.max_frl_rate_per_lane = cfg->max_frl_rate_per_lane;
+ 
+ 	encoder = &hdmi->encoder.encoder;
+ 	encoder->possible_crtcs = drm_of_find_possible_crtcs(drm, dev->of_node);
+diff -Naur '--exclude=.git' '--exclude=*.orig' '--exclude=*.rej' '--exclude=include-prefixes' a/drivers/phy/rockchip/phy-rockchip-samsung-hdptx.c b/drivers/phy/rockchip/phy-rockchip-samsung-hdptx.c
+--- a/drivers/phy/rockchip/phy-rockchip-samsung-hdptx.c
++++ b/drivers/phy/rockchip/phy-rockchip-samsung-hdptx.c
+@@ -397,6 +397,8 @@
+ 	enum phy_hdmi_mode mode;
+ 	unsigned long long rate;
+ 	unsigned int bpc;
++	u8 ffe_lv;
++	u8 ffe_mode;
+ };
+ 
+ struct rk_hdptx_phy {
+@@ -1269,6 +1271,67 @@
+ 	return rk_hdptx_frl_lcpll_cmn_config(hdptx);
+ }
+ 
++#define FFE_PRE_SHOOT_ENABLE		BIT(0)
++#define FFE_DE_EMPHASIS_ENABLE		BIT(1)
++
++/*
++ * FRL transmit FFE.
++ *
++ * rk_hdptx_frl_lane_init_seq programs LANE_REG(03/04/05/06 04) = 0x14
++ * (de-emphasis 4, override enabled) and LANE_REG(..05) = 0x4f (pre-shoot 3),
++ * which is level 0 below. Higher levels only raise de-emphasis. The sink asks
++ * for a level increase during FRL link training when the eye is not open
++ * enough at the requested rate, which is what 8 Gbps per lane and above need.
++ */
++static const struct {
++	u8 pre_shoot;
++	u8 de_emphasis;
++} rk_hdptx_frl_ffe_cfg[] = {
++	{ 0x3, 0x4 },
++	{ 0x3, 0x6 },
++	{ 0x3, 0x8 },
++	{ 0x3, 0x9 },
++};
++
++static void rk_hdptx_frl_apply_ffe(struct rk_hdptx_phy *hdptx)
++{
++	static const u32 post_reg[] = { LANE_REG(0304), LANE_REG(0404),
++					LANE_REG(0504), LANE_REG(0604) };
++	static const u32 pre_reg[]  = { LANE_REG(0305), LANE_REG(0405),
++					LANE_REG(0505), LANE_REG(0605) };
++	u8 pre_shoot, de_emphasis;
++	int i;
++
++	if (hdptx->hdmi_cfg.mode != PHY_HDMI_MODE_FRL)
++		return;
++
++	if (hdptx->hdmi_cfg.ffe_lv >= ARRAY_SIZE(rk_hdptx_frl_ffe_cfg))
++		return;
++
++	pre_shoot = rk_hdptx_frl_ffe_cfg[hdptx->hdmi_cfg.ffe_lv].pre_shoot;
++	de_emphasis = rk_hdptx_frl_ffe_cfg[hdptx->hdmi_cfg.ffe_lv].de_emphasis;
++
++	if (!(hdptx->hdmi_cfg.ffe_mode & FFE_PRE_SHOOT_ENABLE))
++		pre_shoot = 0;
++	if (!(hdptx->hdmi_cfg.ffe_mode & FFE_DE_EMPHASIS_ENABLE))
++		de_emphasis = 0;
++
++	for (i = 0; i < 4; i++) {
++		regmap_update_bits(hdptx->regmap, post_reg[i],
++				   LN_TX_DRV_POST_LVL_CTRL_MASK,
++				   FIELD_PREP(LN_TX_DRV_POST_LVL_CTRL_MASK,
++					      de_emphasis));
++		regmap_update_bits(hdptx->regmap, pre_reg[i],
++				   LN_TX_DRV_PRE_LVL_CTRL_MASK,
++				   FIELD_PREP(LN_TX_DRV_PRE_LVL_CTRL_MASK,
++					      pre_shoot));
++	}
++
++	dev_dbg(hdptx->dev, "FRL TxFFE lv=%u mode=%u pre=%u de=%u\n",
++		hdptx->hdmi_cfg.ffe_lv, hdptx->hdmi_cfg.ffe_mode,
++		pre_shoot, de_emphasis);
++}
++
+ static int rk_hdptx_frl_lcpll_mode_config(struct rk_hdptx_phy *hdptx)
+ {
+ 	rk_hdptx_multi_reg_write(hdptx, rk_hdptx_common_sb_init_seq);
+@@ -1277,6 +1340,8 @@
+ 	rk_hdptx_multi_reg_write(hdptx, rk_hdptx_common_lane_init_seq);
+ 	rk_hdptx_multi_reg_write(hdptx, rk_hdptx_frl_lane_init_seq);
+ 
++	rk_hdptx_frl_apply_ffe(hdptx);
++
+ 	return rk_hdptx_post_enable_lane(hdptx);
+ }
+ 
+@@ -1786,6 +1851,22 @@
+ 	if (hdmi_out)
+ 		hdmi_out->bpc = hdmi_in->bpc ?: 8;
+ 
++	/*
++	 * frl aliases tmds_char_rate in the union, so these fields only carry
++	 * meaning in FRL mode. Validating them unconditionally rejects every
++	 * TMDS modeset, because byte 2 of a real TMDS rate is almost never a
++	 * valid FFE level.
++	 */
++	if (hdptx->hdmi_cfg.mode == PHY_HDMI_MODE_FRL) {
++		if (hdmi_in->frl.ffe_lv >= ARRAY_SIZE(rk_hdptx_frl_ffe_cfg))
++			return -EINVAL;
++
++		if (hdmi_out) {
++			hdmi_out->ffe_lv = hdmi_in->frl.ffe_lv;
++			hdmi_out->ffe_mode = hdmi_in->frl.ffe_mode;
++		}
++	}
++
+ 	return 0;
+ }
+ 
+@@ -2083,6 +2164,14 @@
+ 			hdptx->restrict_rate_change = true;
+ 			dev_dbg(hdptx->dev, "%s rate=%llu bpc=%u\n", __func__,
+ 				hdptx->hdmi_cfg.rate, hdptx->hdmi_cfg.bpc);
++
++			/*
++			 * Link training adjusts TxFFE while the lanes are
++			 * already transmitting, so apply it right away rather
++			 * than waiting for the next power-on.
++			 */
++			if (hdptx->hdmi_cfg.mode == PHY_HDMI_MODE_FRL)
++				rk_hdptx_frl_apply_ffe(hdptx);
+ 		}
+ 
+ 		return ret;

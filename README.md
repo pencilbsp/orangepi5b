@@ -95,11 +95,12 @@ Build dùng `config/kernel-slim.disable` để cắt bớt driver không cần c
 
 ## Patch policy
 
-Patch queue hiện có hai patch local:
+Patch queue hiện có ba patch local:
 
 ```text
 config/patches/linux-7.1.8/0001-rk3588s-orangepi5b-hdmi-4k120.patch
 config/patches/linux-7.1.8/0002-arm64-dts-rockchip-enable-orangepi5b-ap6275p.patch
+config/patches/linux-7.1.8/0003-rk3588s-orangepi5b-hdmi-frl.patch
 ```
 
 Patch HDMI chỉ chạm display path:
@@ -115,10 +116,105 @@ Patch AP6275P chỉ chạm DTS của Orange Pi 5B:
 - Bật UART9/serdev cho BCM4362A2 Bluetooth.
 - Mô tả regulator, reset, wake GPIO và 32.768 kHz LPO clock.
 
+Patch FRL mở đường Fixed Rate Link, thứ mà upstream hoàn toàn không có:
+
+- `drm_hdmi_state_helper`: cho mode vượt trần TMDS đi tiếp khi hai đầu tải được
+  qua FRL, và chọn rate FRL **thấp nhất đủ tải** (Rockchip thì luôn xin rate tối
+  đa của sink rồi clamp xuống 40 Gbps).
+- `drm_bridge`/`drm_connector`: mang capability FRL phía source.
+- `dw-hdmi-qp`: FRL op mode, link training HDMI 2.1 (LTS1..LTS3 và LTSP với bắt
+  tay FRL_START), bậc thang TxFFE khi sink đòi thêm cân bằng.
+- `dw_hdmi_qp-rockchip`: chọn TMDS hay FRL trong atomic_check, lập trình PHY
+  tương ứng, bật bit GRF HDMI21.
+- `phy-rockchip-samsung-hdptx`: áp TxFFE khi dựng lane FRL.
+
+Thứ tự lấy theo driver vendor: controller vào FRL op mode **trước** khi cấp
+nguồn PHY, và link training chạy **sau** khi mode đã lập trình xong. Train trên
+một pipeline dựng dở thì đạt "mọi lane trained" rồi sink xin train lại mãi mãi
+mà không ra hình.
+
+Chưa bao gồm: VOP2 vẫn từ chối pixel clock trên 600 MHz, nên 4K120 cần thêm một
+thay đổi nữa (chia đôi dclk, chạy 2 pixel mỗi clock).
+
 Firmware Broadcom bắt buộc nằm trong `config/firmware/brcm`. Ubuntu 26.04
 `linux-firmware-broadcom-wireless` chưa ship đúng `brcmfmac43752-pcie.*` cho
 board này, nên image tự copy firmware riêng và tạo alias `xunlong,orangepi-5b`.
 
+
+## FRL spike
+
+`spike/frl-lock/` chứa một thí nghiệm một ngày, không nằm trong patch queue và
+không bao giờ vào image: nó kiểm tra xem HDMI TX có train được Fixed Rate Link
+với màn hình đang cắm hay không. FRL là điều kiện bắt buộc để ra 10-bit RGB ở
+4K60, vì driver upstream hiện chỉ chạy TMDS (trần 600 MHz TMDS char rate).
+
+Patch chỉ thêm một trigger sysfs, không đụng đường modeset, nên boot vẫn lên
+TMDS như bình thường. Xem `spike/frl-lock/README.md` để biết quy trình, tiêu chí
+PASS/FAIL và cách rollback.
+
+Kết quả đo trên phần cứng thật (Dell U2725QE, 2026-09-07): link training chạy
+tới LTS3 ở FRL3, nhưng FRL stream chưa bao giờ bắt đầu — sink liên tục xin train
+lại và màn hình báo no signal. Chưa có link FRL nào hoạt động ở bất kỳ rate nào.
+Chi tiết và danh sách giả thuyết đã loại trừ nằm trong runbook của spike.
+
+`spike/bsp-frl-check/` là phép thử đối chứng, và nó đã cho kết quả: kernel BSP
+Rockchip trên chính bo này chạy **4K120 4:4:4 qua FRL5 (10 Gbps/lane, 40 Gbps)**.
+Không có trần 24 Gbps, không có trần 6 Gbps/lane, VOP2 kéo được 4K120 — mọi giới
+hạn gặp phải đều nằm ở phần mềm upstream, không phải phần cứng. Runbook đó cũng
+ghi lại thông số clocking đo được để dùng làm spec cho bản port.
+
+
+## Vòng lặp thử nghiệm display
+
+Build lại cả image để thử một thay đổi driver là quá chậm. Mọi thứ trong đường
+display đều là module (`DRM_DISPLAY_HELPER`, `DRM_ROCKCHIP`, `DRM_DW_HDMI_QP`,
+`PHY_ROCKCHIP_SAMSUNG_HDPTX`), nên có hai mức nhanh hơn nhiều.
+
+**Mức 1 — chỉnh lúc chạy, vài giây, không rủi ro.** Driver FRL có một tham số
+ghi được lúc chạy:
+
+| Tham số | Ý nghĩa |
+|---|---|
+| `frl_max_ffe_lv` | Mức TxFFE tối đa khai báo với sink (0–3, mặc định 3) |
+
+```bash
+echo 2 | sudo tee /sys/module/dw_hdmi_qp/parameters/frl_max_ffe_lv
+```
+
+Đổi xong thì chuyển độ phân giải qua lại để ép train lại.
+
+**Mức 2 — thay module, ~2 phút.**
+
+```bash
+bash scripts/deploy-modules.sh
+```
+
+Build tăng dần, copy bốn module sang board trong `target.json`, `update-initramfs`
+rồi reboot. Quay lại bản gốc:
+
+```bash
+bash scripts/deploy-modules.sh --restore
+```
+
+> **CẢNH BÁO: cách này KHÔNG an toàn với boot.** Đã làm bo không khởi động được
+> và phải flash lại.
+>
+> Lý do: script chạy `update-initramfs`, tức **ghi lại một artifact boot-critical**.
+> Và image này cố tình nhét module display vào initramfs (xem
+> `config/rootfs/orangepi5b-display.conf`, để có hình trước Plymouth), nên module
+> mới chạy ở **giai đoạn initramfs, trước khi mount root**. Lỗi ở đó là chết boot,
+> không phải chỉ mất hình.
+>
+> Tính chất "reboot = rollback" chỉ đúng khi initramfs còn giữ module **gốc**.
+> Ngay khi script regenerate initramfs, lưới an toàn đó biến mất.
+>
+> Muốn có vòng lặp nhanh mà vẫn an toàn thì phải **bỏ module display khỏi
+> initramfs trước** (đánh đổi: mất đồ hoạ sớm/Plymouth), để module lỗi chỉ làm
+> mất hình ở userspace còn boot và SSH vẫn sống. Chưa làm.
+
+Script reboot chứ không `rmmod`/`insmod`. Nạp lại DRM stack lúc đang chạy đã làm
+sập bo này nhiều lần — worker giám sát, modeset và teardown chạy chồng nhau trên
+một controller có thể đã mất clock. Reboot mất ~30 giây và tất định.
 
 ## Runtime checks
 

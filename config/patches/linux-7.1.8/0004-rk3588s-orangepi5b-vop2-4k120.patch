@@ -1,0 +1,164 @@
+RK3588S Orange Pi 5B VOP2 support for pixel clocks above 600 MHz.
+
+rk3588_calc_cru_cfg() drives HDMI with dclk equal to the pixel clock, halving it
+only for YUV420. 4K120 needs 1188 MHz, well past the 600 MHz the video port can
+run at, so the mode is rejected and 4K120 is only reachable with chroma
+subsampling.
+
+The hardware sends two pixels per clock instead. Measured on this board running
+Rockchip's own kernel at 3840x2160p120 over FRL5:
+
+  dclk_vop0          594 MHz   = v_pixclk / 2, parented to the system CRU
+  hdmi_edp0_pixclk   594 MHz   = dclk / 1
+  hdmi_edp0_dclk     297 MHz   = dclk / 2
+  dclk_core0         297 MHz   = dclk / 2
+  clk_hdmiphy_pixel0   4 GHz   = FRL link rate / 10
+
+Expressed against the pixel clock those interface rates are v_pixclk/2 and
+v_pixclk/4, exactly what the sub-600 MHz path already produces, so only dclk and
+the dividers hanging off it change.
+
+Also here, because the same function is involved:
+
+  - The divider outputs were passed to ilog2() without every branch assigning
+    them. With CONFIG_INIT_STACK_ALL_ZERO that made ilog2(0), and an all-ones
+    DCLK_OUT_DIV field was written for every HDMI, eDP and DPI modeset. They now
+    start at the identity divider.
+  - vop2_crtc_mode_valid() only checked horizontal size, so a mode past the
+    datapath limit reached clk_set_rate() instead of being filtered.
+  - On an FRL link the HDMI PHY PLL runs at the link rate rather than a multiple
+    of the pixel clock, so it must not be selected as the dclk parent. The HDMI
+    encoder now records the link type in the CRTC state for that.
+
+diff -Naur '--exclude=.git' '--exclude=*.orig' '--exclude=*.rej' '--exclude=include-prefixes' a/drivers/gpu/drm/rockchip/rockchip_drm_drv.h b/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_drv.h
+@@ -47,6 +47,8 @@
+ 	int output_type;
+ 	int output_mode;
+ 	int output_bpc;
++	/* HDMI link runs FRL, so the PHY PLL is not at the pixel rate */
++	bool frl_link;
+ 	int output_flags;
+ 	bool enable_afbc;
+ 	bool yuv_overlay;
+diff -Naur '--exclude=.git' '--exclude=*.orig' '--exclude=*.rej' '--exclude=include-prefixes' a/drivers/gpu/drm/rockchip/rockchip_drm_vop2.h b/drivers/gpu/drm/rockchip/rockchip_drm_vop2.h
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop2.h
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop2.h
+@@ -24,6 +24,12 @@
+ 
+ #define VOP2_VP_FEATURE_OUTPUT_10BIT        BIT(0)
+ 
++/*
++ * Highest rate the video port dclk can run at. Beyond this a port drives more
++ * than one pixel per clock instead, which is how modes past 4K60 are reached.
++ */
++#define VOP2_MAX_DCLK_RATE		600000000UL
++
+ #define VOP2_FEATURE_HAS_SYS_GRF	BIT(0)
+ #define VOP2_FEATURE_HAS_VO0_GRF	BIT(1)
+ #define VOP2_FEATURE_HAS_VO1_GRF	BIT(2)
+diff -Naur '--exclude=.git' '--exclude=*.orig' '--exclude=*.rej' '--exclude=include-prefixes' a/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c b/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c
+@@ -102,7 +102,6 @@
+ 	VOP2_AFBC_FMT_INVALID = -1,
+ };
+ 
+-#define VOP2_MAX_DCLK_RATE		600000000UL
+ 
+ /*
+  * bus-format types.
+@@ -1441,6 +1440,10 @@
+ 	if (mode->hdisplay > vp->data->max_output.width)
+ 		return MODE_BAD_HVALUE;
+ 
++	/* Two pixels per clock is as wide as the port datapath goes. */
++	if (mode->clock > 2 * (VOP2_MAX_DCLK_RATE / 1000))
++		return MODE_CLOCK_HIGH;
++
+ 	return MODE_OK;
+ }
+ 
+@@ -1757,7 +1760,12 @@
+ 	 * Switch to HDMI PHY PLL as DCLK source for display modes up
+ 	 * to 4K@60Hz, if available, otherwise keep using the system CRU.
+ 	 */
+-	if (vop2->pll_hdmiphy0 || vop2->pll_hdmiphy1) {
++	/*
++	 * On an FRL link the HDMI PHY PLL runs at the link rate, not at a
++	 * multiple of the pixel clock, so it cannot feed dclk. Leave the port
++	 * on the system CRU in that case.
++	 */
++	if (!vcstate->frl_link && (vop2->pll_hdmiphy0 || vop2->pll_hdmiphy1)) {
+ 		unsigned long max_dclk = DIV_ROUND_CLOSEST_ULL(VOP2_MAX_DCLK_RATE * 8,
+ 							       vcstate->output_bpc);
+ 		if (clock <= max_dclk) {
+diff -Naur '--exclude=.git' '--exclude=*.orig' '--exclude=*.rej' '--exclude=include-prefixes' a/drivers/gpu/drm/rockchip/rockchip_vop2_reg.c b/drivers/gpu/drm/rockchip/rockchip_vop2_reg.c
+--- a/drivers/gpu/drm/rockchip/rockchip_vop2_reg.c
++++ b/drivers/gpu/drm/rockchip/rockchip_vop2_reg.c
+@@ -1580,6 +1580,16 @@
+ 	unsigned long if_pixclk_rate;
+ 	int K = 1;
+ 
++	/*
++	 * Not every branch below assigns every divider, and they all go through
++	 * ilog2() at the end. Start from the identity so an unset one is a
++	 * no-op rather than ilog2(0).
++	 */
++	*dclk_core_div = 1;
++	*dclk_out_div = 1;
++	*if_pixclk_div = 1;
++	*if_dclk_div = 1;
++
+ 	if (vop2_output_if_is_hdmi(id)) {
+ 		/*
+ 		 * K = 2: dclk_core = if_pixclk_rate > if_dclk_rate
+@@ -1598,6 +1608,19 @@
+ 		 */
+ 		*if_pixclk_div = 2;
+ 		*if_dclk_div = 4;
++
++		/*
++		 * Past the dclk ceiling the port sends two pixels per clock, so
++		 * dclk runs at half the pixel rate and everything derived from
++		 * it halves too. The interface still sees if_pixclk = v_pixclk/2
++		 * and if_dclk = v_pixclk/4, which is what it gets below the
++		 * ceiling as well.
++		 */
++		if (dclk_rate > VOP2_MAX_DCLK_RATE) {
++			dclk_rate >>= 1;
++			*if_pixclk_div = 1;
++			*if_dclk_div = 2;
++		}
+ 	} else if (vop2_output_if_is_edp(id)) {
+ 		/*
+ 		 * edp_pixclk = edp_dclk > dclk_core
+@@ -1689,7 +1712,7 @@
+ static unsigned long rk3588_set_intf_mux(struct vop2_video_port *vp, int id, u32 polflags)
+ {
+ 	struct vop2 *vop2 = vp->vop2;
+-	int dclk_core_div, dclk_out_div, if_pixclk_div, if_dclk_div;
++	int dclk_core_div = 1, dclk_out_div = 1, if_pixclk_div = 1, if_dclk_div = 1;
+ 	unsigned long clock;
+ 	u32 die, dip, div, vp_clk_div, val;
+ 
+diff -Naur '--exclude=.git' '--exclude=*.orig' '--exclude=*.rej' '--exclude=include-prefixes' a/drivers/gpu/drm/rockchip/dw_hdmi_qp-rockchip.c b/drivers/gpu/drm/rockchip/dw_hdmi_qp-rockchip.c
+--- a/drivers/gpu/drm/rockchip/dw_hdmi_qp-rockchip.c
++++ b/drivers/gpu/drm/rockchip/dw_hdmi_qp-rockchip.c
+@@ -233,6 +233,7 @@
+ 
+ 		hdmi->frl_lanes = lanes;
+ 		hdmi->frl_rate_per_lane = rate_per_lane;
++		s->frl_link = true;
+ 	} else {
+ 		ret = phy_set_mode_ext(hdmi->phy, PHY_MODE_HDMI,
+ 				       PHY_HDMI_MODE_TMDS);
+@@ -243,6 +244,7 @@
+ 
+ 		hdmi->frl_lanes = 0;
+ 		hdmi->frl_rate_per_lane = 0;
++		s->frl_link = false;
+ 	}
+ 
+ 	phy_cfg.hdmi.bpc = conn_state->hdmi.output_bpc;
