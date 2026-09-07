@@ -3,6 +3,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 mkdir -p cache/sources sources
+bash "$ROOT/scripts/fetch-chrome.sh"
 fetch() { [[ -s "cache/sources/$2" ]] || curl -fL --retry 3 "$1" -o "cache/sources/$2"; }
 fetch https://cdimage.ubuntu.com/ubuntu-base/releases/26.04/release/ubuntu-base-26.04.1-base-arm64.tar.gz ubuntu-base-26.04.1-base-arm64.tar.gz
 (cd cache/sources; sha256sum -c ../../config/source-checksums.sha256)

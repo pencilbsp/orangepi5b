@@ -72,6 +72,17 @@ login được sau khi wizard đã tạo tài khoản người dùng.
 
 ## Package trim profile
 
+Google Chrome Stable ARM64 `152.0.7977.82-1` là trình duyệt mặc định cho
+HTTP/HTTPS và HTML. Phiên bản và SHA-256 được ghim trong `config/chrome.env`
+(xác minh ngày 2026-09-07). `scripts/fetch-chrome.sh` tải URL chứa phiên bản
+cụ thể, kiểm tra checksum/package/version/architecture và giữ gói trong
+`cache/debs/`. Các lần build sau luôn cài đúng gói này, không dùng URL `current`
+hay tự chuyển sang bản mới. Hãy lưu giữ cache cho build lâu dài: nếu Google gỡ
+gói và cache không còn, build sẽ fail thay vì cài phiên bản khác.
+Muốn đổi bản ship phải chủ động cập nhật version và checksum trong file lock.
+Việc ghim áp dụng cho bản ship; người dùng vẫn có thể cập nhật Chrome qua APT
+sau khi boot.
+
 `config/boot.packages` là danh sách package cần cài. Sau khi desktop package đã resolve dependency/recommends, `scripts/install-rootfs.sh` purge thêm các package trong `config/boot.purge-packages`. Hiện tại danh sách này bỏ `gnome-terminal`/`gnome-terminal-data` vì Ubuntu 26.04 desktop-minimal đã kéo `ptyxis`, và `ptyxis` cung cấp `x-terminal-emulator`. Cuối bước rootfs, script chạy `apt-get clean` và xoá apt lists/pkgcache để không ship cache build vào image runtime.
 
 ## Kernel slim profile

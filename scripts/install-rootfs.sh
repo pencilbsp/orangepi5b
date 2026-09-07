@@ -4,6 +4,8 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 R="$ROOT/build/rootfs"
 [[ $(id -u) == 0 && -f "$R/etc/os-release" ]]
 grep -qx 'VERSION_ID="26.04"' "$R/etc/os-release"
+source "$ROOT/config/chrome.env"
+bash "$ROOT/scripts/fetch-chrome.sh"
 cleanup() {
   for p in dev sys proc; do
     if mountpoint -q "$R/$p"; then umount -R "$R/$p"; fi
@@ -47,6 +49,18 @@ if ((${#purge_packages[@]})); then
   chroot "$R" apt-get -y purge "${purge_packages[@]}"
 fi
 # Minimal board settings for this GNOME boot/display baseline.
+# Install the verified, versioned artifact rather than a repository candidate.
+chrome_deb="google-chrome-stable_${CHROME_VERSION}_arm64.deb"
+install -m 0644 "$ROOT/cache/debs/$chrome_deb" "$R/tmp/$chrome_deb"
+chroot "$R" apt-get -y --no-install-recommends install "/tmp/$chrome_deb"
+rm -f "$R/tmp/$chrome_deb"
+[[ $(chroot "$R" dpkg-query -W '-f=${Version}' google-chrome-stable) == "$CHROME_VERSION" ]]
+chroot "$R" update-alternatives --set x-www-browser /usr/bin/google-chrome-stable
+chroot "$R" update-alternatives --set gnome-www-browser /usr/bin/google-chrome-stable
+install -D -m 0644 "$ROOT/config/defaults/mimeapps.list" "$R/etc/xdg/mimeapps.list"
+# GNOME-specific defaults take precedence over the generic system defaults.
+install -D -m 0644 "$ROOT/config/defaults/mimeapps.list" "$R/etc/xdg/gnome-mimeapps.list"
+install -D -m 0644 "$ROOT/config/defaults/mimeapps.list" "$R/etc/skel/.config/mimeapps.list"
 install -D -m 0644 "$ROOT/config/rootfs/orangepi5b-display.conf" "$R/usr/share/initramfs-tools/modules.d/orangepi5b-display.conf"
 install -D -m 0644 "$ROOT/config/rootfs/orangepi5b-ap6275p.conf" "$R/usr/lib/modules-load.d/orangepi5b-ap6275p.conf"
 install -D -m 0644 "$ROOT/config/rootfs/bluetooth.service.d/10-orangepi5b-persistent.conf" "$R/etc/systemd/system/bluetooth.service.d/10-orangepi5b-persistent.conf"
