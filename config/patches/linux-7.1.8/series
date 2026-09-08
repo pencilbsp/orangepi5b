@@ -2,3 +2,4 @@
 0002-arm64-dts-rockchip-enable-orangepi5b-ap6275p.patch
 0003-rk3588s-orangepi5b-hdmi-frl.patch
 0004-rk3588s-orangepi5b-vop2-4k120.patch
+0005-rk3588s-orangepi5b-hdmi-hdr.patch

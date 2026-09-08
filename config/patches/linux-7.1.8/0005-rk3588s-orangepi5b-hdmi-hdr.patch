@@ -1,0 +1,127 @@
+RK3588S Orange Pi 5B HDR10 output over HDMI.
+
+Most of what HDR needs is already in 7.1.8. The HDMI connector helper builds
+and sends the Dynamic Range and Mastering InfoFrame, dw-hdmi-qp implements the
+packet writes behind it, and since patch 0003 this board runs the link at
+10 bpc — 4K120 RGB over FRL6. What is missing is the other half of the
+signalling, and the way it gets to the wire.
+
+A sink stays in SDR unless the AVI InfoFrame also declares BT.2020, and the
+colorimetry bits of that InfoFrame are filled from the "Colorspace" connector
+property, which no bridge-based HDMI connector attaches. Userspace has nothing
+to set, so HDR_OUTPUT_METADATA on its own changes nothing on screen and mutter
+reports the output as not HDR-capable. Attach it in drm_bridge_connector.
+
+Attach "Broadcast RGB" with it. On a CEA mode the helper defaults the
+quantization range to limited while nothing in this path narrows the
+framebuffer to match, so the sink is told to expand a signal that was never
+compressed. Under PQ that is not a subtle shift: the code values are absolute
+luminance, and userspace needs a way to say which range it is sending.
+
+Delivery is the second half. Bridges write InfoFrames from atomic_enable, so a
+commit that changes colorimetry or HDR metadata but no timing produces no
+modeset and never reaches the sink — and turning HDR on is exactly such a
+commit. Treat both as mode-changing in the HDMI atomic check, next to the bpc,
+format and quantization-range changes already listed there.
+
+One more state has to be explicit for this board: RGB range. The helper's
+Automatic policy follows CTA and advertises limited range on CEA timings, while
+Rockchip's scanout path is feeding full-range RGB buffers. After toggling HDR
+back to SDR this ambiguous range state can leave applications such as Chromium
+looking washed out until the display stack is restarted. Default to full-range
+RGB, make the Automatic policy resolve to full-range on this path even if
+userspace restores Automatic after login, and also treat changes in the derived
+limited/full result as mode-changing so the AVI InfoFrame is always rewritten.
+
+diff -Naur '--exclude=.git' '--exclude=*.orig' '--exclude=*.rej' '--exclude=include-prefixes' a/drivers/gpu/drm/display/drm_bridge_connector.c b/drivers/gpu/drm/display/drm_bridge_connector.c
+--- a/drivers/gpu/drm/display/drm_bridge_connector.c
++++ b/drivers/gpu/drm/display/drm_bridge_connector.c
+@@ -989,6 +989,32 @@
+ 
+ 		connector->hdmi.max_frl_rate_per_lane =
+ 			bridge_connector->bridge_hdmi->max_frl_rate_per_lane;
++
++		/*
++		 * A sink leaves SDR only when it is told two things: BT.2020
++		 * in the colorimetry bits of the AVI InfoFrame, and PQ or HLG
++		 * in the HDR InfoFrame. The HDMI connector helper fills both
++		 * from connector state, but the colorimetry half is read from
++		 * a property that nothing attaches here, so the AVI InfoFrame
++		 * can otherwise only ever say "default".
++		 */
++		ret = drm_mode_create_hdmi_colorspace_property(connector, 0);
++		if (ret)
++			return ERR_PTR(ret);
++
++		drm_connector_attach_colorspace_property(connector);
++
++		/*
++		 * The CTA default asks for limited range on a CEA mode, and
++		 * nothing in this path narrows a full-range framebuffer to
++		 * match, so the sink is told to expand what was never
++		 * compressed. Attaching the property lets userspace say which
++		 * range it is actually sending; it matters more under PQ,
++		 * where the code values are absolute luminance.
++		 */
++		ret = drm_connector_attach_broadcast_rgb_property(connector);
++		if (ret)
++			return ERR_PTR(ret);
+ 	} else {
+ 		ret = drmm_connector_init(drm, connector,
+ 					  &drm_bridge_connector_funcs,
+diff -Naur '--exclude=.git' '--exclude=*.orig' '--exclude=*.rej' '--exclude=include-prefixes' a/drivers/gpu/drm/display/drm_hdmi_state_helper.c b/drivers/gpu/drm/display/drm_hdmi_state_helper.c
+--- a/drivers/gpu/drm/display/drm_hdmi_state_helper.c
++++ b/drivers/gpu/drm/display/drm_hdmi_state_helper.c
+@@ -322,7 +322,15 @@
+ 
+ 	new_conn_state->max_bpc = max_bpc;
+ 	new_conn_state->max_requested_bpc = max_bpc;
+-	new_conn_state->hdmi.broadcast_rgb = DRM_HDMI_BROADCAST_RGB_AUTO;
++	/*
++	 * Rockchip's HDMI path feeds a full-range RGB framebuffer into the
++	 * controller. The CTA automatic default would advertise limited range
++	 * for CEA timings such as 3840x2160p120, which leaves the sink applying
++	 * a range expansion to pixels that were never compressed. Make the
++	 * default explicit so HDR->SDR transitions return to an unambiguous SDR
++	 * state. Userspace can still request limited range through the property.
++	 */
++	new_conn_state->hdmi.broadcast_rgb = DRM_HDMI_BROADCAST_RGB_FULL;
+ }
+ EXPORT_SYMBOL(__drm_atomic_helper_connector_hdmi_reset);
+ 
+@@ -385,6 +393,15 @@
+ 	if (conn_state->hdmi.broadcast_rgb == DRM_HDMI_BROADCAST_RGB_LIMITED)
+ 		return true;
+ 
++	/*
++	 * Userspace such as mutter may persist the connector property as
++	 * "Automatic". On this Rockchip path the scanout buffers are still
++	 * full-range RGB, so following the CTA limited-range default for CEA
++	 * timings makes the sink expand pixels that were never compressed.
++	 */
++	if (conn_state->hdmi.broadcast_rgb == DRM_HDMI_BROADCAST_RGB_AUTO)
++		return false;
++
+ 	if (!info->is_hdmi)
+ 		return false;
+ 
+@@ -988,9 +1005,18 @@
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * Drivers push the InfoFrames from their enable hook, so a change that
++	 * rewrites one without touching the mode would sit in connector state
++	 * and never reach the wire. Colorimetry and HDR metadata are exactly
++	 * that: turning HDR on or off changes no timing at all.
++	 */
+ 	if (old_conn_state->hdmi.broadcast_rgb != new_conn_state->hdmi.broadcast_rgb ||
++	    old_conn_state->hdmi.is_limited_range != new_conn_state->hdmi.is_limited_range ||
+ 	    old_conn_state->hdmi.output_bpc != new_conn_state->hdmi.output_bpc ||
+-	    old_conn_state->hdmi.output_format != new_conn_state->hdmi.output_format) {
++	    old_conn_state->hdmi.output_format != new_conn_state->hdmi.output_format ||
++	    old_conn_state->colorspace != new_conn_state->colorspace ||
++	    !drm_connector_atomic_hdr_metadata_equal(old_conn_state, new_conn_state)) {
+ 		struct drm_crtc *crtc = new_conn_state->crtc;
+ 		struct drm_crtc_state *crtc_state;
+ 
