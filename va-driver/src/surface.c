@@ -43,6 +43,7 @@
 
 #include "config.h"
 #include "context.h"
+#include "encode.h"
 #include "media.h"
 #include "picture.h"
 #include "utils.h"
@@ -74,6 +75,46 @@ find_unique_context_session(struct request_data *driver_data,
 	}
 
 	return session;
+}
+
+static struct object_context *
+find_encode_context(struct request_data *driver_data,
+		    unsigned int width, unsigned int height)
+{
+	struct object_context *context_object;
+	int iterator;
+
+	context_object = (struct object_context *)object_heap_first(
+		&driver_data->context_heap, &iterator);
+	while (context_object != NULL) {
+		if (context_object->is_encoder &&
+		    context_object->picture_width == (int)width &&
+		    context_object->picture_height == (int)height)
+			return context_object;
+
+		context_object = (struct object_context *)object_heap_next(
+			&driver_data->context_heap, &iterator);
+	}
+
+	return NULL;
+}
+
+static bool have_encode_config(struct request_data *driver_data)
+{
+	struct object_config *config_object;
+	int iterator;
+
+	config_object = (struct object_config *)object_heap_first(
+		&driver_data->config_heap, &iterator);
+	while (config_object != NULL) {
+		if (config_object->entrypoint == VAEntrypointEncSlice)
+			return true;
+
+		config_object = (struct object_config *)object_heap_next(
+			&driver_data->config_heap, &iterator);
+	}
+
+	return false;
 }
 
 /*
@@ -141,6 +182,7 @@ VAStatus RequestCreateSurfaces2(VADriverContextP context, unsigned int format,
 		surface_object->width = width;
 		surface_object->height = height;
 		surface_object->source_index = SURFACE_INDEX_UNASSIGNED;
+		surface_object->encode_fd = -1;
 		surface_object->destination_index = SURFACE_INDEX_UNASSIGNED;
 		surface_object->request_fd = -1;
 
@@ -167,6 +209,9 @@ VAStatus RequestCreateSurfaces2(VADriverContextP context, unsigned int format,
 		struct object_config *cfg =
 			(struct object_config *)object_heap_first(
 				&driver_data->config_heap, &it);
+
+		if (cfg != NULL && cfg->entrypoint == VAEntrypointEncSlice)
+			return VA_STATUS_SUCCESS;
 
 		probe_profile = cfg != NULL ? cfg->profile : VAProfileH264High;
 
@@ -235,6 +280,8 @@ VAStatus RequestDestroySurfaces(VADriverContextP context,
 
 		if (surface_object->request_fd >= 0)
 			close(surface_object->request_fd);
+
+		encode_surface_release(surface_object);
 
 		object_heap_free(&driver_data->surface_heap,
 				 (struct object_base *)surface_object);
@@ -416,6 +463,21 @@ static int config_frame_limits(struct request_data *driver_data,
 	if (profile_to_pixelformat(config_object->profile, &pixelformat) < 0)
 		return -1;
 
+	if (config_object->entrypoint == VAEntrypointEncSlice) {
+		int fd, rc;
+
+		if (!driver_data->has_encoder)
+			return -1;
+
+		fd = open(driver_data->encoder_video_path, O_RDWR | O_NONBLOCK);
+		if (fd < 0)
+			return -1;
+
+		rc = v4l2_get_frame_sizes(fd, V4L2_PIX_FMT_H264, limits);
+		close(fd);
+		return rc;
+	}
+
 	return v4l2_get_frame_sizes(driver_data->video_fd, pixelformat, limits);
 }
 
@@ -561,6 +623,64 @@ VAStatus RequestUnlockSurface(VADriverContextP context, VASurfaceID surface_id)
 	return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
+static VAStatus export_encode_surface(struct object_surface *surface_object,
+				      uint32_t flags,
+				      VADRMPRIMESurfaceDescriptor *descriptor)
+{
+	VAStatus status;
+	int fd;
+
+	status = encode_surface_storage(surface_object);
+	if (status != VA_STATUS_SUCCESS)
+		return status;
+
+	if (surface_object->encode_fd < 0)
+		return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+
+	fd = fcntl(surface_object->encode_fd, F_DUPFD_CLOEXEC, 0);
+	if (fd < 0)
+		return VA_STATUS_ERROR_OPERATION_FAILED;
+
+	memset(descriptor, 0, sizeof(*descriptor));
+	descriptor->fourcc = VA_FOURCC_NV12;
+	descriptor->width = surface_object->width;
+	descriptor->height = surface_object->height;
+	descriptor->num_objects = 1;
+	descriptor->objects[0].fd = fd;
+	descriptor->objects[0].size = surface_object->encode_size;
+	descriptor->objects[0].drm_format_modifier = DRM_FORMAT_MOD_LINEAR;
+
+	if (flags & VA_EXPORT_SURFACE_SEPARATE_LAYERS) {
+		descriptor->num_layers = 2;
+
+		descriptor->layers[0].drm_format = DRM_FORMAT_R8;
+		descriptor->layers[0].num_planes = 1;
+		descriptor->layers[0].object_index[0] = 0;
+		descriptor->layers[0].offset[0] = 0;
+		descriptor->layers[0].pitch[0] = surface_object->encode_pitch;
+
+		descriptor->layers[1].drm_format = DRM_FORMAT_GR88;
+		descriptor->layers[1].num_planes = 1;
+		descriptor->layers[1].object_index[0] = 0;
+		descriptor->layers[1].offset[0] =
+			surface_object->encode_pitch * surface_object->height;
+		descriptor->layers[1].pitch[0] = surface_object->encode_pitch;
+	} else {
+		descriptor->num_layers = 1;
+		descriptor->layers[0].drm_format = DRM_FORMAT_NV12;
+		descriptor->layers[0].num_planes = 2;
+		descriptor->layers[0].object_index[0] = 0;
+		descriptor->layers[0].offset[0] = 0;
+		descriptor->layers[0].pitch[0] = surface_object->encode_pitch;
+		descriptor->layers[0].object_index[1] = 0;
+		descriptor->layers[0].offset[1] =
+			surface_object->encode_pitch * surface_object->height;
+		descriptor->layers[0].pitch[1] = surface_object->encode_pitch;
+	}
+
+	return VA_STATUS_SUCCESS;
+}
+
 VAStatus RequestExportSurfaceHandle(VADriverContextP context,
 				    VASurfaceID surface_id, uint32_t mem_type,
 				    uint32_t flags, void *descriptor)
@@ -585,6 +705,15 @@ VAStatus RequestExportSurfaceHandle(VADriverContextP context,
 	surface_object = SURFACE(driver_data, surface_id);
 	if (surface_object == NULL)
 		return VA_STATUS_ERROR_INVALID_SURFACE;
+
+	if (find_encode_context(driver_data, surface_object->width,
+				surface_object->height) != NULL ||
+	    surface_object->encode_data != NULL ||
+	    (surface_object->session == NULL &&
+	     driver_data->probe_session.video_format == NULL &&
+	     have_encode_config(driver_data)))
+		return export_encode_surface(surface_object, flags,
+					     surface_descriptor);
 
 	/*
 	 * A surface exported before any context exists -- Chrome does this --

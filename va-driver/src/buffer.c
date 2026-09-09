@@ -61,6 +61,13 @@ VAStatus RequestCreateBuffer(VADriverContextP context, VAContextID context_id,
 	case VASliceParameterBufferType:
 	case VASliceDataBufferType:
 	case VAImageBufferType:
+	case VAEncSequenceParameterBufferType:
+	case VAEncPictureParameterBufferType:
+	case VAEncSliceParameterBufferType:
+	case VAEncMiscParameterBufferType:
+	case VAEncPackedHeaderParameterBufferType:
+	case VAEncPackedHeaderDataBufferType:
+	case VAEncCodedBufferType:
 		break;
 
 	default:
@@ -75,20 +82,43 @@ VAStatus RequestCreateBuffer(VADriverContextP context, VAContextID context_id,
 		goto error;
 	}
 
-	buffer_data = malloc(size * count);
-	if (buffer_data == NULL) {
-		status = VA_STATUS_ERROR_ALLOCATION_FAILED;
-		goto error;
-	}
+	if (type == VAEncCodedBufferType) {
+		VACodedBufferSegment *segment;
+		unsigned int capacity = size * count;
 
-	if (data != NULL)
-		memcpy(buffer_data, data, size * count);
+		buffer_data = malloc(sizeof(*segment) + capacity);
+		if (buffer_data == NULL) {
+			status = VA_STATUS_ERROR_ALLOCATION_FAILED;
+			goto error;
+		}
+
+		segment = buffer_data;
+		memset(segment, 0, sizeof(*segment));
+		segment->buf = (unsigned char *)buffer_data + sizeof(*segment);
+		segment->next = NULL;
+
+		buffer_object->coded_segment = true;
+		buffer_object->coded_capacity = capacity;
+	} else {
+		buffer_data = malloc(size * count);
+		if (buffer_data == NULL) {
+			status = VA_STATUS_ERROR_ALLOCATION_FAILED;
+			goto error;
+		}
+
+		if (data != NULL)
+			memcpy(buffer_data, data, size * count);
+
+		buffer_object->coded_segment = false;
+		buffer_object->coded_capacity = 0;
+	}
 
 	buffer_object->type = type;
 	buffer_object->initial_count = count;
 	buffer_object->count = count;
 	buffer_object->data = buffer_data;
 	buffer_object->size = size;
+	buffer_object->data_borrowed = false;
 
 	buffer_object->derived_surface_id = VA_INVALID_ID;
 	buffer_object->info.handle = (uintptr_t) -1;
@@ -116,7 +146,7 @@ VAStatus RequestDestroyBuffer(VADriverContextP context, VABufferID buffer_id)
 	if (buffer_object == NULL)
 		return VA_STATUS_ERROR_INVALID_BUFFER;
 
-	if (buffer_object->data != NULL)
+	if (buffer_object->data != NULL && !buffer_object->data_borrowed)
 		free(buffer_object->data);
 
 	object_heap_free(&driver_data->buffer_heap,

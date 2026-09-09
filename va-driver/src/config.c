@@ -28,7 +28,10 @@
 #include "request.h"
 
 #include <assert.h>
+#include <stdbool.h>
+#include <fcntl.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <sys/ioctl.h>
 
@@ -40,6 +43,87 @@
 #include "v4l2.h"
 
 #include "autoconfig.h"
+
+static bool config_profile_is_h264(VAProfile profile)
+{
+	switch (profile) {
+	case VAProfileH264ConstrainedBaseline:
+	case VAProfileH264Main:
+	case VAProfileH264High:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool config_encoder_limits(struct request_data *driver_data,
+				  struct v4l2_frame_limits *limits)
+{
+	int fd;
+	int rc;
+
+	if (!driver_data->has_encoder)
+		return false;
+
+	fd = open(driver_data->encoder_video_path, O_RDWR | O_NONBLOCK);
+	if (fd < 0)
+		return false;
+
+	rc = v4l2_get_frame_sizes(fd, V4L2_PIX_FMT_H264, limits);
+	close(fd);
+
+	return rc == 0;
+}
+
+static void config_get_encode_attribute(bool have_limits,
+					struct v4l2_frame_limits *limits,
+					VAConfigAttrib *attribute)
+{
+	switch (attribute->type) {
+	case VAConfigAttribRTFormat:
+		attribute->value = VA_RT_FORMAT_YUV420;
+		break;
+	case VAConfigAttribRateControl:
+		attribute->value = VA_RC_CQP;
+		break;
+	case VAConfigAttribEncMaxRefFrames:
+		attribute->value = 1;
+		break;
+	case VAConfigAttribEncPackedHeaders:
+		attribute->value = VA_ENC_PACKED_HEADER_SEQUENCE |
+				    VA_ENC_PACKED_HEADER_PICTURE |
+				    VA_ENC_PACKED_HEADER_SLICE |
+				    VA_ENC_PACKED_HEADER_MISC |
+				    VA_ENC_PACKED_HEADER_RAW_DATA;
+		break;
+	case VAConfigAttribEncMaxSlices:
+		attribute->value = 1;
+		break;
+	case VAConfigAttribEncSliceStructure:
+		attribute->value = VA_ENC_SLICE_STRUCTURE_EQUAL_MULTI_ROWS;
+		break;
+	case VAConfigAttribMaxPictureWidth:
+		attribute->value = have_limits ? limits->max_width :
+						  VA_ATTRIB_NOT_SUPPORTED;
+		break;
+	case VAConfigAttribMaxPictureHeight:
+		attribute->value = have_limits ? limits->max_height :
+						  VA_ATTRIB_NOT_SUPPORTED;
+		break;
+	case VAConfigAttribEncQualityRange:
+		attribute->value = 1;
+		break;
+	case VAConfigAttribEncMacroblockInfo:
+	case VAConfigAttribEncQuantization:
+	case VAConfigAttribEncIntraRefresh:
+	case VAConfigAttribEncROI:
+		attribute->value = 0;
+		break;
+	default:
+		attribute->value = VA_ATTRIB_NOT_SUPPORTED;
+		break;
+	}
+}
 
 VAStatus RequestCreateConfig(VADriverContextP context, VAProfile profile,
 			     VAEntrypoint entrypoint,
@@ -55,6 +139,12 @@ VAStatus RequestCreateConfig(VADriverContextP context, VAProfile profile,
 	case VAProfileH264ConstrainedBaseline:
 	case VAProfileH264Main:
 	case VAProfileH264High:
+		if (entrypoint == VAEntrypointVLD)
+			break;
+		if (entrypoint == VAEntrypointEncSlice && driver_data->has_encoder)
+			break;
+		return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
+
 	case VAProfileHEVCMain:
 		if (entrypoint != VAEntrypointVLD)
 			return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
@@ -78,11 +168,19 @@ VAStatus RequestCreateConfig(VADriverContextP context, VAProfile profile,
 	config_object->attributes[0].value = VA_RT_FORMAT_YUV420;
 	config_object->attributes_count = 1;
 
-	for (i = 1; i < attributes_count; i++) {
-		index = config_object->attributes_count++;
-		config_object->attributes[index].type = attributes[index].type;
+	for (i = 0; i < attributes_count; i++) {
+		if (attributes[i].type == VAConfigAttribRTFormat) {
+			config_object->attributes[0].value = attributes[i].value;
+			continue;
+		}
+
+		index = config_object->attributes_count;
+		if (index >= V4L2_REQUEST_MAX_CONFIG_ATTRIBUTES)
+			break;
+		config_object->attributes_count++;
+		config_object->attributes[index].type = attributes[i].type;
 		config_object->attributes[index].value =
-			attributes[index].value;
+			attributes[i].value;
 	}
 
 	*config_id = id;
@@ -150,10 +248,23 @@ VAStatus RequestQueryConfigEntrypoints(VADriverContextP context,
 				       VAEntrypoint *entrypoints,
 				       int *entrypoints_count)
 {
+	struct request_data *driver_data = context->pDriverData;
+	int index = 0;
+
 	switch (profile) {
 	case VAProfileH264ConstrainedBaseline:
 	case VAProfileH264Main:
 	case VAProfileH264High:
+		entrypoints[index++] = VAEntrypointVLD;
+		/*
+		 * The encoder is H.264 only; HEVC encode needs a second
+		 * register path the kernel driver does not have yet.
+		 */
+		if (driver_data->has_encoder)
+			entrypoints[index++] = VAEntrypointEncSlice;
+		*entrypoints_count = index;
+		break;
+
 	case VAProfileHEVCMain:
 		entrypoints[0] = VAEntrypointVLD;
 		*entrypoints_count = 1;
@@ -209,7 +320,16 @@ VAStatus RequestGetConfigAttributes(VADriverContextP context, VAProfile profile,
 	bool have_limits = false;
 	int i;
 
-	(void)entrypoint;
+	if (entrypoint == VAEntrypointEncSlice && config_profile_is_h264(profile) &&
+	    driver_data->has_encoder) {
+		have_limits = config_encoder_limits(driver_data, &limits);
+
+		for (i = 0; i < attributes_count; i++)
+			config_get_encode_attribute(have_limits, &limits,
+						    &attributes[i]);
+
+		return VA_STATUS_SUCCESS;
+	}
 
 	if (profile_to_pixelformat(profile, &pixelformat) == 0)
 		have_limits = v4l2_get_frame_sizes(driver_data->video_fd,

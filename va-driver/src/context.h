@@ -32,6 +32,7 @@
 
 #include <va/va_backend.h>
 
+#include "encode.h"
 #include "object_heap.h"
 #include "h264.h"
 #include "session.h"
@@ -54,6 +55,10 @@ struct object_context {
 
 	/* This context's own decoder handles and queue state. */
 	struct decoder_session session;
+
+	bool is_encoder;
+	struct encode_context encode;
+	struct encode_picture_params encode_params;
 
 	/* H264 only */
 	struct h264_dpb dpb;

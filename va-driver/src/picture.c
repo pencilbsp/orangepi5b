@@ -28,6 +28,7 @@
 #include "buffer.h"
 #include "config.h"
 #include "context.h"
+#include "encode.h"
 #include "request.h"
 #include "surface.h"
 #include "video.h"
@@ -419,6 +420,7 @@ VAStatus RequestBeginPicture(VADriverContextP context, VAContextID context_id,
 	struct object_context *context_object;
 	struct object_config *config_object;
 	struct object_surface *surface_object;
+	VAStatus status;
 	int rc;
 
 	context_object = CONTEXT(driver_data, context_id);
@@ -432,6 +434,23 @@ VAStatus RequestBeginPicture(VADriverContextP context, VAContextID context_id,
 	surface_object = SURFACE(driver_data, surface_id);
 	if (surface_object == NULL)
 		return VA_STATUS_ERROR_INVALID_SURFACE;
+
+	if (context_object->is_encoder) {
+		if (surface_object->status == VASurfaceRendering)
+			RequestSyncSurface(context, surface_id);
+
+		status = encode_surface_storage(surface_object);
+		if (status != VA_STATUS_SUCCESS)
+			return status;
+
+		encode_params_reset(&context_object->encode_params);
+		surface_object->status = VASurfaceRendering;
+		surface_object->slices_count = 0;
+		surface_object->slices_size = 0;
+		context_object->render_surface_id = surface_id;
+
+		return VA_STATUS_SUCCESS;
+	}
 
 	if (context_adopt_probe_session(driver_data, context_object,
 					config_object, surface_object) < 0)
@@ -485,6 +504,14 @@ VAStatus RequestRenderPicture(VADriverContextP context, VAContextID context_id,
 		buffer_object = BUFFER(driver_data, buffers_ids[i]);
 		if (buffer_object == NULL)
 			return VA_STATUS_ERROR_INVALID_BUFFER;
+
+		if (context_object->is_encoder) {
+			rc = encode_params_collect(&context_object->encode_params,
+						   buffer_object);
+			if (rc != VA_STATUS_SUCCESS)
+				return rc;
+			continue;
+		}
 
 		rc = codec_store_buffer(driver_data, config_object->profile,
 					surface_object, buffer_object);
@@ -553,6 +580,7 @@ VAStatus RequestEndPicture(VADriverContextP context, VAContextID context_id)
 	struct object_surface *surface_object;
 	struct decoder_session *session;
 	struct video_format *video_format;
+	struct object_buffer *coded_buffer;
 	unsigned int output_type, capture_type;
 	int request_fd;
 	VAStatus status;
@@ -562,14 +590,6 @@ VAStatus RequestEndPicture(VADriverContextP context, VAContextID context_id)
 	if (context_object == NULL)
 		return VA_STATUS_ERROR_INVALID_CONTEXT;
 
-	session = &context_object->session;
-	video_format = session->video_format;
-	if (video_format == NULL)
-		return VA_STATUS_ERROR_OPERATION_FAILED;
-
-	output_type = v4l2_type_video_output(video_format->v4l2_mplane);
-	capture_type = v4l2_type_video_capture(video_format->v4l2_mplane);
-
 	config_object = CONFIG(driver_data, context_object->config_id);
 	if (config_object == NULL)
 		return VA_STATUS_ERROR_INVALID_CONFIG;
@@ -578,6 +598,37 @@ VAStatus RequestEndPicture(VADriverContextP context, VAContextID context_id)
 		SURFACE(driver_data, context_object->render_surface_id);
 	if (surface_object == NULL)
 		return VA_STATUS_ERROR_INVALID_SURFACE;
+
+	if (context_object->is_encoder) {
+		if (!context_object->encode_params.have_picture)
+			return VA_STATUS_ERROR_INVALID_BUFFER;
+
+		coded_buffer = BUFFER(driver_data,
+				      context_object->encode_params.picture.coded_buf);
+		if (coded_buffer == NULL ||
+		    coded_buffer->type != VAEncCodedBufferType)
+			return VA_STATUS_ERROR_INVALID_BUFFER;
+
+		status = encode_picture_submit(&context_object->encode,
+					       surface_object,
+					       &context_object->encode_params,
+					       coded_buffer);
+		if (status != VA_STATUS_SUCCESS)
+			return status;
+
+		surface_object->status = VASurfaceReady;
+		context_object->render_surface_id = VA_INVALID_ID;
+
+		return VA_STATUS_SUCCESS;
+	}
+
+	session = &context_object->session;
+	video_format = session->video_format;
+	if (video_format == NULL)
+		return VA_STATUS_ERROR_OPERATION_FAILED;
+
+	output_type = v4l2_type_video_output(video_format->v4l2_mplane);
+	capture_type = v4l2_type_video_capture(video_format->v4l2_mplane);
 
 	gettimeofday(&surface_object->timestamp, NULL);
 

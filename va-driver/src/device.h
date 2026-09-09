@@ -17,4 +17,13 @@ int decoder_device_open(int *video_fd_out, int *media_fd_out,
 			char *video_path_out, char *media_path_out,
 			size_t path_len);
 
+/*
+ * Find the stateful H.264 encoder, if the kernel has one. Unlike the decoder
+ * this is optional: a build without the RKVENC driver still decodes, and the
+ * driver simply does not advertise an encode entrypoint.
+ *
+ * Returns 0 and fills @video_path_out, or -1 when no encoder is present.
+ */
+int encoder_device_find(char *video_path_out, size_t path_len);
+
 #endif

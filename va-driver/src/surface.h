@@ -55,6 +55,11 @@ struct object_surface {
 	void *source_data;
 	unsigned int source_size;
 
+	void *encode_data;
+	unsigned int encode_size;
+	unsigned int encode_pitch;
+	int encode_fd;
+
 	unsigned int destination_index;
 	void *destination_map[VIDEO_MAX_PLANES];
 	unsigned int destination_map_lengths[VIDEO_MAX_PLANES];

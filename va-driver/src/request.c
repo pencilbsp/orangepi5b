@@ -141,6 +141,15 @@ VAStatus VA_DRIVER_INIT_FUNC(VADriverContextP context)
 	pthread_mutex_init(&driver_data->lock, NULL);
 
 	/*
+	 * Encode is optional. Probing it here rather than at vaCreateConfig
+	 * keeps the answer to vaQueryConfigEntrypoints a property of the
+	 * machine instead of something that changes with call order.
+	 */
+	driver_data->has_encoder =
+		encoder_device_find(driver_data->encoder_video_path,
+				    sizeof(driver_data->encoder_video_path)) == 0;
+
+	/*
 	 * driver_data is zeroed above, so an unopened session would read
 	 * fd 0 -- stdin -- as a live handle. Every decoder_session field
 	 * that means "no handle" has to say -1 explicitly.

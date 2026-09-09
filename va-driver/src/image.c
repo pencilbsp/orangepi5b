@@ -26,15 +26,112 @@
 
 #include "image.h"
 #include "buffer.h"
+#include "config.h"
+#include "context.h"
+#include "encode.h"
 #include "request.h"
 #include "surface.h"
 #include "video.h"
 
 #include <assert.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "utils.h"
 #include "v4l2.h"
+
+static bool image_surface_has_encode_context(struct request_data *driver_data,
+					     struct object_surface *surface_object)
+{
+	struct object_context *context_object;
+	int iterator;
+
+	context_object = (struct object_context *)object_heap_first(
+		&driver_data->context_heap, &iterator);
+	while (context_object != NULL) {
+		if (context_object->is_encoder &&
+		    context_object->picture_width == surface_object->width &&
+		    context_object->picture_height == surface_object->height)
+			return true;
+
+		context_object = (struct object_context *)object_heap_next(
+			&driver_data->context_heap, &iterator);
+	}
+
+	return false;
+}
+
+static bool image_have_encode_config(struct request_data *driver_data)
+{
+	struct object_config *config_object;
+	int iterator;
+
+	config_object = (struct object_config *)object_heap_first(
+		&driver_data->config_heap, &iterator);
+	while (config_object != NULL) {
+		if (config_object->entrypoint == VAEntrypointEncSlice)
+			return true;
+
+		config_object = (struct object_config *)object_heap_next(
+			&driver_data->config_heap, &iterator);
+	}
+
+	return false;
+}
+
+static bool image_surface_is_encode(struct request_data *driver_data,
+				    struct object_surface *surface_object)
+{
+	if (surface_object->encode_data != NULL)
+		return true;
+
+	if (image_surface_has_encode_context(driver_data, surface_object))
+		return true;
+
+	return surface_object->session == NULL &&
+	       driver_data->probe_session.video_format == NULL &&
+	       image_have_encode_config(driver_data);
+}
+
+static VAStatus alias_encode_surface_to_image(struct request_data *driver_data,
+					      struct object_surface *surface_object,
+					      VAImage *image)
+{
+	struct object_buffer *buffer_object;
+	struct object_image *image_object;
+	VAStatus status;
+
+	status = encode_surface_storage(surface_object);
+	if (status != VA_STATUS_SUCCESS)
+		return status;
+
+	image->pitches[0] = surface_object->encode_pitch;
+	image->pitches[1] = surface_object->encode_pitch;
+	image->offsets[0] = 0;
+	image->offsets[1] = surface_object->encode_pitch *
+			    (unsigned int)surface_object->height;
+	image->data_size = surface_object->encode_size;
+
+	buffer_object = BUFFER(driver_data, image->buf);
+	if (buffer_object == NULL)
+		return VA_STATUS_ERROR_INVALID_BUFFER;
+
+	if (buffer_object->data != NULL && !buffer_object->data_borrowed)
+		free(buffer_object->data);
+
+	buffer_object->data = surface_object->encode_data;
+	buffer_object->size = image->data_size;
+	buffer_object->initial_count = 1;
+	buffer_object->count = 1;
+	buffer_object->data_borrowed = true;
+	buffer_object->derived_surface_id = surface_object->base.id;
+
+	image_object = IMAGE(driver_data, image->image_id);
+	if (image_object != NULL)
+		image_object->image = *image;
+
+	return VA_STATUS_SUCCESS;
+}
 
 VAStatus RequestCreateImage(VADriverContextP context, VAImageFormat *format,
 			    int width, int height, VAImage *image)
@@ -210,6 +307,16 @@ VAStatus RequestDeriveImage(VADriverContextP context, VASurfaceID surface_id,
 				    surface_object->height, image);
 	if (status != VA_STATUS_SUCCESS)
 		return status;
+
+	if (image_surface_is_encode(driver_data, surface_object)) {
+		status = alias_encode_surface_to_image(driver_data,
+						       surface_object, image);
+		if (status != VA_STATUS_SUCCESS)
+			return status;
+
+		surface_object->status = VASurfaceReady;
+		return VA_STATUS_SUCCESS;
+	}
 
 	status = copy_surface_to_image (driver_data, surface_object, image);
 	if (status != VA_STATUS_SUCCESS)

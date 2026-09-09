@@ -217,3 +217,83 @@ int decoder_device_open(int *video_fd_out, int *media_fd_out,
 	snprintf(media_path_out, path_len, "%s", media_path);
 	return 0;
 }
+
+/*
+ * Encoders are told apart from decoders by the coded format they carry: a
+ * stateless decoder advertises V4L2_PIX_FMT_H264_SLICE, a stateful encoder
+ * plain V4L2_PIX_FMT_H264. The JPEG-only VEPU121 on this SoC advertises
+ * neither, so it never matches.
+ */
+static int rank_encoder(int fd, const char *path, const char *wanted_path)
+{
+	struct v4l2_capability capability;
+
+	if (wanted_path != NULL && strcmp(path, wanted_path) == 0)
+		return RANK_ENVIRONMENT;
+
+	memset(&capability, 0, sizeof(capability));
+	if (ioctl(fd, VIDIOC_QUERYCAP, &capability) < 0)
+		return RANK_NONE;
+
+	if (!(capability.capabilities & V4L2_CAP_STREAMING))
+		return RANK_NONE;
+
+	/*
+	 * The coded format sits on the queue the block writes, which for an
+	 * encoder is CAPTURE -- the mirror of a stateless decoder, where it is
+	 * on OUTPUT. Probing the decoder's side here finds nothing and quietly
+	 * reports that the machine has no encoder.
+	 */
+	if (!v4l2_find_format(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+			      V4L2_PIX_FMT_H264) &&
+	    !v4l2_find_format(fd, V4L2_BUF_TYPE_VIDEO_CAPTURE,
+			      V4L2_PIX_FMT_H264))
+		return RANK_NONE;
+
+	if (strstr((const char *)capability.card, "VEPU580") != NULL)
+		return RANK_RKVDEC;
+
+	return RANK_OTHER;
+}
+
+int encoder_device_find(char *video_path_out, size_t path_len)
+{
+	const char *wanted = getenv("LIBVA_V4L2_REQUEST_ENCODER_PATH");
+	int best_rank = RANK_NONE;
+	struct dirent *entry;
+	DIR *dir;
+
+	dir = opendir("/dev");
+	if (dir == NULL)
+		return -1;
+
+	while ((entry = readdir(dir)) != NULL) {
+		char path[PATH_MAX];
+		int rank, fd;
+
+		if (strncmp(entry->d_name, "video", 5) != 0)
+			continue;
+
+		snprintf(path, sizeof(path), "/dev/%s", entry->d_name);
+		fd = open(path, O_RDWR | O_NONBLOCK);
+		if (fd < 0)
+			continue;
+
+		rank = rank_encoder(fd, path, wanted);
+		close(fd);
+
+		if (rank > best_rank) {
+			best_rank = rank;
+			snprintf(video_path_out, path_len, "%s", path);
+		}
+	}
+
+	closedir(dir);
+
+	if (best_rank == RANK_NONE)
+		return -1;
+
+	request_log("device: encoder at %s\n", video_path_out);
+
+	return 0;
+}

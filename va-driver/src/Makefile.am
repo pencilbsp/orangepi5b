@@ -32,6 +32,8 @@ v4l2_request_drv_video_la_SOURCES = request.c \
 	surface.h \
 	context.c \
 	context.h \
+	encode.c \
+	encode.h \
 	buffer.c \
 	buffer.h \
 	picture.c \

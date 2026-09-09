@@ -26,6 +26,7 @@
 
 #include "context.h"
 #include "config.h"
+#include "encode.h"
 #include "request.h"
 #include "surface.h"
 #include "video.h"
@@ -78,6 +79,17 @@ static unsigned int pool_depth(int width, int height)
 		depth = POOL_MIN_BUFFERS;
 
 	return depth;
+}
+
+static unsigned int context_config_rate_control(struct object_config *config)
+{
+	int i;
+
+	for (i = 0; i < config->attributes_count; i++)
+		if (config->attributes[i].type == VAConfigAttribRateControl)
+			return config->attributes[i].value;
+
+	return VA_RC_CQP;
 }
 
 static int detect_capture_format(struct decoder_session *session)
@@ -289,19 +301,37 @@ VAStatus RequestCreateContext(VADriverContextP context, VAConfigID config_id,
 	context_object = CONTEXT(driver_data, id);
 	if (context_object == NULL)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	memset(context_object, 0, sizeof(*context_object));
+	context_object->base.id = id;
+	context_object->base.next_free = OBJECT_HEAP_ALLOCATED;
+	context_object->session.video_fd = -1;
+	context_object->session.media_fd = -1;
+	context_object->encode.video_fd = -1;
 	memset(&context_object->dpb, 0, sizeof(context_object->dpb));
 
-	if (decoder_session_open(driver_data, &context_object->session) < 0) {
-		status = VA_STATUS_ERROR_OPERATION_FAILED;
-		goto error;
-	}
+	if (config_object->entrypoint == VAEntrypointEncSlice) {
+		if (encode_context_create(driver_data, &context_object->encode,
+					  config_object->profile,
+					  context_config_rate_control(config_object),
+					  picture_width, picture_height) < 0) {
+			status = VA_STATUS_ERROR_OPERATION_FAILED;
+			goto error;
+		}
 
-	if (request_ensure_v4l2_initialized(&context_object->session,
-					    config_object->profile,
-					    picture_width,
-					    picture_height) < 0) {
-		status = VA_STATUS_ERROR_OPERATION_FAILED;
-		goto error;
+		context_object->is_encoder = true;
+	} else {
+		if (decoder_session_open(driver_data, &context_object->session) < 0) {
+			status = VA_STATUS_ERROR_OPERATION_FAILED;
+			goto error;
+		}
+
+		if (request_ensure_v4l2_initialized(&context_object->session,
+						    config_object->profile,
+						    picture_width,
+						    picture_height) < 0) {
+			status = VA_STATUS_ERROR_OPERATION_FAILED;
+			goto error;
+		}
 	}
 
 	/* Snapshot the caller's surface_ids — its lifetime is unspecified
@@ -332,9 +362,12 @@ error:
 	if (ids != NULL)
 		free(ids);
 
-	if (context_object != NULL)
+	if (context_object != NULL) {
+		encode_context_destroy(&context_object->encode);
+		decoder_session_close(&context_object->session);
 		object_heap_free(&driver_data->context_heap,
 				 (struct object_base *)context_object);
+	}
 
 	return status;
 }
@@ -359,7 +392,9 @@ VAStatus RequestDestroyContext(VADriverContextP context, VAContextID context_id)
 	 * Only this context's queues are torn down. Reaching for the driver's
 	 * handles here would stop a decode running in another context.
 	 */
-	if (video_format != NULL) {
+	if (context_object->is_encoder) {
+		encode_context_destroy(&context_object->encode);
+	} else if (video_format != NULL) {
 		output_type = v4l2_type_video_output(video_format->v4l2_mplane);
 		capture_type = v4l2_type_video_capture(video_format->v4l2_mplane);
 
@@ -381,7 +416,8 @@ VAStatus RequestDestroyContext(VADriverContextP context, VAContextID context_id)
 	 * with no render-target list -- are not on surfaces_ids and survive
 	 * it, so they have to be cut loose before the slot is recycled.
 	 */
-	surface_detach_session(driver_data, session);
+	if (!context_object->is_encoder)
+		surface_detach_session(driver_data, session);
 
 	/*
 	 * Closing the handles is what actually releases the decode session;
@@ -389,11 +425,11 @@ VAStatus RequestDestroyContext(VADriverContextP context, VAContextID context_id)
 	 * afterwards cannot read "already configured" from a queue that is
 	 * gone.
 	 */
-	decoder_session_close(session);
+	if (!context_object->is_encoder)
+		decoder_session_close(session);
 
 	object_heap_free(&driver_data->context_heap,
 			 (struct object_base *)context_object);
 
 	return VA_STATUS_SUCCESS;
 }
-

@@ -27,6 +27,8 @@
 #ifndef _BUFFER_H_
 #define _BUFFER_H_
 
+#include <stdbool.h>
+
 #include <va/va_backend.h>
 
 #include "object_heap.h"
@@ -48,6 +50,10 @@ struct object_buffer {
 
 	VASurfaceID derived_surface_id;
 	VABufferInfo info;
+
+	bool data_borrowed;
+	bool coded_segment;
+	unsigned int coded_capacity;
 };
 
 VAStatus RequestCreateBuffer(VADriverContextP context, VAContextID context_id,

@@ -72,6 +72,14 @@ struct request_data {
 	char media_path[PATH_MAX];
 
 	/*
+	 * The stateful H.264 encoder, when the kernel has one. Empty means no
+	 * encode entrypoint is advertised, which is the correct answer on a
+	 * build without the RKVENC driver rather than an error.
+	 */
+	char encoder_video_path[PATH_MAX];
+	bool has_encoder;
+
+	/*
 	 * Clients that touch vaDeriveImage or vaExportSurfaceHandle before
 	 * creating a context have no session to use, so surfaces bound that
 	 * early borrow this one.
