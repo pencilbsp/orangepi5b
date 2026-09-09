@@ -252,6 +252,7 @@ VAStatus RequestDestroySurfaces(VADriverContextP context,
 {
 	struct request_data *driver_data = context->pDriverData;
 	struct object_surface *surface_object;
+	VAStatus status = VA_STATUS_SUCCESS;
 	unsigned int j;
 	int i;
 
@@ -262,8 +263,16 @@ VAStatus RequestDestroySurfaces(VADriverContextP context,
 	 */
 	for (i = 0; i < surfaces_count; i++) {
 		surface_object = SURFACE(driver_data, surfaces_ids[i]);
-		if (surface_object == NULL)
-			return VA_STATUS_ERROR_INVALID_SURFACE;
+		if (surface_object == NULL) {
+			/*
+			 * Report the first bad id, but keep going. Stopping
+			 * here would strand every surface behind it, and a
+			 * client has no way to resume a destroy that gave up
+			 * part way through.
+			 */
+			status = VA_STATUS_ERROR_INVALID_SURFACE;
+			continue;
+		}
 
 		if (surface_object->source_data != NULL &&
 		    surface_object->source_data != MAP_FAILED &&
@@ -287,7 +296,7 @@ VAStatus RequestDestroySurfaces(VADriverContextP context,
 				 (struct object_base *)surface_object);
 	}
 
-	return VA_STATUS_SUCCESS;
+	return status;
 }
 
 /*

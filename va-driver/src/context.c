@@ -289,7 +289,6 @@ VAStatus RequestCreateContext(VADriverContextP context, VAConfigID config_id,
 	struct request_data *driver_data = context->pDriverData;
 	struct object_config *config_object;
 	struct object_context *context_object = NULL;
-	VASurfaceID *ids = NULL;
 	VAContextID id;
 	VAStatus status;
 
@@ -334,22 +333,14 @@ VAStatus RequestCreateContext(VADriverContextP context, VAConfigID config_id,
 		}
 	}
 
-	/* Snapshot the caller's surface_ids — its lifetime is unspecified
-	 * by libva and we need it on context teardown. */
-	if (surfaces_count > 0) {
-		ids = malloc((size_t)surfaces_count * sizeof(VASurfaceID));
-		if (ids == NULL) {
-			status = VA_STATUS_ERROR_ALLOCATION_FAILED;
-			goto error;
-		}
-		memcpy(ids, surfaces_ids,
-		       (size_t)surfaces_count * sizeof(VASurfaceID));
-	}
-
+	/*
+	 * The render targets are not copied. They belong to the client, which
+	 * created them with vaCreateSurfaces and will destroy them with
+	 * vaDestroySurfaces; a context that kept the list would only be
+	 * tempted to act on it.
+	 */
 	context_object->config_id = config_id;
 	context_object->render_surface_id = VA_INVALID_ID;
-	context_object->surfaces_ids = ids;
-	context_object->surfaces_count = surfaces_count;
 	context_object->picture_width = picture_width;
 	context_object->picture_height = picture_height;
 	context_object->flags = flags;
@@ -359,9 +350,6 @@ VAStatus RequestCreateContext(VADriverContextP context, VAConfigID config_id,
 	return VA_STATUS_SUCCESS;
 
 error:
-	if (ids != NULL)
-		free(ids);
-
 	if (context_object != NULL) {
 		encode_context_destroy(&context_object->encode);
 		decoder_session_close(&context_object->session);
@@ -379,7 +367,6 @@ VAStatus RequestDestroyContext(VADriverContextP context, VAContextID context_id)
 	struct decoder_session *session;
 	struct video_format *video_format;
 	unsigned int output_type, capture_type;
-	VAStatus status;
 
 	context_object = CONTEXT(driver_data, context_id);
 	if (context_object == NULL)
@@ -389,6 +376,20 @@ VAStatus RequestDestroyContext(VADriverContextP context, VAContextID context_id)
 	video_format = session->video_format;
 
 	/*
+	 * A context owns its queues and its session. It does not own the
+	 * surfaces it was handed: those come from vaCreateSurfaces and go back
+	 * through vaDestroySurfaces, which the client calls separately and in
+	 * whichever order it likes -- libva-utils destroys the context first,
+	 * then the surfaces.
+	 *
+	 * Destroying them from here returned their heap slots to the free list
+	 * while the client still held the ids. The client's own
+	 * vaDestroySurfaces then failed, or, if anything had allocated a
+	 * surface in between, tore down whichever live surface had been handed
+	 * that recycled slot. Called the other way round it was worse: the
+	 * lookups came back NULL, this function bailed out early, and the
+	 * session's two file descriptors were never closed.
+	 *
 	 * Only this context's queues are torn down. Reaching for the driver's
 	 * handles here would stop a decode running in another context.
 	 */
@@ -404,29 +405,22 @@ VAStatus RequestDestroyContext(VADriverContextP context, VAContextID context_id)
 		v4l2_request_buffers(session->video_fd, capture_type, 0);
 	}
 
-	status = RequestDestroySurfaces(context, context_object->surfaces_ids,
-					context_object->surfaces_count);
-	if (status != VA_STATUS_SUCCESS)
-		return VA_STATUS_ERROR_OPERATION_FAILED;
-
-	free(context_object->surfaces_ids);
-
 	/*
-	 * Surfaces created outside this context -- Chrome creates its contexts
-	 * with no render-target list -- are not on surfaces_ids and survive
-	 * it, so they have to be cut loose before the slot is recycled.
-	 */
-	if (!context_object->is_encoder)
-		surface_detach_session(driver_data, session);
-
-	/*
+	 * Surfaces outlive the context, so whatever they hold of this session
+	 * has to be taken back before its handles close: their mappings point
+	 * into queues that are about to go away. Encode surfaces carry no
+	 * session state, only their own dma-buf store, so there is nothing to
+	 * detach on that path.
+	 *
 	 * Closing the handles is what actually releases the decode session;
 	 * the cached description of it goes with them, so a context created
 	 * afterwards cannot read "already configured" from a queue that is
 	 * gone.
 	 */
-	if (!context_object->is_encoder)
+	if (!context_object->is_encoder) {
+		surface_detach_session(driver_data, session);
 		decoder_session_close(session);
+	}
 
 	object_heap_free(&driver_data->context_heap,
 			 (struct object_base *)context_object);
