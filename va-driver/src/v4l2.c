@@ -310,7 +310,7 @@ int v4l2_query_buffer(int video_fd, unsigned int type, unsigned int index,
 }
 
 int v4l2_request_buffers(int video_fd, unsigned int type,
-			 unsigned int buffers_count)
+			 unsigned int buffers_count, unsigned int *allocated)
 {
 	struct v4l2_requestbuffers buffers;
 	int rc;
@@ -325,6 +325,15 @@ int v4l2_request_buffers(int video_fd, unsigned int type,
 		request_log("Unable to request buffers: %s\n", strerror(errno));
 		return -1;
 	}
+
+	/*
+	 * REQBUFS answers with the count it could actually allocate, which on
+	 * a short or fragmented CMA pool is fewer than asked for. Taking the
+	 * request as the answer leaves the caller indexing buffers that were
+	 * never created.
+	 */
+	if (allocated != NULL)
+		*allocated = buffers.count;
 
 	return 0;
 }

@@ -62,6 +62,8 @@
  */
 #define POOL_MAX_BUFFERS	64u
 #define POOL_MIN_BUFFERS	20u
+/* Below this the pool cannot hold a reference frame and the current one. */
+#define POOL_FLOOR_BUFFERS	3u
 #define POOL_BUDGET_BYTES	(192u * 1024u * 1024u)
 
 static unsigned int pool_depth(int width, int height)
@@ -152,6 +154,8 @@ int request_ensure_v4l2_initialized(struct decoder_session *session,
 	unsigned int output_type, capture_type;
 	unsigned int pixelformat;
 	unsigned int depth;
+	unsigned int output_count = 0;
+	unsigned int capture_count = 0;
 	int rc;
 
 	if (profile_to_pixelformat(profile, &pixelformat) < 0)
@@ -186,8 +190,8 @@ int request_ensure_v4l2_initialized(struct decoder_session *session,
 
 		v4l2_set_stream(session->video_fd, old_output, false);
 		v4l2_set_stream(session->video_fd, old_capture, false);
-		v4l2_request_buffers(session->video_fd, old_output, 0);
-		v4l2_request_buffers(session->video_fd, old_capture, 0);
+		v4l2_request_buffers(session->video_fd, old_output, 0, NULL);
+		v4l2_request_buffers(session->video_fd, old_capture, 0, NULL);
 
 		session->num_output_buffers = 0;
 		session->num_capture_buffers = 0;
@@ -252,20 +256,39 @@ int request_ensure_v4l2_initialized(struct decoder_session *session,
 
 	depth = pool_depth(picture_width, picture_height);
 
-	rc = v4l2_request_buffers(session->video_fd, output_type, depth);
+	rc = v4l2_request_buffers(session->video_fd, output_type, depth,
+				  &output_count);
 	if (rc < 0) {
 		request_log("context: REQBUFS(OUTPUT, %u) failed\n", depth);
 		return -1;
 	}
 
-	rc = v4l2_request_buffers(session->video_fd, capture_type, depth);
+	rc = v4l2_request_buffers(session->video_fd, capture_type, depth,
+				  &capture_count);
 	if (rc < 0) {
 		request_log("context: REQBUFS(CAPTURE, %u) failed\n", depth);
 		return -1;
 	}
 
-	session->num_output_buffers = depth;
-	session->num_capture_buffers = depth;
+	/*
+	 * Carry on with what the kernel gave rather than what was asked for,
+	 * but not below the point where the pool cannot hold a reference and
+	 * the frame being decoded into at the same time.
+	 */
+	if (output_count < POOL_FLOOR_BUFFERS ||
+	    capture_count < POOL_FLOOR_BUFFERS) {
+		request_log("context: pool too small: %u output, %u capture "
+			    "of %u requested\n", output_count, capture_count,
+			    depth);
+		return -1;
+	}
+
+	if (output_count < depth || capture_count < depth)
+		request_log("context: pool short of %u: %u output, %u capture\n",
+			    depth, output_count, capture_count);
+
+	session->num_output_buffers = output_count;
+	session->num_capture_buffers = capture_count;
 	session->next_output_buf = 0;
 	session->next_capture_buf = 0;
 	session->programmed_pixelformat = pixelformat;
@@ -401,8 +424,8 @@ VAStatus RequestDestroyContext(VADriverContextP context, VAContextID context_id)
 
 		v4l2_set_stream(session->video_fd, output_type, false);
 		v4l2_set_stream(session->video_fd, capture_type, false);
-		v4l2_request_buffers(session->video_fd, output_type, 0);
-		v4l2_request_buffers(session->video_fd, capture_type, 0);
+		v4l2_request_buffers(session->video_fd, output_type, 0, NULL);
+		v4l2_request_buffers(session->video_fd, capture_type, 0, NULL);
 	}
 
 	/*

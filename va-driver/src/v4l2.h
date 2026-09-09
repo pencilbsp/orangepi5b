@@ -53,8 +53,12 @@ int v4l2_get_format(int video_fd, unsigned int type, unsigned int *width,
 int v4l2_query_buffer(int video_fd, unsigned int type, unsigned int index,
 		      unsigned int *lengths, unsigned int *offsets,
 		      unsigned int buffers_count);
+/*
+ * Request a queue's buffers. @allocated, when given, receives the number the
+ * kernel actually created, which may be fewer than requested.
+ */
 int v4l2_request_buffers(int video_fd, unsigned int type,
-			 unsigned int buffers_count);
+			 unsigned int buffers_count, unsigned int *allocated);
 int v4l2_queue_buffer(int video_fd, int request_fd, unsigned int type,
 		      struct timeval *timestamp, unsigned int index,
 		      unsigned int size, unsigned int buffers_count);
