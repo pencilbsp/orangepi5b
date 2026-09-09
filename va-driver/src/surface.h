@@ -44,9 +44,22 @@
  * pool growth) still work. */
 #define SURFACE_INDEX_UNASSIGNED	((unsigned int)-1)
 
+/*
+ * What a surface is for. VA-API does not say at vaCreateSurfaces time, so it
+ * is recorded when the surface first meets a context -- as a render target
+ * at vaCreateContext, or at vaBeginPicture -- and that is the only thing
+ * allowed to decide it afterwards.
+ */
+enum surface_role {
+	SURFACE_ROLE_UNKNOWN = 0,
+	SURFACE_ROLE_DECODE,
+	SURFACE_ROLE_ENCODE,
+};
+
 struct object_surface {
 	struct object_base base;
 
+	enum surface_role role;
 	VAStatus status;
 	int width;
 	int height;
@@ -121,6 +134,13 @@ VAStatus RequestCreateSurfaces(VADriverContextP context, int width, int height,
 			       VASurfaceID *surfaces_ids);
 VAStatus RequestDestroySurfaces(VADriverContextP context,
 				VASurfaceID *surfaces_ids, int surfaces_count);
+
+/*
+ * Record what a surface is for. The first context to claim it wins; a later
+ * context of the other kind does not silently take it over.
+ */
+void surface_set_role(struct request_data *driver_data,
+		      VASurfaceID surface_id, enum surface_role role);
 VAStatus RequestSyncSurface(VADriverContextP context, VASurfaceID surface_id);
 VAStatus RequestQuerySurfaceAttributes(VADriverContextP context,
 				       VAConfigID config,

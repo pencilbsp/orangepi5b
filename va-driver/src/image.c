@@ -82,6 +82,19 @@ static bool image_have_encode_config(struct request_data *driver_data)
 static bool image_surface_is_encode(struct request_data *driver_data,
 				    struct object_surface *surface_object)
 {
+	if (surface_object->role == SURFACE_ROLE_ENCODE)
+		return true;
+
+	if (surface_object->role == SURFACE_ROLE_DECODE)
+		return false;
+
+	/*
+	 * Nothing has claimed this surface yet -- a client can derive an image
+	 * from one before it ever reaches a context, and ffmpeg does -- so
+	 * fall back to the old guess. It is only ever consulted here, where
+	 * there is genuinely nothing better to go on, and it can no longer
+	 * override a surface whose role is known.
+	 */
 	if (surface_object->encode_data != NULL)
 		return true;
 

@@ -435,6 +435,15 @@ VAStatus RequestBeginPicture(VADriverContextP context, VAContextID context_id,
 	if (surface_object == NULL)
 		return VA_STATUS_ERROR_INVALID_SURFACE;
 
+	/*
+	 * A surface can reach a context without ever having been a render
+	 * target -- Chrome creates its contexts with an empty list -- so this
+	 * is the other place its role becomes known.
+	 */
+	surface_set_role(driver_data, surface_id,
+			 context_object->is_encoder ? SURFACE_ROLE_ENCODE :
+						      SURFACE_ROLE_DECODE);
+
 	if (context_object->is_encoder) {
 		if (surface_object->status == VASurfaceRendering)
 			RequestSyncSurface(context, surface_id);

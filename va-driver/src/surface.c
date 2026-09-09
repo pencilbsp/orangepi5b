@@ -99,6 +99,23 @@ find_encode_context(struct request_data *driver_data,
 	return NULL;
 }
 
+void surface_set_role(struct request_data *driver_data,
+		      VASurfaceID surface_id, enum surface_role role)
+{
+	struct object_surface *surface_object;
+
+	surface_object = SURFACE(driver_data, surface_id);
+	if (surface_object == NULL || role == SURFACE_ROLE_UNKNOWN)
+		return;
+
+	/*
+	 * First claim wins. A surface that has already been a decode target
+	 * does not become an encode one because some later context asked.
+	 */
+	if (surface_object->role == SURFACE_ROLE_UNKNOWN)
+		surface_object->role = role;
+}
+
 static bool have_encode_config(struct request_data *driver_data)
 {
 	struct object_config *config_object;
@@ -715,12 +732,26 @@ VAStatus RequestExportSurfaceHandle(VADriverContextP context,
 	if (surface_object == NULL)
 		return VA_STATUS_ERROR_INVALID_SURFACE;
 
-	if (find_encode_context(driver_data, surface_object->width,
-				surface_object->height) != NULL ||
-	    surface_object->encode_data != NULL ||
-	    (surface_object->session == NULL &&
-	     driver_data->probe_session.video_format == NULL &&
-	     have_encode_config(driver_data)))
+	/*
+	 * The role decides this. Matching an encoder context by picture size,
+	 * as this used to, made every decode surface on a display that also
+	 * encodes at the same resolution look like an encode surface, and
+	 * handed the client the encoder's staging buffer instead of the
+	 * decoded frame.
+	 *
+	 * A surface nothing has claimed yet keeps the old guess, size match
+	 * included: a client can export one before it has ever reached a
+	 * context, and there is nothing better to go on then. What the guess
+	 * can no longer do is contradict a role that is already known.
+	 */
+	if (surface_object->role == SURFACE_ROLE_ENCODE ||
+	    (surface_object->role == SURFACE_ROLE_UNKNOWN &&
+	     (surface_object->encode_data != NULL ||
+	      find_encode_context(driver_data, surface_object->width,
+				  surface_object->height) != NULL ||
+	      (surface_object->session == NULL &&
+	       driver_data->probe_session.video_format == NULL &&
+	       have_encode_config(driver_data)))))
 		return export_encode_surface(surface_object, flags,
 					     surface_descriptor);
 

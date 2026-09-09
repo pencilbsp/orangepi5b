@@ -313,6 +313,7 @@ VAStatus RequestCreateContext(VADriverContextP context, VAConfigID config_id,
 	struct object_config *config_object;
 	struct object_context *context_object = NULL;
 	VAContextID id;
+	int i;
 	VAStatus status;
 
 	config_object = CONFIG(driver_data, config_id);
@@ -357,11 +358,17 @@ VAStatus RequestCreateContext(VADriverContextP context, VAConfigID config_id,
 	}
 
 	/*
-	 * The render targets are not copied. They belong to the client, which
-	 * created them with vaCreateSurfaces and will destroy them with
-	 * vaDestroySurfaces; a context that kept the list would only be
-	 * tempted to act on it.
+	 * The render targets are stamped with what this context will use them
+	 * for and then let go. They belong to the client, which created them
+	 * with vaCreateSurfaces and will destroy them with vaDestroySurfaces;
+	 * a context that kept the list would only be tempted to act on it.
 	 */
+	for (i = 0; i < surfaces_count; i++)
+		surface_set_role(driver_data, surfaces_ids[i],
+				 context_object->is_encoder ?
+					SURFACE_ROLE_ENCODE :
+					SURFACE_ROLE_DECODE);
+
 	context_object->config_id = config_id;
 	context_object->render_surface_id = VA_INVALID_ID;
 	context_object->picture_width = picture_width;
