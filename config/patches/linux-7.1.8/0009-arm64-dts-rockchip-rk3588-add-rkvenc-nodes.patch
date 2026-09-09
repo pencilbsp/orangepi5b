@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ubuntu Rockchip Builder <builder@localhost>
+Subject: [PATCH] arm64: dts: rockchip: rk3588: add RKVENC VEPU580 nodes
+
+RK3588 and RK3588S carry two VEPU580 video encoder cores. Mainline
+already describes the surrounding clocks, resets, power domains and QoS
+nodes, but has no device nodes for the encoder cores themselves, so no
+driver can bind to them.
+
+Add the two encoder cores and the two IOMMUs in front of them. The
+addresses, interrupts, clocks, resets and power domains are hardware
+facts taken from the previously validated RK3588 VEPU580 description in
+the reference tree.
+
+Use a VEPU580-specific compatible string so this H.264 encoder does not
+collide with the VEPU121 JPEG encoder already handled by the Hantro
+driver.
+
+Signed-off-by: Ubuntu Rockchip Builder <builder@localhost>
+---
+diff --git a/arch/arm64/boot/dts/rockchip/rk3588-base.dtsi b/arch/arm64/boot/dts/rockchip/rk3588-base.dtsi
+index d4dc057e3..747faec90 100644
+--- a/arch/arm64/boot/dts/rockchip/rk3588-base.dtsi
++++ b/arch/arm64/boot/dts/rockchip/rk3588-base.dtsi
+@@ -1353,6 +1353,64 @@ vepu121_3_mmu: iommu@fdbac800 {
+ 		#iommu-cells = <0>;
+ 	};
+ 
++	rkvenc0: video-codec@fdbd0000 {
++		compatible = "rockchip,rk3588-vepu580";
++		reg = <0x0 0xfdbd0000 0x0 0x6000>;
++		interrupts = <GIC_SPI 101 IRQ_TYPE_LEVEL_HIGH 0>;
++		interrupt-names = "enc";
++		clocks = <&cru ACLK_RKVENC0>, <&cru HCLK_RKVENC0>,
++			 <&cru CLK_RKVENC0_CORE>;
++		clock-names = "aclk", "hclk", "core";
++		assigned-clocks = <&cru ACLK_RKVENC0>, <&cru CLK_RKVENC0_CORE>;
++		assigned-clock-rates = <500000000>, <800000000>;
++		resets = <&cru SRST_A_RKVENC0>, <&cru SRST_H_RKVENC0>,
++			 <&cru SRST_RKVENC0_CORE>;
++		reset-names = "a", "h", "core";
++		iommus = <&rkvenc0_mmu>;
++		power-domains = <&power RK3588_PD_VENC0>;
++	};
++
++	rkvenc0_mmu: iommu@fdbdf000 {
++		compatible = "rockchip,rk3588-iommu", "rockchip,rk3568-iommu";
++		reg = <0x0 0xfdbdf000 0x0 0x40>, <0x0 0xfdbdf040 0x0 0x40>;
++		interrupts = <GIC_SPI 99 IRQ_TYPE_LEVEL_HIGH 0>,
++			     <GIC_SPI 100 IRQ_TYPE_LEVEL_HIGH 0>;
++		clocks = <&cru ACLK_RKVENC0>, <&cru HCLK_RKVENC0>;
++		clock-names = "aclk", "iface";
++		power-domains = <&power RK3588_PD_VENC0>;
++		rockchip,disable-mmu-reset;
++		#iommu-cells = <0>;
++	};
++
++	rkvenc1: video-codec@fdbe0000 {
++		compatible = "rockchip,rk3588-vepu580";
++		reg = <0x0 0xfdbe0000 0x0 0x6000>;
++		interrupts = <GIC_SPI 104 IRQ_TYPE_LEVEL_HIGH 0>;
++		interrupt-names = "enc";
++		clocks = <&cru ACLK_RKVENC1>, <&cru HCLK_RKVENC1>,
++			 <&cru CLK_RKVENC1_CORE>;
++		clock-names = "aclk", "hclk", "core";
++		assigned-clocks = <&cru ACLK_RKVENC1>, <&cru CLK_RKVENC1_CORE>;
++		assigned-clock-rates = <500000000>, <800000000>;
++		resets = <&cru SRST_A_RKVENC1>, <&cru SRST_H_RKVENC1>,
++			 <&cru SRST_RKVENC1_CORE>;
++		reset-names = "a", "h", "core";
++		iommus = <&rkvenc1_mmu>;
++		power-domains = <&power RK3588_PD_VENC1>;
++	};
++
++	rkvenc1_mmu: iommu@fdbef000 {
++		compatible = "rockchip,rk3588-iommu", "rockchip,rk3568-iommu";
++		reg = <0x0 0xfdbef000 0x0 0x40>, <0x0 0xfdbef040 0x0 0x40>;
++		interrupts = <GIC_SPI 102 IRQ_TYPE_LEVEL_HIGH 0>,
++			     <GIC_SPI 103 IRQ_TYPE_LEVEL_HIGH 0>;
++		clocks = <&cru ACLK_RKVENC1>, <&cru HCLK_RKVENC1>;
++		clock-names = "aclk", "iface";
++		power-domains = <&power RK3588_PD_VENC1>;
++		rockchip,disable-mmu-reset;
++		#iommu-cells = <0>;
++	};
++
+ 	vdec0: video-codec@fdc38000 {
+ 		compatible = "rockchip,rk3588-vdec";
+ 		reg = <0x0 0xfdc38000 0x0 0x100>,

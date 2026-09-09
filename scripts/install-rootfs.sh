@@ -52,6 +52,22 @@ if ((${#resources_debs[@]})); then
   chroot "$R" apt-get -y --no-install-recommends install "/tmp/$(basename "$resources_deb")"
   rm -f "$R/tmp/$(basename "$resources_deb")"
 fi
+
+# The VA-API driver for rkvdec. Without it libva finds no backend, Chrome
+# silently drops to FFmpegVideoDecoder and nothing in the log says why -- the
+# fallback is reported to MediaLog, not stderr. Fail loudly instead: an image
+# that is supposed to decode in hardware and cannot is a broken image.
+va_driver_debs=( "$ROOT"/output/debs/orangepi5b-va-driver_*_arm64.deb )
+if ((${#va_driver_debs[@]})); then
+  mapfile -t va_driver_debs < <(printf '%s\n' "${va_driver_debs[@]}" | sort -V)
+  va_driver_deb=${va_driver_debs[-1]}
+  install -m 0644 "$va_driver_deb" "$R/tmp/$(basename "$va_driver_deb")"
+  chroot "$R" apt-get -y --no-install-recommends install "/tmp/$(basename "$va_driver_deb")"
+  rm -f "$R/tmp/$(basename "$va_driver_deb")"
+else
+  echo "Missing VA driver package: run scripts/build-va-driver-package.sh first" >&2
+  exit 1
+fi
 mapfile -t purge_packages < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$ROOT/config/boot.purge-packages")
 if ((${#purge_packages[@]})); then
   chroot "$R" apt-get -y purge "${purge_packages[@]}"

@@ -1,0 +1,48 @@
+From: Ubuntu Rockchip Builder <builder@localhost>
+Subject: [PATCH] media: rockchip: rkvdec: allow image-format controls in requests
+
+Stateless codec clients submit the sequence header with every request, so
+the first one necessarily arrives after CAPTURE buffers have been
+allocated.  rkvdec_s_ctrl() rejected any such control with -EBUSY whenever
+the codec-derived image format had not been latched yet, which breaks the
+normal GStreamer request flow and prevents a VA-API bridge from supplying
+its first H.264 SPS atomically with the frame.
+
+Narrow the check instead of dropping it.  The queue must still be refused
+when the new image format needs a different capture format: rkvdec can
+select NV12, NV15, NV16 or NV20 depending on bit depth and chroma format,
+and NV20 needs two and a half times the NV12 buffer size, so applying such
+a change to buffers already handed to the hardware would have the decoder
+write past them.  Comparing the resulting fourcc lets the harmless
+ANY-to-8-bit transition through while keeping that protection.
+
+Signed-off-by: Ubuntu Rockchip Builder <builder@localhost>
+---
+diff --git a/drivers/media/platform/rockchip/rkvdec/rkvdec.c b/drivers/media/platform/rockchip/rkvdec/rkvdec.c
+index 104b4a142..a139e8135 100644
+--- a/drivers/media/platform/rockchip/rkvdec/rkvdec.c
++++ b/drivers/media/platform/rockchip/rkvdec/rkvdec.c
+@@ -183,9 +183,22 @@ static int rkvdec_s_ctrl(struct v4l2_ctrl *ctrl)
+ 
+ 	image_fmt = desc->ops->get_image_fmt(ctx, ctrl);
+ 	if (rkvdec_image_fmt_changed(ctx, image_fmt)) {
++		u32 fourcc = rkvdec_enum_decoded_fmt(ctx, 0, image_fmt);
++
++		/*
++		 * A stateless client submits the sequence header with every
++		 * request, so the first one necessarily arrives once CAPTURE
++		 * buffers are already allocated; refusing all of them breaks
++		 * the normal request flow. Only refuse when the new image
++		 * format needs a different capture format, which is exactly
++		 * the case where the buffers already handed to the hardware
++		 * are the wrong size and letting the decoder proceed would
++		 * have it write past them.
++		 */
+ 		vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx,
+ 				     V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
+-		if (vb2_is_busy(vq))
++		if (vb2_is_busy(vq) &&
++		    fourcc != ctx->decoded_fmt.fmt.pix_mp.pixelformat)
+ 			return -EBUSY;
+ 
+ 		ctx->image_fmt = image_fmt;

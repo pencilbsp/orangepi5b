@@ -112,6 +112,18 @@ disable_enabled_group PHY_ \
 
 # Re-assert Orange Pi 5B essentials after the slim profile so an accidental
 # future disable entry fails safely instead of producing a silent black screen.
+# Hardware video codecs. rkvdec (H.264/HEVC decode on RK3588) and its DT nodes
+# come from mainline; only the config switch was missing. RKVENC is the VEPU580
+# H.264 encoder, which mainline has no driver for -- patches 0009 (DT nodes) and
+# 0010 (the driver) add it. DMABUF_HEAPS is built-in, not a module, and the VA
+# driver needs the CMA heap to export encode surfaces as DMA-BUFs.
+"$K/scripts/config" --file "$K/.config" \
+ --module VIDEO_ROCKCHIP_VDEC \
+ --module VIDEO_ROCKCHIP_RKVENC \
+ --enable DMABUF_HEAPS \
+ --enable DMABUF_HEAPS_SYSTEM \
+ --enable DMABUF_HEAPS_CMA
+
 "$K/scripts/config" --file "$K/.config" \
  --enable IKCONFIG \
  --enable IKCONFIG_PROC \
@@ -173,8 +185,11 @@ done
 for symbol in DWMAC_ROCKCHIP DRM_ROCKCHIP DRM_DW_HDMI_QP PHY_ROCKCHIP_SAMSUNG_HDPTX; do
  grep -Eq "^CONFIG_${symbol}=[ym]$" "$K/.config" || { echo "Required display driver missing: $symbol"; exit 1; }
 done
-for symbol in DRM_PANTHOR VIDEO_HANTRO VIDEO_ROCKCHIP_RGA; do
+for symbol in DRM_PANTHOR VIDEO_HANTRO VIDEO_ROCKCHIP_RGA VIDEO_ROCKCHIP_VDEC VIDEO_ROCKCHIP_RKVENC; do
  grep -Eq "^CONFIG_${symbol}=[ym]$" "$K/.config" || { echo "Required GPU/media driver missing: $symbol"; exit 1; }
+done
+for symbol in DMABUF_HEAPS DMABUF_HEAPS_CMA; do
+ grep -qx "CONFIG_${symbol}=y" "$K/.config" || { echo "Required dma-buf heap missing: $symbol"; exit 1; }
 done
 for symbol in CFG80211 MAC80211 RFKILL BRCMFMAC BT BT_BCM BT_HCIUART BT_RFCOMM BT_BNEP BT_HIDP; do
  grep -Eq "^CONFIG_${symbol}=[ym]$" "$K/.config" || { echo "Required Wi-Fi/Bluetooth driver missing: $symbol"; exit 1; }

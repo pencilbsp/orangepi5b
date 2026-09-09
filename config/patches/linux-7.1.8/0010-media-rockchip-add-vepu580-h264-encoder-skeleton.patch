@@ -1,0 +1,1058 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ubuntu Rockchip Builder <builder@localhost>
+Subject: [PATCH] media: rockchip: add VEPU580 H.264 encoder skeleton
+
+Add the first, deliberately small, V4L2 mem2mem driver for the RK3588
+VEPU580 encoder. This stage binds to the DT nodes, enables the core's
+clock/power path long enough to read the version register, registers a
+video node, and exposes the stateful encoder shape userspace will need:
+NV12 on OUTPUT and H.264 on CAPTURE.
+
+The hardware register path is intentionally not implemented yet. If a
+client tries to stream, queued buffers are completed with an error rather
+than producing a fake bitstream. This keeps the first bring-up gate honest:
+probe and format negotiation can be validated before per-frame register
+programming is added.
+
+Signed-off-by: Ubuntu Rockchip Builder <builder@localhost>
+---
+diff --git a/drivers/media/platform/rockchip/Kconfig b/drivers/media/platform/rockchip/Kconfig
+index 5e9dd525d..fc59d799e 100644
+--- a/drivers/media/platform/rockchip/Kconfig
++++ b/drivers/media/platform/rockchip/Kconfig
+@@ -6,3 +6,4 @@ source "drivers/media/platform/rockchip/rga/Kconfig"
+ source "drivers/media/platform/rockchip/rkcif/Kconfig"
+ source "drivers/media/platform/rockchip/rkisp1/Kconfig"
+ source "drivers/media/platform/rockchip/rkvdec/Kconfig"
++source "drivers/media/platform/rockchip/rkvenc/Kconfig"
+diff --git a/drivers/media/platform/rockchip/Makefile b/drivers/media/platform/rockchip/Makefile
+index 3de3f3f8e..9cb333ba2 100644
+--- a/drivers/media/platform/rockchip/Makefile
++++ b/drivers/media/platform/rockchip/Makefile
+@@ -3,3 +3,4 @@ obj-y += rga/
+ obj-y += rkcif/
+ obj-y += rkisp1/
+ obj-y += rkvdec/
++obj-y += rkvenc/
+diff --git a/drivers/media/platform/rockchip/rkvenc/Kconfig b/drivers/media/platform/rockchip/rkvenc/Kconfig
+new file mode 100644
+index 000000000..7cb6084ce
+--- /dev/null
++++ b/drivers/media/platform/rockchip/rkvenc/Kconfig
+@@ -0,0 +1,15 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++config VIDEO_ROCKCHIP_RKVENC
++	tristate "Rockchip VEPU580 H.264 encoder driver"
++	depends on ARCH_ROCKCHIP || COMPILE_TEST
++	depends on VIDEO_DEV
++	select VIDEOBUF2_DMA_CONTIG
++	select V4L2_MEM2MEM_DEV
++	help
++	  Support for the Rockchip VEPU580 encoder found on RK3588/RK3588S
++	  SoCs. The initial driver binds the hardware and exposes a stateful
++	  V4L2 mem2mem H.264 encoder node; the per-frame register programming
++	  is added in a later patch.
++
++	  To compile this driver as a module, choose M here. The module will
++	  be called rockchip-rkvenc.
+diff --git a/drivers/media/platform/rockchip/rkvenc/Makefile b/drivers/media/platform/rockchip/rkvenc/Makefile
+new file mode 100644
+index 000000000..e49b3cf10
+--- /dev/null
++++ b/drivers/media/platform/rockchip/rkvenc/Makefile
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++obj-$(CONFIG_VIDEO_ROCKCHIP_RKVENC) += rockchip-rkvenc.o
+diff --git a/drivers/media/platform/rockchip/rkvenc/rockchip-rkvenc.c b/drivers/media/platform/rockchip/rkvenc/rockchip-rkvenc.c
+new file mode 100644
+index 000000000..26ee2d8f7
+--- /dev/null
++++ b/drivers/media/platform/rockchip/rkvenc/rockchip-rkvenc.c
+@@ -0,0 +1,985 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Rockchip VEPU580 (RKVENC) H.264 encoder driver
++ *
++ * Copyright (C) 2026 Orange Pi 5B mainline project
++ */
++
++#include <linux/bitfield.h>
++#include <linux/bits.h>
++#include <linux/clk.h>
++#include <linux/dma-mapping.h>
++#include <linux/interrupt.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/reset.h>
++#include <linux/slab.h>
++#include <linux/videodev2.h>
++
++#include <media/v4l2-common.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-event.h>
++#include <media/v4l2-fh.h>
++#include <media/v4l2-ioctl.h>
++#include <media/v4l2-mem2mem.h>
++#include <media/videobuf2-dma-contig.h>
++#include <media/videobuf2-v4l2.h>
++
++#define RKVENC_NAME			"rockchip-rkvenc"
++#define RKVENC_CARD_NAME		"Rockchip VEPU580 encoder"
++
++#define RKVENC_REG_VERSION		0x0000
++#define RKVENC_VERSION_SUB_VER		GENMASK(7, 0)
++#define RKVENC_VERSION_H264_CAP		BIT(8)
++#define RKVENC_VERSION_HEVC_CAP		BIT(9)
++#define RKVENC_VERSION_FBC_CAP		GENMASK(22, 21)
++
++#define RKVENC_REG_INT_CLR		0x0028
++#define RKVENC_REG_INT_STA		0x002c
++
++#define RKVENC_MIN_WIDTH		128U
++#define RKVENC_MIN_HEIGHT		96U
++#define RKVENC_MAX_WIDTH		4096U
++#define RKVENC_MAX_HEIGHT		4096U
++#define RKVENC_DEFAULT_WIDTH		1920U
++#define RKVENC_DEFAULT_HEIGHT		1080U
++#define RKVENC_MB_DIM			16U
++
++#define RKVENC_MIN_BITSTREAM_SIZE	SZ_512K
++#define RKVENC_MAX_BITSTREAM_SIZE	SZ_16M
++#define RKVENC_DEFAULT_BITRATE		12000000
++#define RKVENC_DEFAULT_GOP_SIZE		60
++#define RKVENC_DEFAULT_FPS		60
++
++#define RKVENC_NUM_CLKS			3
++#define RKVENC_NUM_RESETS		3
++
++struct rkvenc_fmt {
++	u32 fourcc;
++	bool coded;
++};
++
++struct rkvenc_dev {
++	struct device *dev;
++	struct v4l2_device v4l2_dev;
++	struct video_device vfd;
++	struct v4l2_m2m_dev *m2m_dev;
++	void __iomem *regs;
++	struct clk_bulk_data clks[RKVENC_NUM_CLKS];
++	struct reset_control_bulk_data resets[RKVENC_NUM_RESETS];
++	struct mutex mutex;
++	int irq;
++	u32 hw_id;
++};
++
++struct rkvenc_ctx {
++	struct v4l2_fh fh;
++	struct rkvenc_dev *enc;
++	struct v4l2_ctrl_handler ctrl_handler;
++	struct v4l2_pix_format_mplane src_fmt;
++	struct v4l2_pix_format_mplane dst_fmt;
++	struct v4l2_rect crop;
++	u32 bitrate;
++	u32 gop_size;
++	u32 fps_num;
++	u32 fps_den;
++	u32 sequence_out;
++	u32 sequence_cap;
++};
++
++static const struct rkvenc_fmt rkvenc_raw_fmts[] = {
++	{ .fourcc = V4L2_PIX_FMT_NV12 },
++};
++
++static const struct rkvenc_fmt rkvenc_coded_fmts[] = {
++	{ .fourcc = V4L2_PIX_FMT_H264, .coded = true },
++};
++
++static inline struct rkvenc_ctx *file_to_ctx(struct file *file)
++{
++	return container_of(file_to_v4l2_fh(file), struct rkvenc_ctx, fh);
++}
++
++static inline u32 rkvenc_read(struct rkvenc_dev *enc, u32 reg)
++{
++	return readl(enc->regs + reg);
++}
++
++static inline void rkvenc_write(struct rkvenc_dev *enc, u32 reg, u32 val)
++{
++	writel(val, enc->regs + reg);
++}
++
++static const struct rkvenc_fmt *rkvenc_find_fmt(u32 fourcc, bool coded)
++{
++	const struct rkvenc_fmt *fmts = coded ? rkvenc_coded_fmts : rkvenc_raw_fmts;
++	unsigned int num_fmts = coded ? ARRAY_SIZE(rkvenc_coded_fmts) :
++					ARRAY_SIZE(rkvenc_raw_fmts);
++	unsigned int i;
++
++	for (i = 0; i < num_fmts; i++) {
++		if (fmts[i].fourcc == fourcc)
++			return &fmts[i];
++	}
++
++	return NULL;
++}
++
++static void rkvenc_bound_dimensions(u32 *width, u32 *height)
++{
++	*width = clamp_t(u32, *width, RKVENC_MIN_WIDTH, RKVENC_MAX_WIDTH);
++	*height = clamp_t(u32, *height, RKVENC_MIN_HEIGHT, RKVENC_MAX_HEIGHT);
++	*width = ALIGN(*width, RKVENC_MB_DIM);
++	*height = ALIGN(*height, RKVENC_MB_DIM);
++}
++
++static u32 rkvenc_coded_sizeimage(u32 width, u32 height)
++{
++	u32 size = width * height;
++
++	return clamp_t(u32, size, RKVENC_MIN_BITSTREAM_SIZE,
++		       RKVENC_MAX_BITSTREAM_SIZE);
++}
++
++static void rkvenc_fill_raw_fmt(struct v4l2_pix_format_mplane *pix)
++{
++	u32 width = pix->width;
++	u32 height = pix->height;
++	u32 colorspace = pix->colorspace;
++	u32 ycbcr_enc = pix->ycbcr_enc;
++	u32 quantization = pix->quantization;
++	u32 xfer_func = pix->xfer_func;
++
++	rkvenc_bound_dimensions(&width, &height);
++	memset(pix, 0, sizeof(*pix));
++	pix->width = width;
++	pix->height = height;
++	pix->pixelformat = V4L2_PIX_FMT_NV12;
++	pix->field = V4L2_FIELD_NONE;
++	pix->colorspace = colorspace ?: V4L2_COLORSPACE_REC709;
++	pix->ycbcr_enc = ycbcr_enc ?: V4L2_YCBCR_ENC_DEFAULT;
++	pix->quantization = quantization ?: V4L2_QUANTIZATION_LIM_RANGE;
++	pix->xfer_func = xfer_func ?: V4L2_XFER_FUNC_DEFAULT;
++	v4l2_fill_pixfmt_mp(pix, pix->pixelformat, width, height);
++}
++
++static void rkvenc_fill_coded_fmt(struct v4l2_pix_format_mplane *pix)
++{
++	u32 width = pix->width;
++	u32 height = pix->height;
++	u32 colorspace = pix->colorspace;
++	u32 ycbcr_enc = pix->ycbcr_enc;
++	u32 quantization = pix->quantization;
++	u32 xfer_func = pix->xfer_func;
++
++	rkvenc_bound_dimensions(&width, &height);
++	memset(pix, 0, sizeof(*pix));
++	pix->width = width;
++	pix->height = height;
++	pix->pixelformat = V4L2_PIX_FMT_H264;
++	pix->field = V4L2_FIELD_NONE;
++	pix->colorspace = colorspace ?: V4L2_COLORSPACE_REC709;
++	pix->ycbcr_enc = ycbcr_enc ?: V4L2_YCBCR_ENC_DEFAULT;
++	pix->quantization = quantization ?: V4L2_QUANTIZATION_LIM_RANGE;
++	pix->xfer_func = xfer_func ?: V4L2_XFER_FUNC_DEFAULT;
++	pix->num_planes = 1;
++	pix->plane_fmt[0].bytesperline = 0;
++	pix->plane_fmt[0].sizeimage = rkvenc_coded_sizeimage(width, height);
++}
++
++static int rkvenc_querycap(struct file *file, void *priv,
++			   struct v4l2_capability *cap)
++{
++	struct rkvenc_dev *enc = video_drvdata(file);
++
++	strscpy(cap->driver, RKVENC_NAME, sizeof(cap->driver));
++	strscpy(cap->card, RKVENC_CARD_NAME, sizeof(cap->card));
++	snprintf(cap->bus_info, sizeof(cap->bus_info), "platform:%s",
++		 dev_name(enc->dev));
++
++	return 0;
++}
++
++static int rkvenc_enum_fmt(struct file *file, void *priv,
++			   struct v4l2_fmtdesc *f)
++{
++	const struct rkvenc_fmt *fmts;
++	unsigned int num_fmts;
++	bool coded = V4L2_TYPE_IS_CAPTURE(f->type);
++
++	fmts = coded ? rkvenc_coded_fmts : rkvenc_raw_fmts;
++	num_fmts = coded ? ARRAY_SIZE(rkvenc_coded_fmts) :
++			   ARRAY_SIZE(rkvenc_raw_fmts);
++
++	if (f->index >= num_fmts)
++		return -EINVAL;
++
++	f->pixelformat = fmts[f->index].fourcc;
++
++	return 0;
++}
++
++static int rkvenc_enum_framesizes(struct file *file, void *fh,
++				  struct v4l2_frmsizeenum *fsize)
++{
++	bool supported;
++
++	if (fsize->index)
++		return -EINVAL;
++
++	supported = rkvenc_find_fmt(fsize->pixel_format, false) ||
++		    rkvenc_find_fmt(fsize->pixel_format, true);
++	if (!supported)
++		return -EINVAL;
++
++	fsize->type = V4L2_FRMSIZE_TYPE_STEPWISE;
++	fsize->stepwise.min_width = RKVENC_MIN_WIDTH;
++	fsize->stepwise.max_width = RKVENC_MAX_WIDTH;
++	fsize->stepwise.step_width = RKVENC_MB_DIM;
++	fsize->stepwise.min_height = RKVENC_MIN_HEIGHT;
++	fsize->stepwise.max_height = RKVENC_MAX_HEIGHT;
++	fsize->stepwise.step_height = RKVENC_MB_DIM;
++
++	return 0;
++}
++
++static int rkvenc_try_fmt(struct file *file, void *priv, struct v4l2_format *f)
++{
++	struct rkvenc_ctx *ctx = file_to_ctx(file);
++	struct v4l2_pix_format_mplane *pix = &f->fmt.pix_mp;
++	bool coded = V4L2_TYPE_IS_CAPTURE(f->type);
++
++	if (coded) {
++		if (!rkvenc_find_fmt(pix->pixelformat, true))
++			pix->pixelformat = V4L2_PIX_FMT_H264;
++		if (!pix->width)
++			pix->width = ctx->src_fmt.width;
++		if (!pix->height)
++			pix->height = ctx->src_fmt.height;
++		rkvenc_fill_coded_fmt(pix);
++	} else {
++		if (!rkvenc_find_fmt(pix->pixelformat, false))
++			pix->pixelformat = V4L2_PIX_FMT_NV12;
++		rkvenc_fill_raw_fmt(pix);
++	}
++
++	return 0;
++}
++
++static int rkvenc_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
++{
++	struct rkvenc_ctx *ctx = file_to_ctx(file);
++
++	f->fmt.pix_mp = V4L2_TYPE_IS_CAPTURE(f->type) ? ctx->dst_fmt :
++						 ctx->src_fmt;
++
++	return 0;
++}
++
++static int rkvenc_s_fmt(struct file *file, void *priv, struct v4l2_format *f)
++{
++	struct rkvenc_ctx *ctx = file_to_ctx(file);
++	struct vb2_queue *vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx, f->type);
++	int ret;
++
++	if (vb2_is_busy(vq))
++		return -EBUSY;
++
++	ret = rkvenc_try_fmt(file, priv, f);
++	if (ret)
++		return ret;
++
++	if (V4L2_TYPE_IS_CAPTURE(f->type)) {
++		ctx->dst_fmt = f->fmt.pix_mp;
++		return 0;
++	}
++
++	ctx->src_fmt = f->fmt.pix_mp;
++	ctx->crop.left = 0;
++	ctx->crop.top = 0;
++	ctx->crop.width = ctx->src_fmt.width;
++	ctx->crop.height = ctx->src_fmt.height;
++
++	ctx->dst_fmt.width = ctx->src_fmt.width;
++	ctx->dst_fmt.height = ctx->src_fmt.height;
++	rkvenc_fill_coded_fmt(&ctx->dst_fmt);
++
++	return 0;
++}
++
++static int rkvenc_g_selection(struct file *file, void *fh,
++			      struct v4l2_selection *s)
++{
++	struct rkvenc_ctx *ctx = file_to_ctx(file);
++
++	if (!V4L2_TYPE_IS_OUTPUT(s->type))
++		return -EINVAL;
++
++	switch (s->target) {
++	case V4L2_SEL_TGT_CROP:
++		s->r = ctx->crop;
++		break;
++	case V4L2_SEL_TGT_CROP_DEFAULT:
++	case V4L2_SEL_TGT_CROP_BOUNDS:
++		s->r.left = 0;
++		s->r.top = 0;
++		s->r.width = ctx->src_fmt.width;
++		s->r.height = ctx->src_fmt.height;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int rkvenc_s_selection(struct file *file, void *fh,
++			      struct v4l2_selection *s)
++{
++	struct rkvenc_ctx *ctx = file_to_ctx(file);
++	struct vb2_queue *vq;
++
++	if (!V4L2_TYPE_IS_OUTPUT(s->type) || s->target != V4L2_SEL_TGT_CROP)
++		return -EINVAL;
++
++	vq = v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx);
++	if (vb2_is_busy(vq))
++		return -EBUSY;
++
++	s->r.left = 0;
++	s->r.top = 0;
++	s->r.width = clamp_t(u32, s->r.width, RKVENC_MIN_WIDTH,
++			     ctx->src_fmt.width);
++	s->r.height = clamp_t(u32, s->r.height, RKVENC_MIN_HEIGHT,
++			      ctx->src_fmt.height);
++	s->r.width = ALIGN(s->r.width, RKVENC_MB_DIM);
++	s->r.height = ALIGN(s->r.height, RKVENC_MB_DIM);
++	if (s->r.width > ctx->src_fmt.width)
++		s->r.width = ctx->src_fmt.width;
++	if (s->r.height > ctx->src_fmt.height)
++		s->r.height = ctx->src_fmt.height;
++
++	ctx->crop = s->r;
++
++	return 0;
++}
++
++static int rkvenc_g_parm(struct file *file, void *fh,
++			 struct v4l2_streamparm *a)
++{
++	struct rkvenc_ctx *ctx = file_to_ctx(file);
++
++	if (!V4L2_TYPE_IS_OUTPUT(a->type))
++		return -EINVAL;
++
++	a->parm.output.capability = V4L2_CAP_TIMEPERFRAME;
++	a->parm.output.timeperframe.numerator = ctx->fps_den;
++	a->parm.output.timeperframe.denominator = ctx->fps_num;
++
++	return 0;
++}
++
++static int rkvenc_s_parm(struct file *file, void *fh,
++			 struct v4l2_streamparm *a)
++{
++	struct rkvenc_ctx *ctx = file_to_ctx(file);
++	struct v4l2_fract *tpf = &a->parm.output.timeperframe;
++
++	if (!V4L2_TYPE_IS_OUTPUT(a->type))
++		return -EINVAL;
++
++	if (tpf->numerator && tpf->denominator) {
++		ctx->fps_den = tpf->numerator;
++		ctx->fps_num = tpf->denominator;
++	}
++
++	return rkvenc_g_parm(file, fh, a);
++}
++
++static int rkvenc_encoder_cmd(struct file *file, void *priv,
++			      struct v4l2_encoder_cmd *ec)
++{
++	struct rkvenc_ctx *ctx = file_to_ctx(file);
++	int ret;
++
++	ret = v4l2_m2m_ioctl_try_encoder_cmd(file, priv, ec);
++	if (ret)
++		return ret;
++
++	ret = v4l2_m2m_ioctl_encoder_cmd(file, priv, ec);
++	if (ret)
++		return ret;
++
++	if (ec->cmd == V4L2_ENC_CMD_STOP &&
++	    v4l2_m2m_has_stopped(ctx->fh.m2m_ctx))
++		v4l2_event_queue_fh(&ctx->fh,
++				     &(const struct v4l2_event) {
++					.type = V4L2_EVENT_EOS,
++				     });
++
++	return 0;
++}
++
++static int rkvenc_subscribe_event(struct v4l2_fh *fh,
++				  const struct v4l2_event_subscription *sub)
++{
++	switch (sub->type) {
++	case V4L2_EVENT_EOS:
++		return v4l2_event_subscribe(fh, sub, 0, NULL);
++	default:
++		return v4l2_ctrl_subscribe_event(fh, sub);
++	}
++}
++
++static const struct v4l2_ioctl_ops rkvenc_ioctl_ops = {
++	.vidioc_querycap		= rkvenc_querycap,
++	.vidioc_enum_fmt_vid_cap	= rkvenc_enum_fmt,
++	.vidioc_enum_fmt_vid_out	= rkvenc_enum_fmt,
++	.vidioc_enum_framesizes		= rkvenc_enum_framesizes,
++	.vidioc_g_fmt_vid_cap_mplane	= rkvenc_g_fmt,
++	.vidioc_g_fmt_vid_out_mplane	= rkvenc_g_fmt,
++	.vidioc_try_fmt_vid_cap_mplane	= rkvenc_try_fmt,
++	.vidioc_try_fmt_vid_out_mplane	= rkvenc_try_fmt,
++	.vidioc_s_fmt_vid_cap_mplane	= rkvenc_s_fmt,
++	.vidioc_s_fmt_vid_out_mplane	= rkvenc_s_fmt,
++	.vidioc_g_selection		= rkvenc_g_selection,
++	.vidioc_s_selection		= rkvenc_s_selection,
++	.vidioc_g_parm			= rkvenc_g_parm,
++	.vidioc_s_parm			= rkvenc_s_parm,
++	.vidioc_reqbufs			= v4l2_m2m_ioctl_reqbufs,
++	.vidioc_querybuf		= v4l2_m2m_ioctl_querybuf,
++	.vidioc_qbuf			= v4l2_m2m_ioctl_qbuf,
++	.vidioc_dqbuf			= v4l2_m2m_ioctl_dqbuf,
++	.vidioc_prepare_buf		= v4l2_m2m_ioctl_prepare_buf,
++	.vidioc_create_bufs		= v4l2_m2m_ioctl_create_bufs,
++	.vidioc_expbuf			= v4l2_m2m_ioctl_expbuf,
++	.vidioc_streamon		= v4l2_m2m_ioctl_streamon,
++	.vidioc_streamoff		= v4l2_m2m_ioctl_streamoff,
++	.vidioc_try_encoder_cmd		= v4l2_m2m_ioctl_try_encoder_cmd,
++	.vidioc_encoder_cmd		= rkvenc_encoder_cmd,
++	.vidioc_subscribe_event		= rkvenc_subscribe_event,
++	.vidioc_unsubscribe_event	= v4l2_event_unsubscribe,
++};
++
++static int rkvenc_queue_setup(struct vb2_queue *vq, unsigned int *num_buffers,
++			      unsigned int *num_planes, unsigned int sizes[],
++			      struct device *alloc_devs[])
++{
++	struct rkvenc_ctx *ctx = vb2_get_drv_priv(vq);
++	struct v4l2_pix_format_mplane *pix;
++
++	pix = V4L2_TYPE_IS_CAPTURE(vq->type) ? &ctx->dst_fmt : &ctx->src_fmt;
++
++	if (*num_planes) {
++		if (*num_planes != pix->num_planes ||
++		    sizes[0] < pix->plane_fmt[0].sizeimage)
++			return -EINVAL;
++		return 0;
++	}
++
++	*num_planes = pix->num_planes;
++	sizes[0] = pix->plane_fmt[0].sizeimage;
++
++	return 0;
++}
++
++static int rkvenc_buf_prepare(struct vb2_buffer *vb)
++{
++	struct rkvenc_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++	struct v4l2_pix_format_mplane *pix;
++
++	pix = V4L2_TYPE_IS_CAPTURE(vb->vb2_queue->type) ? &ctx->dst_fmt :
++							   &ctx->src_fmt;
++	if (vb2_plane_size(vb, 0) < pix->plane_fmt[0].sizeimage)
++		return -EINVAL;
++
++	if (V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type))
++		vb2_set_plane_payload(vb, 0, pix->plane_fmt[0].sizeimage);
++
++	return 0;
++}
++
++static int rkvenc_buf_out_validate(struct vb2_buffer *vb)
++{
++	to_vb2_v4l2_buffer(vb)->field = V4L2_FIELD_NONE;
++
++	return 0;
++}
++
++static void rkvenc_buf_queue(struct vb2_buffer *vb)
++{
++	struct rkvenc_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++
++	v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, to_vb2_v4l2_buffer(vb));
++}
++
++static void rkvenc_return_bufs(struct rkvenc_ctx *ctx, struct vb2_queue *vq,
++			       enum vb2_buffer_state state)
++{
++	struct vb2_v4l2_buffer *vbuf;
++
++	for (;;) {
++		if (V4L2_TYPE_IS_CAPTURE(vq->type))
++			vbuf = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
++		else
++			vbuf = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
++		if (!vbuf)
++			break;
++		v4l2_m2m_buf_done(vbuf, state);
++	}
++}
++
++static int rkvenc_start_streaming(struct vb2_queue *vq, unsigned int count)
++{
++	struct rkvenc_ctx *ctx = vb2_get_drv_priv(vq);
++	int ret;
++
++	if (V4L2_TYPE_IS_OUTPUT(vq->type))
++		ctx->sequence_out = 0;
++	else
++		ctx->sequence_cap = 0;
++
++	ret = pm_runtime_resume_and_get(ctx->enc->dev);
++	if (ret < 0) {
++		rkvenc_return_bufs(ctx, vq, VB2_BUF_STATE_QUEUED);
++		return ret;
++	}
++
++	return 0;
++}
++
++static void rkvenc_stop_streaming(struct vb2_queue *vq)
++{
++	struct rkvenc_ctx *ctx = vb2_get_drv_priv(vq);
++
++	rkvenc_return_bufs(ctx, vq, VB2_BUF_STATE_ERROR);
++	pm_runtime_put(ctx->enc->dev);
++}
++
++static const struct vb2_ops rkvenc_qops = {
++	.queue_setup		= rkvenc_queue_setup,
++	.buf_out_validate	= rkvenc_buf_out_validate,
++	.buf_prepare		= rkvenc_buf_prepare,
++	.buf_queue		= rkvenc_buf_queue,
++	.start_streaming	= rkvenc_start_streaming,
++	.stop_streaming		= rkvenc_stop_streaming,
++};
++
++static int rkvenc_queue_init(void *priv, struct vb2_queue *src_vq,
++			     struct vb2_queue *dst_vq)
++{
++	struct rkvenc_ctx *ctx = priv;
++	int ret;
++
++	src_vq->type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++	src_vq->io_modes = VB2_MMAP | VB2_DMABUF;
++	src_vq->drv_priv = ctx;
++	src_vq->ops = &rkvenc_qops;
++	src_vq->mem_ops = &vb2_dma_contig_memops;
++	src_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
++	src_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
++	src_vq->lock = &ctx->enc->mutex;
++	src_vq->dev = ctx->enc->dev;
++
++	ret = vb2_queue_init(src_vq);
++	if (ret)
++		return ret;
++
++	dst_vq->type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++	dst_vq->io_modes = VB2_MMAP | VB2_DMABUF;
++	dst_vq->drv_priv = ctx;
++	dst_vq->ops = &rkvenc_qops;
++	dst_vq->mem_ops = &vb2_dma_contig_memops;
++	dst_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
++	dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
++	dst_vq->lock = &ctx->enc->mutex;
++	dst_vq->dev = ctx->enc->dev;
++
++	return vb2_queue_init(dst_vq);
++}
++
++static int rkvenc_s_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct rkvenc_ctx *ctx =
++		container_of(ctrl->handler, struct rkvenc_ctx, ctrl_handler);
++
++	switch (ctrl->id) {
++	case V4L2_CID_MPEG_VIDEO_BITRATE:
++		ctx->bitrate = ctrl->val;
++		break;
++	case V4L2_CID_MPEG_VIDEO_GOP_SIZE:
++		ctx->gop_size = ctrl->val;
++		break;
++	default:
++		break;
++	}
++
++	return 0;
++}
++
++static const struct v4l2_ctrl_ops rkvenc_ctrl_ops = {
++	.s_ctrl = rkvenc_s_ctrl,
++};
++
++static int rkvenc_setup_ctrls(struct rkvenc_ctx *ctx)
++{
++	struct v4l2_ctrl_handler *hdl = &ctx->ctrl_handler;
++	struct v4l2_ctrl *ctrl;
++	int ret;
++
++	v4l2_ctrl_handler_init(hdl, 16);
++
++	v4l2_ctrl_new_std(hdl, &rkvenc_ctrl_ops, V4L2_CID_MPEG_VIDEO_BITRATE,
++			  10000, 200000000, 1, RKVENC_DEFAULT_BITRATE);
++	v4l2_ctrl_new_std(hdl, &rkvenc_ctrl_ops, V4L2_CID_MPEG_VIDEO_GOP_SIZE,
++			  0, 1000, 1, RKVENC_DEFAULT_GOP_SIZE);
++	v4l2_ctrl_new_std(hdl, &rkvenc_ctrl_ops,
++			  V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0, 0, 0, 0);
++	v4l2_ctrl_new_std_menu(hdl, &rkvenc_ctrl_ops,
++			       V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
++			       V4L2_MPEG_VIDEO_BITRATE_MODE_CQ,
++			       ~(BIT(V4L2_MPEG_VIDEO_BITRATE_MODE_VBR) |
++				 BIT(V4L2_MPEG_VIDEO_BITRATE_MODE_CBR) |
++				 BIT(V4L2_MPEG_VIDEO_BITRATE_MODE_CQ)),
++			       V4L2_MPEG_VIDEO_BITRATE_MODE_CBR);
++	v4l2_ctrl_new_std_menu(hdl, &rkvenc_ctrl_ops,
++			       V4L2_CID_MPEG_VIDEO_H264_PROFILE,
++			       V4L2_MPEG_VIDEO_H264_PROFILE_HIGH,
++			       BIT(V4L2_MPEG_VIDEO_H264_PROFILE_EXTENDED),
++			       V4L2_MPEG_VIDEO_H264_PROFILE_HIGH);
++	v4l2_ctrl_new_std_menu(hdl, &rkvenc_ctrl_ops,
++			       V4L2_CID_MPEG_VIDEO_H264_LEVEL,
++			       V4L2_MPEG_VIDEO_H264_LEVEL_5_1, 0,
++			       V4L2_MPEG_VIDEO_H264_LEVEL_4_0);
++	v4l2_ctrl_new_std(hdl, &rkvenc_ctrl_ops,
++			  V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE, 0, 1, 1, 1);
++	v4l2_ctrl_new_std(hdl, &rkvenc_ctrl_ops,
++			  V4L2_CID_MPEG_VIDEO_MB_RC_ENABLE, 0, 1, 1, 1);
++	v4l2_ctrl_new_std(hdl, &rkvenc_ctrl_ops,
++			  V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR,
++			  0, 1, 1, 1);
++
++	ctrl = v4l2_ctrl_new_std(hdl, &rkvenc_ctrl_ops,
++				 V4L2_CID_MIN_BUFFERS_FOR_OUTPUT, 1, 32, 1, 1);
++	if (ctrl)
++		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	if (hdl->error) {
++		ret = hdl->error;
++		v4l2_ctrl_handler_free(hdl);
++		return ret;
++	}
++
++	ctx->fh.ctrl_handler = hdl;
++
++	return v4l2_ctrl_handler_setup(hdl);
++}
++
++static int rkvenc_open(struct file *file)
++{
++	struct rkvenc_dev *enc = video_drvdata(file);
++	struct rkvenc_ctx *ctx;
++	int ret;
++
++	ctx = kzalloc_obj(*ctx);
++	if (!ctx)
++		return -ENOMEM;
++
++	ctx->enc = enc;
++	ctx->bitrate = RKVENC_DEFAULT_BITRATE;
++	ctx->gop_size = RKVENC_DEFAULT_GOP_SIZE;
++	ctx->fps_num = RKVENC_DEFAULT_FPS;
++	ctx->fps_den = 1;
++
++	ctx->src_fmt.width = RKVENC_DEFAULT_WIDTH;
++	ctx->src_fmt.height = RKVENC_DEFAULT_HEIGHT;
++	ctx->src_fmt.colorspace = V4L2_COLORSPACE_REC709;
++	ctx->src_fmt.quantization = V4L2_QUANTIZATION_LIM_RANGE;
++	rkvenc_fill_raw_fmt(&ctx->src_fmt);
++
++	ctx->dst_fmt.width = RKVENC_DEFAULT_WIDTH;
++	ctx->dst_fmt.height = RKVENC_DEFAULT_HEIGHT;
++	ctx->dst_fmt.colorspace = V4L2_COLORSPACE_REC709;
++	ctx->dst_fmt.quantization = V4L2_QUANTIZATION_LIM_RANGE;
++	rkvenc_fill_coded_fmt(&ctx->dst_fmt);
++
++	ctx->crop.left = 0;
++	ctx->crop.top = 0;
++	ctx->crop.width = ctx->src_fmt.width;
++	ctx->crop.height = ctx->src_fmt.height;
++
++	if (mutex_lock_interruptible(&enc->mutex)) {
++		ret = -ERESTARTSYS;
++		goto err_free;
++	}
++
++	v4l2_fh_init(&ctx->fh, video_devdata(file));
++	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(enc->m2m_dev, ctx,
++					    rkvenc_queue_init);
++	if (IS_ERR(ctx->fh.m2m_ctx)) {
++		ret = PTR_ERR(ctx->fh.m2m_ctx);
++		goto err_fh;
++	}
++
++	ret = rkvenc_setup_ctrls(ctx);
++	if (ret)
++		goto err_m2m;
++
++	v4l2_fh_add(&ctx->fh, file);
++	mutex_unlock(&enc->mutex);
++
++	return 0;
++
++err_m2m:
++	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
++err_fh:
++	v4l2_fh_exit(&ctx->fh);
++	mutex_unlock(&enc->mutex);
++err_free:
++	kfree(ctx);
++	return ret;
++}
++
++static int rkvenc_release(struct file *file)
++{
++	struct rkvenc_ctx *ctx = file_to_ctx(file);
++	struct rkvenc_dev *enc = ctx->enc;
++
++	mutex_lock(&enc->mutex);
++	v4l2_fh_del(&ctx->fh, file);
++	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
++	v4l2_ctrl_handler_free(&ctx->ctrl_handler);
++	v4l2_fh_exit(&ctx->fh);
++	mutex_unlock(&enc->mutex);
++
++	kfree(ctx);
++
++	return 0;
++}
++
++static const struct v4l2_file_operations rkvenc_fops = {
++	.owner		= THIS_MODULE,
++	.open		= rkvenc_open,
++	.release	= rkvenc_release,
++	.poll		= v4l2_m2m_fop_poll,
++	.unlocked_ioctl	= video_ioctl2,
++	.mmap		= v4l2_m2m_fop_mmap,
++};
++
++static int rkvenc_job_ready(void *priv)
++{
++	struct rkvenc_ctx *ctx = priv;
++
++	return v4l2_m2m_num_src_bufs_ready(ctx->fh.m2m_ctx) &&
++	       v4l2_m2m_num_dst_bufs_ready(ctx->fh.m2m_ctx);
++}
++
++static void rkvenc_device_run(void *priv)
++{
++	struct rkvenc_ctx *ctx = priv;
++	struct rkvenc_dev *enc = ctx->enc;
++	struct vb2_v4l2_buffer *src, *dst;
++
++	src = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
++	dst = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
++	if (src && dst) {
++		v4l2_m2m_buf_copy_metadata(src, dst);
++		src->sequence = ctx->sequence_out++;
++		dst->sequence = ctx->sequence_cap++;
++		vb2_set_plane_payload(&dst->vb2_buf, 0, 0);
++		v4l2_m2m_buf_done(src, VB2_BUF_STATE_ERROR);
++		v4l2_m2m_buf_done(dst, VB2_BUF_STATE_ERROR);
++	}
++
++	dev_dbg(enc->dev, "encode register path is not implemented yet\n");
++	v4l2_m2m_job_finish(enc->m2m_dev, ctx->fh.m2m_ctx);
++}
++
++static void rkvenc_job_abort(void *priv)
++{
++	struct rkvenc_ctx *ctx = priv;
++
++	v4l2_m2m_job_finish(ctx->enc->m2m_dev, ctx->fh.m2m_ctx);
++}
++
++static const struct v4l2_m2m_ops rkvenc_m2m_ops = {
++	.device_run	= rkvenc_device_run,
++	.job_ready	= rkvenc_job_ready,
++	.job_abort	= rkvenc_job_abort,
++};
++
++static irqreturn_t rkvenc_irq(int irq, void *data)
++{
++	struct rkvenc_dev *enc = data;
++	u32 status;
++
++	status = rkvenc_read(enc, RKVENC_REG_INT_STA);
++	if (!status)
++		return IRQ_NONE;
++
++	rkvenc_write(enc, RKVENC_REG_INT_CLR, status);
++
++	return IRQ_HANDLED;
++}
++
++static int rkvenc_runtime_resume(struct device *dev)
++{
++	struct rkvenc_dev *enc = dev_get_drvdata(dev);
++
++	return clk_bulk_prepare_enable(RKVENC_NUM_CLKS, enc->clks);
++}
++
++static int rkvenc_runtime_suspend(struct device *dev)
++{
++	struct rkvenc_dev *enc = dev_get_drvdata(dev);
++
++	clk_bulk_disable_unprepare(RKVENC_NUM_CLKS, enc->clks);
++
++	return 0;
++}
++
++static const struct dev_pm_ops rkvenc_pm_ops = {
++	RUNTIME_PM_OPS(rkvenc_runtime_suspend, rkvenc_runtime_resume, NULL)
++};
++
++static int rkvenc_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct rkvenc_dev *enc;
++	struct video_device *vfd;
++	int ret;
++
++	enc = devm_kzalloc(dev, sizeof(*enc), GFP_KERNEL);
++	if (!enc)
++		return -ENOMEM;
++
++	enc->dev = dev;
++	platform_set_drvdata(pdev, enc);
++	mutex_init(&enc->mutex);
++
++	enc->regs = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(enc->regs))
++		return PTR_ERR(enc->regs);
++
++	enc->clks[0].id = "aclk";
++	enc->clks[1].id = "hclk";
++	enc->clks[2].id = "core";
++	ret = devm_clk_bulk_get(dev, RKVENC_NUM_CLKS, enc->clks);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to get clocks\n");
++
++	enc->resets[0].id = "a";
++	enc->resets[1].id = "h";
++	enc->resets[2].id = "core";
++	ret = devm_reset_control_bulk_get_exclusive(dev, RKVENC_NUM_RESETS,
++						    enc->resets);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to get resets\n");
++
++	enc->irq = platform_get_irq_byname(pdev, "enc");
++	if (enc->irq < 0)
++		enc->irq = platform_get_irq(pdev, 0);
++	if (enc->irq < 0)
++		return enc->irq;
++
++	ret = devm_request_irq(dev, enc->irq, rkvenc_irq, 0, dev_name(dev),
++			       enc);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to request IRQ\n");
++
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to set DMA mask\n");
++
++	pm_runtime_set_suspended(dev);
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		return ret;
++
++	ret = pm_runtime_resume_and_get(dev);
++	if (ret < 0)
++		return dev_err_probe(dev, ret, "failed to power encoder\n");
++	enc->hw_id = rkvenc_read(enc, RKVENC_REG_VERSION);
++	pm_runtime_put(dev);
++
++	if (!enc->hw_id || enc->hw_id == 0xffffffff)
++		return dev_err_probe(dev, -ENODEV,
++				     "implausible hardware id 0x%08x\n",
++				     enc->hw_id);
++
++	if (!(enc->hw_id & RKVENC_VERSION_H264_CAP))
++		return dev_err_probe(dev, -ENODEV,
++				     "H.264 capability missing in id 0x%08x\n",
++				     enc->hw_id);
++
++	ret = v4l2_device_register(dev, &enc->v4l2_dev);
++	if (ret)
++		return ret;
++
++	enc->m2m_dev = v4l2_m2m_init(&rkvenc_m2m_ops);
++	if (IS_ERR(enc->m2m_dev)) {
++		ret = PTR_ERR(enc->m2m_dev);
++		goto err_v4l2;
++	}
++
++	vfd = &enc->vfd;
++	vfd->fops = &rkvenc_fops;
++	vfd->ioctl_ops = &rkvenc_ioctl_ops;
++	vfd->release = video_device_release_empty;
++	vfd->lock = &enc->mutex;
++	vfd->v4l2_dev = &enc->v4l2_dev;
++	vfd->vfl_dir = VFL_DIR_M2M;
++	vfd->device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING;
++	strscpy(vfd->name, RKVENC_NAME, sizeof(vfd->name));
++	video_set_drvdata(vfd, enc);
++
++	ret = video_register_device(vfd, VFL_TYPE_VIDEO, -1);
++	if (ret)
++		goto err_m2m;
++
++	dev_info(dev,
++		 "VEPU580 registered as /dev/video%d: version 0x%08x, H.264, HEVC %s, FBC %lu\n",
++		 vfd->num, enc->hw_id,
++		 enc->hw_id & RKVENC_VERSION_HEVC_CAP ? "yes" : "no",
++		 FIELD_GET(RKVENC_VERSION_FBC_CAP, enc->hw_id));
++
++	return 0;
++
++err_m2m:
++	v4l2_m2m_release(enc->m2m_dev);
++err_v4l2:
++	v4l2_device_unregister(&enc->v4l2_dev);
++	return ret;
++}
++
++static void rkvenc_remove(struct platform_device *pdev)
++{
++	struct rkvenc_dev *enc = platform_get_drvdata(pdev);
++
++	video_unregister_device(&enc->vfd);
++	v4l2_m2m_release(enc->m2m_dev);
++	v4l2_device_unregister(&enc->v4l2_dev);
++}
++
++static const struct of_device_id rkvenc_of_match[] = {
++	{ .compatible = "rockchip,rk3588-vepu580" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, rkvenc_of_match);
++
++static struct platform_driver rkvenc_driver = {
++	.probe = rkvenc_probe,
++	.remove = rkvenc_remove,
++	.driver = {
++		.name = RKVENC_NAME,
++		.of_match_table = rkvenc_of_match,
++		.pm = pm_ptr(&rkvenc_pm_ops),
++	},
++};
++module_platform_driver(rkvenc_driver);
++
++MODULE_DESCRIPTION("Rockchip VEPU580 H.264 encoder skeleton");
++MODULE_LICENSE("GPL");
