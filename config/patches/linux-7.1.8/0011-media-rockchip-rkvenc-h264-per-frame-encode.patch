@@ -555,7 +555,7 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x Module.symvers -x Kconfig base/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c ktest/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c
 --- a/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c	1970-01-01 00:00:00.000000000 +0000
 +++ b/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c	2026-09-09 08:49:39.497692058 +0000
-@@ -0,0 +1,1343 @@
+@@ -0,0 +1,1430 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Rockchip VEPU580 (RKVENC) H.264 encoder driver
@@ -566,6 +566,7 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +#include <linux/bitfield.h>
 +#include <linux/bits.h>
 +#include <linux/clk.h>
++#include <linux/delay.h>
 +#include <linux/dma-mapping.h>
 +#include <linux/interrupt.h>
 +#include <linux/module.h>
@@ -573,6 +574,7 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +#include <linux/platform_device.h>
 +#include <linux/pm_runtime.h>
 +#include <linux/reset.h>
++#include <linux/spinlock.h>
 +#include <linux/workqueue.h>
 +#include <linux/slab.h>
 +#include <linux/videodev2.h>
@@ -644,6 +646,8 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	 */
 +	struct delayed_work watchdog;
 +	atomic_t job_active;
++	/* Serializes job launch against abort, IRQ and watchdog ownership. */
++	spinlock_t job_lock;
 +};
 +
 +struct rkvenc_ctx {
@@ -670,6 +674,7 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	u8 profile_idc;
 +	u8 qp;
 +	bool force_key_frame;
++	bool aborting;
 +	u32 job_hdr_bytes;	/* software headers at the front of this frame */
 +};
 +
@@ -1118,7 +1123,13 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +static int rkvenc_start_streaming(struct vb2_queue *vq, unsigned int count)
 +{
 +	struct rkvenc_ctx *ctx = vb2_get_drv_priv(vq);
++	unsigned long flags;
 +	int ret;
++
++	/* A completed STREAMOFF makes the context eligible for jobs again. */
++	spin_lock_irqsave(&ctx->enc->job_lock, flags);
++	ctx->aborting = false;
++	spin_unlock_irqrestore(&ctx->enc->job_lock, flags);
 +
 +	if (V4L2_TYPE_IS_OUTPUT(vq->type))
 +		ctx->sequence_out = 0;
@@ -1464,6 +1475,7 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	struct rkvenc_dev *enc = ctx->enc;
 +	struct rkvenc_frame_job job = {};
 +	struct vb2_v4l2_buffer *src, *dst;
++	unsigned long flags;
 +	unsigned int cur, prev;
 +	void *bs_cpu;
 +	bool idr;
@@ -1550,10 +1562,23 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +		 job.bs_size, &job.recon_hdr, &job.recon_body,
 +		 &job.recon_thumb);
 +
++	/*
++	 * STREAMOFF may race the m2m scheduler after it selected this context
++	 * but before device_run reached the hardware. Serialize that boundary:
++	 * abort either prevents the launch or takes ownership of an active job.
++	 * Arm the watchdog before starting the block so a very fast completion
++	 * cannot leave delayed work from this job attached to the next one.
++	 */
++	spin_lock_irqsave(&enc->job_lock, flags);
++	if (ctx->aborting) {
++		spin_unlock_irqrestore(&enc->job_lock, flags);
++		goto fail;
++	}
 +	atomic_set(&enc->job_active, 1);
-+	rkvenc_hw_run(enc->regs, &job);
 +	schedule_delayed_work(&enc->watchdog,
 +			      msecs_to_jiffies(RKVENC_JOB_TIMEOUT_MS));
++	rkvenc_hw_run(enc->regs, &job);
++	spin_unlock_irqrestore(&enc->job_lock, flags);
 +
 +	return;
 +
@@ -1567,15 +1592,42 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	v4l2_m2m_job_finish(enc->m2m_dev, ctx->fh.m2m_ctx);
 +}
 +
++static void rkvenc_reset_block(struct rkvenc_dev *enc)
++{
++	if (!rkvenc_hw_reset(enc->regs))
++		return;
++
++	dev_warn(enc->dev, "soft reset timed out, using reset controls\n");
++	if (reset_control_bulk_assert(RKVENC_NUM_RESETS, enc->resets)) {
++		dev_err(enc->dev, "failed to assert reset controls\n");
++		return;
++	}
++
++	udelay(5);
++	if (reset_control_bulk_deassert(RKVENC_NUM_RESETS, enc->resets)) {
++		dev_err(enc->dev, "failed to deassert reset controls\n");
++		return;
++	}
++
++	/* A reset clears the tables that the next frame expects to find. */
++	rkvenc_hw_setup_common(enc->regs);
++	rkvenc_hw_load_tables(enc->regs);
++}
++
 +static void rkvenc_watchdog(struct work_struct *work)
 +{
 +	struct rkvenc_dev *enc =
 +		container_of(to_delayed_work(work), struct rkvenc_dev, watchdog);
 +	struct vb2_v4l2_buffer *src, *dst;
 +	struct rkvenc_ctx *ctx;
++	unsigned long flags;
 +
-+	if (atomic_cmpxchg(&enc->job_active, 1, 0) != 1)
++	spin_lock_irqsave(&enc->job_lock, flags);
++	if (atomic_cmpxchg(&enc->job_active, 1, 0) != 1) {
++		spin_unlock_irqrestore(&enc->job_lock, flags);
 +		return;
++	}
++	spin_unlock_irqrestore(&enc->job_lock, flags);
 +
 +	dev_err(enc->dev, "job timed out after %u ms, int status 0x%08x\n",
 +		RKVENC_JOB_TIMEOUT_MS, rkvenc_read(enc, RKVENC_REG_INT_STA));
@@ -1585,7 +1637,8 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	 * into them, and handing memory back to userspace while the hardware
 +	 * has a pointer to it is worse than the stall we are recovering from.
 +	 */
-+	rkvenc_hw_reset(enc->regs);
++	rkvenc_reset_block(enc);
++	synchronize_irq(enc->irq);
 +
 +	ctx = v4l2_m2m_get_curr_priv(enc->m2m_dev);
 +	if (!ctx)
@@ -1606,8 +1659,36 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +static void rkvenc_job_abort(void *priv)
 +{
 +	struct rkvenc_ctx *ctx = priv;
++	struct rkvenc_dev *enc = ctx->enc;
++	struct vb2_v4l2_buffer *src, *dst;
++	unsigned long flags;
 +
-+	v4l2_m2m_job_finish(ctx->enc->m2m_dev, ctx->fh.m2m_ctx);
++	spin_lock_irqsave(&enc->job_lock, flags);
++	ctx->aborting = true;
++
++	/* IRQ or watchdog already owns completion; cancel_job will wait for it. */
++	if (atomic_cmpxchg(&enc->job_active, 1, 0) != 1) {
++		spin_unlock_irqrestore(&enc->job_lock, flags);
++		return;
++	}
++
++	spin_unlock_irqrestore(&enc->job_lock, flags);
++
++	/* Stop all asynchronous owners before resetting and returning memory. */
++	cancel_delayed_work_sync(&enc->watchdog);
++	rkvenc_reset_block(enc);
++	synchronize_irq(enc->irq);
++
++	src = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
++	dst = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
++	if (src)
++		v4l2_m2m_buf_done(src, VB2_BUF_STATE_ERROR);
++	if (dst) {
++		vb2_set_plane_payload(&dst->vb2_buf, 0, 0);
++		v4l2_m2m_buf_done(dst, VB2_BUF_STATE_ERROR);
++	}
++
++	v4l2_m2m_job_finish(enc->m2m_dev, ctx->fh.m2m_ctx);
 +}
 +
 +static const struct v4l2_m2m_ops rkvenc_m2m_ops = {
@@ -1622,6 +1703,7 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	struct vb2_v4l2_buffer *src, *dst;
 +	struct rkvenc_ctx *ctx;
 +	enum vb2_buffer_state state;
++	unsigned long flags;
 +	u32 status, bytes = 0;
 +
 +	status = rkvenc_read(enc, RKVENC_REG_INT_STA);
@@ -1644,8 +1726,12 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	 * so only claim the job once something final has happened.
 +	 */
 +	if (status & (RKVENC_INT_ENC_DONE | RKVENC_INT_ERROR)) {
-+		if (atomic_cmpxchg(&enc->job_active, 1, 0) != 1)
++		spin_lock_irqsave(&enc->job_lock, flags);
++		if (atomic_cmpxchg(&enc->job_active, 1, 0) != 1) {
++			spin_unlock_irqrestore(&enc->job_lock, flags);
 +			return IRQ_HANDLED;
++		}
++		spin_unlock_irqrestore(&enc->job_lock, flags);
 +		cancel_delayed_work(&enc->watchdog);
 +	}
 +
@@ -1772,6 +1858,7 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	platform_set_drvdata(pdev, enc);
 +	INIT_DELAYED_WORK(&enc->watchdog, rkvenc_watchdog);
 +	atomic_set(&enc->job_active, 0);
++	spin_lock_init(&enc->job_lock);
 +	mutex_init(&enc->mutex);
 +
 +	enc->regs = devm_platform_ioremap_resource(pdev, 0);
@@ -2208,7 +2295,7 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x Module.symvers -x Kconfig base/drivers/media/platform/rockchip/rkvenc/rkvenc-hw.c ktest/drivers/media/platform/rockchip/rkvenc/rkvenc-hw.c
 --- a/drivers/media/platform/rockchip/rkvenc/rkvenc-hw.c	1970-01-01 00:00:00.000000000 +0000
 +++ b/drivers/media/platform/rockchip/rkvenc/rkvenc-hw.c	2026-09-09 08:49:39.497692058 +0000
-@@ -0,0 +1,436 @@
+@@ -0,0 +1,452 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Per-frame register path for the Rockchip VEPU580 encoder driver.
@@ -2217,7 +2304,9 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 + */
 +
 +#include <linux/bitfield.h>
++#include <linux/delay.h>
 +#include <linux/io.h>
++#include <linux/iopoll.h>
 +
 +#include <linux/align.h>
 +#include <linux/minmax.h>
@@ -2308,11 +2397,25 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	}
 +}
 +
-+void rkvenc_hw_reset(void __iomem *regs)
++int rkvenc_hw_reset(void __iomem *regs)
 +{
-+	rkvenc_wr(regs, RKVENC_REG_ENC_CLR,
-+		  RKVENC_ENC_CLR_SAFE | RKVENC_ENC_CLR_FORCE);
++	u32 status;
++	int ret;
++
++	/* First let outstanding AXI transactions drain cleanly. */
++	rkvenc_wr(regs, RKVENC_REG_INT_MASK, RKVENC_INT_ALL);
++	rkvenc_wr(regs, RKVENC_REG_ENC_CLR, RKVENC_ENC_CLR_SAFE);
++	ret = readl_poll_timeout_atomic(regs + RKVENC_REG_INT_STA, status,
++					status & RKVENC_INT_SCLR_DONE, 0, 5);
++
++	/* Force the block idle even when safe-clear did not acknowledge. */
++	rkvenc_wr(regs, RKVENC_REG_ENC_CLR, RKVENC_ENC_CLR_FORCE);
++	udelay(5);
++	rkvenc_wr(regs, RKVENC_REG_ENC_CLR, 0);
 +	rkvenc_wr(regs, RKVENC_REG_INT_CLR, RKVENC_INT_ALL);
++	rkvenc_rd(regs, RKVENC_REG_INT_STA);
++
++	return ret;
 +}
 +
 +u32 rkvenc_hw_bitstream_len(void __iomem *regs)
@@ -2770,8 +2873,8 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +/* Bytes the block wrote for the frame that just completed. */
 +u32 rkvenc_hw_bitstream_len(void __iomem *regs);
 +
-+/* Stop a running job and leave the block idle. */
-+void rkvenc_hw_reset(void __iomem *regs);
++/* Stop a running job and leave the block idle. Returns a safe-clear timeout. */
++int rkvenc_hw_reset(void __iomem *regs);
 +
 +#endif /* _RKVENC_HW_H_ */
 diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x Module.symvers -x Kconfig base/drivers/media/platform/rockchip/rkvenc/rkvenc-regs.h ktest/drivers/media/platform/rockchip/rkvenc/rkvenc-regs.h
