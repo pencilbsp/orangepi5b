@@ -555,7 +555,7 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x Module.symvers -x Kconfig base/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c ktest/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c
 --- a/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c	1970-01-01 00:00:00.000000000 +0000
 +++ b/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c	2026-09-09 08:49:39.497692058 +0000
-@@ -0,0 +1,1488 @@
+@@ -0,0 +1,1563 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Rockchip VEPU580 (RKVENC) H.264 encoder driver
@@ -611,6 +611,8 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +#define RKVENC_DEFAULT_BITRATE		12000000
 +#define RKVENC_DEFAULT_GOP_SIZE		60
 +#define RKVENC_DEFAULT_QP		26
++#define RKVENC_MIN_QP			0
++#define RKVENC_MAX_QP			51
 +
 +/* Generous next to a frame time, short next to a user noticing a stall. */
 +#define RKVENC_JOB_TIMEOUT_MS		500
@@ -680,7 +682,18 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	u16 idr_pic_id;		/* alternates so two IDRs never look alike */
 +	unsigned int recon_idx;	/* which reconstruction slot to write */
 +	u8 profile_idc;
-+	u8 qp;
++	/*
++	 * Constant QP is the whole of this driver's rate control: the block's
++	 * own is left off, so these are the QPs rather than a starting point
++	 * for one. @pic_init_qp is what the PPS now in flight declares, held
++	 * across the GOP that PPS opened so that a mid-stream change to @qp_i
++	 * cannot contradict headers a decoder has already read.
++	 */
++	u8 qp_i;
++	u8 qp_p;
++	u8 qp_min;
++	u8 qp_max;
++	u8 pic_init_qp;
 +	bool force_key_frame;
 +	bool aborting;
 +	u32 job_hdr_bytes;	/* software headers at the front of this frame */
@@ -1246,6 +1259,18 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	case V4L2_CID_MPEG_VIDEO_GOP_SIZE:
 +		ctx->gop_size = ctrl->val;
 +		break;
++	case V4L2_CID_MPEG_VIDEO_H264_I_FRAME_QP:
++		ctx->qp_i = ctrl->val;
++		break;
++	case V4L2_CID_MPEG_VIDEO_H264_P_FRAME_QP:
++		ctx->qp_p = ctrl->val;
++		break;
++	case V4L2_CID_MPEG_VIDEO_H264_MIN_QP:
++		ctx->qp_min = ctrl->val;
++		break;
++	case V4L2_CID_MPEG_VIDEO_H264_MAX_QP:
++		ctx->qp_max = ctrl->val;
++		break;
 +	case V4L2_CID_MPEG_VIDEO_H264_PROFILE:
 +		switch (ctrl->val) {
 +		case V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE:
@@ -1290,6 +1315,26 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +			  10000, 200000000, 1, RKVENC_DEFAULT_BITRATE);
 +	v4l2_ctrl_new_std(hdl, &rkvenc_ctrl_ops, V4L2_CID_MPEG_VIDEO_GOP_SIZE,
 +			  0, 1000, 1, RKVENC_DEFAULT_GOP_SIZE);
++
++	/*
++	 * These four are the entire rate control. The block's own is off, so
++	 * I_FRAME_QP and P_FRAME_QP are applied literally, and MIN_QP/MAX_QP
++	 * can only bound them: there is no per-macroblock QP decision for a
++	 * range to constrain. A client that means to pick its own quality --
++	 * which is what a remote desktop does -- drives exactly these.
++	 */
++	v4l2_ctrl_new_std(hdl, &rkvenc_ctrl_ops,
++			  V4L2_CID_MPEG_VIDEO_H264_I_FRAME_QP,
++			  RKVENC_MIN_QP, RKVENC_MAX_QP, 1, RKVENC_DEFAULT_QP);
++	v4l2_ctrl_new_std(hdl, &rkvenc_ctrl_ops,
++			  V4L2_CID_MPEG_VIDEO_H264_P_FRAME_QP,
++			  RKVENC_MIN_QP, RKVENC_MAX_QP, 1, RKVENC_DEFAULT_QP);
++	v4l2_ctrl_new_std(hdl, &rkvenc_ctrl_ops,
++			  V4L2_CID_MPEG_VIDEO_H264_MIN_QP,
++			  RKVENC_MIN_QP, RKVENC_MAX_QP, 1, RKVENC_MIN_QP);
++	v4l2_ctrl_new_std(hdl, &rkvenc_ctrl_ops,
++			  V4L2_CID_MPEG_VIDEO_H264_MAX_QP,
++			  RKVENC_MIN_QP, RKVENC_MAX_QP, 1, RKVENC_MAX_QP);
 +	v4l2_ctrl_new_std(hdl, &rkvenc_ctrl_ops,
 +			  V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0, 0, 0, 0);
 +	v4l2_ctrl_new_std_menu(hdl, &rkvenc_ctrl_ops,
@@ -1346,11 +1391,15 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	ctx->bitrate = RKVENC_DEFAULT_BITRATE;
 +	ctx->gop_size = RKVENC_DEFAULT_GOP_SIZE;
 +	/*
-+	 * Until rate control runs, this QP is what every macroblock gets, so
-+	 * it has to be a sane picture rather than a placeholder: zero would
-+	 * ask for near-lossless coding and overrun any bitstream buffer.
++	 * These QPs are what every macroblock gets, so they have to describe a
++	 * sane picture rather than stand in as placeholders: zero would ask
++	 * for near-lossless coding and overrun any bitstream buffer.
 +	 */
-+	ctx->qp = RKVENC_DEFAULT_QP;
++	ctx->qp_i = RKVENC_DEFAULT_QP;
++	ctx->qp_p = RKVENC_DEFAULT_QP;
++	ctx->qp_min = RKVENC_MIN_QP;
++	ctx->qp_max = RKVENC_MAX_QP;
++	ctx->pic_init_qp = RKVENC_DEFAULT_QP;
 +	ctx->profile_idc = RKVENC_H264_PROFILE_HIGH;
 +	ctx->fps_num = RKVENC_DEFAULT_FPS;
 +	ctx->fps_den = 1;
@@ -1458,6 +1507,21 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	return ctx->frame_cnt % ctx->gop_size == 0;
 +}
 +
++/*
++ * The picture QP for one frame, bounded by the range the client asked for. A
++ * client that inverts that range gets its literal QP: clamping against a
++ * bound that means nothing would be a worse answer than ignoring it.
++ */
++static u8 rkvenc_pic_qp(const struct rkvenc_ctx *ctx, bool idr)
++{
++	u8 qp = idr ? ctx->qp_i : ctx->qp_p;
++
++	if (ctx->qp_min > ctx->qp_max)
++		return qp;
++
++	return clamp(qp, ctx->qp_min, ctx->qp_max);
++}
++
 +static size_t rkvenc_write_headers(struct rkvenc_ctx *ctx, void *dst,
 +				   size_t size)
 +{
@@ -1468,7 +1532,7 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	p.height = ctx->src_fmt.height;
 +	p.profile_idc = ctx->profile_idc;
 +	p.cabac = ctx->profile_idc != RKVENC_H264_PROFILE_BASELINE;
-+	p.init_qp = ctx->qp;
++	p.init_qp = ctx->pic_init_qp;
 +	p.chroma_qp_index_offset = 0;
 +	p.fps_num = ctx->fps_num;
 +	p.fps_den = ctx->fps_den;
@@ -1516,6 +1580,16 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	}
 +
 +	idr = rkvenc_want_idr(ctx);
++
++	/*
++	 * pic_init_qp lives in the PPS, and a PPS only goes out in front of an
++	 * IDR, so it is fixed for the GOP that IDR opens. The block is told it
++	 * separately from the frame QP because it builds the slice header
++	 * itself and writes slice_qp_delta as the difference between the two.
++	 */
++	if (idr)
++		ctx->pic_init_qp = rkvenc_pic_qp(ctx, true);
++
 +	cur = ctx->recon_idx;
 +	prev = cur ^ 1;
 +
@@ -1564,7 +1638,8 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	job.ext_line_size = ctx->bufs.ext_line.size;
 +
 +	job.idr = idr;
-+	job.qp = ctx->qp;
++	job.qp = rkvenc_pic_qp(ctx, idr);
++	job.pic_init_qp = ctx->pic_init_qp;
 +	job.cabac = ctx->profile_idc != RKVENC_H264_PROFILE_BASELINE;
 +	job.frame_num = idr ? 0 : ctx->frame_cnt;
 +	job.idr_pic_id = ctx->idr_pic_id;
@@ -2667,7 +2742,7 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	 */
 +	rkvenc_wr(regs, RKVENC_REG_SYNT_PPS,
 +		  (job->cabac ? RKVENC_SYNT_PPS_ETPY_MODE : 0) |
-+		  FIELD_PREP(RKVENC_SYNT_PPS_PIC_INIT_QP, job->qp) |
++		  FIELD_PREP(RKVENC_SYNT_PPS_PIC_INIT_QP, job->pic_init_qp) |
 +		  FIELD_PREP(RKVENC_SYNT_PPS_CB_OFST,
 +			     job->chroma_qp_index_offset & 0x1f) |
 +		  FIELD_PREP(RKVENC_SYNT_PPS_CR_OFST,
@@ -2828,7 +2903,7 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x Module.symvers -x Kconfig base/drivers/media/platform/rockchip/rkvenc/rkvenc-hw.h ktest/drivers/media/platform/rockchip/rkvenc/rkvenc-hw.h
 --- a/drivers/media/platform/rockchip/rkvenc/rkvenc-hw.h	1970-01-01 00:00:00.000000000 +0000
 +++ b/drivers/media/platform/rockchip/rkvenc/rkvenc-hw.h	2026-09-09 08:49:39.497692058 +0000
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,134 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +/*
 + * Per-frame register path for the Rockchip VEPU580 encoder driver.
@@ -2880,6 +2955,8 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 + * @ext_line_size: size of @ext_line
 + * @idr:          code as an IDR rather than a predicted picture
 + * @qp:           picture QP, 0..51
++ * @pic_init_qp:  pic_init_qp exactly as the PPS in flight declares it; the
++ *                block writes slice_qp_delta as @qp minus this
 + * @cabac:        entropy coder, must match the PPS handed to the decoder
 + * @frame_num:    H.264 frame_num for this picture
 + * @idr_pic_id:   idr_pic_id, alternates between consecutive IDRs
@@ -2921,6 +2998,7 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +
 +	bool idr;
 +	u8 qp;
++	u8 pic_init_qp;
 +	bool cabac;
 +	u16 frame_num;
 +	u16 idr_pic_id;
