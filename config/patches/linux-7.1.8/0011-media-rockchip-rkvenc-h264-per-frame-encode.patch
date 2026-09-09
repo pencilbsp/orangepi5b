@@ -555,7 +555,7 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x Module.symvers -x Kconfig base/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c ktest/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c
 --- a/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c	1970-01-01 00:00:00.000000000 +0000
 +++ b/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c	2026-09-09 08:49:39.497692058 +0000
-@@ -0,0 +1,1614 @@
+@@ -0,0 +1,1622 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Rockchip VEPU580 (RKVENC) H.264 encoder driver
@@ -1201,11 +1201,18 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +
 +	/*
 +	 * A stream that starts is a stream a decoder has to be able to join,
-+	 * so it opens on an IDR carrying parameter sets. Without resetting the
-+	 * GOP phase a client that stops and restarts -- a remote desktop
-+	 * changing resolution, which is the common case here -- resumes
-+	 * mid-GOP, and its first frame is a P-frame predicted from a picture
-+	 * the decoder was never given.
++	 * so it opens on an IDR carrying parameter sets. rkvenc_want_idr()
++	 * keys off frame_cnt, and frame_cnt is zero on a fresh context only
++	 * because the context was allocated zeroed -- an accident, not a
++	 * decision. A client that reuses one file descriptor across STREAMOFF
++	 * and STREAMON would resume wherever in the GOP it left off, and its
++	 * first frame would be a P-frame predicted from a picture the decoder
++	 * was never given.
++	 *
++	 * No client on this board does that today: the VA-API driver closes
++	 * the node and reopens it, so it lands on a zeroed context either way.
++	 * The guarantee should not rest on which client happens to be
++	 * attached, or on kzalloc.
 +	 *
 +	 * Both queues run this, and no job can start until both are
 +	 * streaming, so doing it twice costs nothing.
@@ -1395,13 +1402,14 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +			       V4L2_MPEG_VIDEO_H264_PROFILE_HIGH,
 +			       BIT(V4L2_MPEG_VIDEO_H264_PROFILE_EXTENDED),
 +			       V4L2_MPEG_VIDEO_H264_PROFILE_HIGH);
-+	ctx->ctrl_level = v4l2_ctrl_new_std_menu(hdl, &rkvenc_ctrl_ops,
-+			       V4L2_CID_MPEG_VIDEO_H264_LEVEL,
-+			       V4L2_MPEG_VIDEO_H264_LEVEL_6_2,
-+			       BIT(V4L2_MPEG_VIDEO_H264_LEVEL_1B),
-+			       V4L2_MPEG_VIDEO_H264_LEVEL_4_0);
-+	if (ctx->ctrl_level)
-+		ctx->ctrl_level->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++	ctrl = v4l2_ctrl_new_std_menu(hdl, &rkvenc_ctrl_ops,
++				      V4L2_CID_MPEG_VIDEO_H264_LEVEL,
++				      V4L2_MPEG_VIDEO_H264_LEVEL_6_2,
++				      BIT(V4L2_MPEG_VIDEO_H264_LEVEL_1B),
++				      V4L2_MPEG_VIDEO_H264_LEVEL_4_0);
++	if (ctrl)
++		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++	ctx->ctrl_level = ctrl;
 +	v4l2_ctrl_new_std(hdl, &rkvenc_ctrl_ops,
 +			  V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR,
 +			  0, 1, 1, 1);
