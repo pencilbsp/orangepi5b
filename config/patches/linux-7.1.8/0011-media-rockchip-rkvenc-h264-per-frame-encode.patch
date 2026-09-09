@@ -555,7 +555,7 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x Module.symvers -x Kconfig base/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c ktest/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c
 --- a/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c	1970-01-01 00:00:00.000000000 +0000
 +++ b/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c	2026-09-09 08:49:39.497692058 +0000
-@@ -0,0 +1,1430 @@
+@@ -0,0 +1,1451 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Rockchip VEPU580 (RKVENC) H.264 encoder driver
@@ -569,6 +569,7 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +#include <linux/delay.h>
 +#include <linux/dma-mapping.h>
 +#include <linux/interrupt.h>
++#include <linux/jiffies.h>
 +#include <linux/module.h>
 +#include <linux/of.h>
 +#include <linux/platform_device.h>
@@ -646,6 +647,13 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	 */
 +	struct delayed_work watchdog;
 +	atomic_t job_active;
++	/*
++	 * When the job now in the block is due. The watchdog is a single work
++	 * item shared by every job, so an execution left over from a job that
++	 * has since finished cannot be told apart from the one the running job
++	 * armed -- nothing but the deadline separates them.
++	 */
++	unsigned long job_deadline;
 +	/* Serializes job launch against abort, IRQ and watchdog ownership. */
 +	spinlock_t job_lock;
 +};
@@ -1566,8 +1574,9 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	 * STREAMOFF may race the m2m scheduler after it selected this context
 +	 * but before device_run reached the hardware. Serialize that boundary:
 +	 * abort either prevents the launch or takes ownership of an active job.
-+	 * Arm the watchdog before starting the block so a very fast completion
-+	 * cannot leave delayed work from this job attached to the next one.
++	 * The deadline is published under the same lock as the flag, so that a
++	 * watchdog execution left over from an earlier job cannot mistake this
++	 * one for a stall.
 +	 */
 +	spin_lock_irqsave(&enc->job_lock, flags);
 +	if (ctx->aborting) {
@@ -1575,6 +1584,7 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +		goto fail;
 +	}
 +	atomic_set(&enc->job_active, 1);
++	enc->job_deadline = jiffies + msecs_to_jiffies(RKVENC_JOB_TIMEOUT_MS);
 +	schedule_delayed_work(&enc->watchdog,
 +			      msecs_to_jiffies(RKVENC_JOB_TIMEOUT_MS));
 +	rkvenc_hw_run(enc->regs, &job);
@@ -1622,11 +1632,22 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	struct rkvenc_ctx *ctx;
 +	unsigned long flags;
 +
++	/*
++	 * cancel_delayed_work() in the interrupt cannot wait for a callback
++	 * that has already started, so this may be an execution armed by a job
++	 * that has since completed -- and by then the block may be running the
++	 * next one. Claiming on the flag alone would reset a healthy job,
++	 * possibly one belonging to a different open file. Only a job that has
++	 * really outlived its deadline is a stall; a job still within its own
++	 * has a timer of its own that will arrive on time.
++	 */
 +	spin_lock_irqsave(&enc->job_lock, flags);
-+	if (atomic_cmpxchg(&enc->job_active, 1, 0) != 1) {
++	if (atomic_read(&enc->job_active) != 1 ||
++	    time_before(jiffies, enc->job_deadline)) {
 +		spin_unlock_irqrestore(&enc->job_lock, flags);
 +		return;
 +	}
++	atomic_set(&enc->job_active, 0);
 +	spin_unlock_irqrestore(&enc->job_lock, flags);
 +
 +	dev_err(enc->dev, "job timed out after %u ms, int status 0x%08x\n",
