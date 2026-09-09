@@ -555,7 +555,7 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x Module.symvers -x Kconfig base/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c ktest/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c
 --- a/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c	1970-01-01 00:00:00.000000000 +0000
 +++ b/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c	2026-09-09 08:49:39.497692058 +0000
-@@ -0,0 +1,1555 @@
+@@ -0,0 +1,1614 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Rockchip VEPU580 (RKVENC) H.264 encoder driver
@@ -679,6 +679,7 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	u32 frame_cnt;		/* frames since the last IDR */
 +	u16 idr_pic_id;		/* alternates so two IDRs never look alike */
 +	unsigned int recon_idx;	/* which reconstruction slot to write */
++	struct v4l2_ctrl *ctrl_level;	/* reports the level, never sets it */
 +	u8 profile_idc;
 +	/*
 +	 * Constant QP is the whole of this driver's rate control: the block's
@@ -853,6 +854,51 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	return 0;
 +}
 +
++static int rkvenc_level_menu(u8 level_idc)
++{
++	switch (level_idc) {
++	case 10: return V4L2_MPEG_VIDEO_H264_LEVEL_1_0;
++	case 11: return V4L2_MPEG_VIDEO_H264_LEVEL_1_1;
++	case 12: return V4L2_MPEG_VIDEO_H264_LEVEL_1_2;
++	case 13: return V4L2_MPEG_VIDEO_H264_LEVEL_1_3;
++	case 20: return V4L2_MPEG_VIDEO_H264_LEVEL_2_0;
++	case 21: return V4L2_MPEG_VIDEO_H264_LEVEL_2_1;
++	case 22: return V4L2_MPEG_VIDEO_H264_LEVEL_2_2;
++	case 30: return V4L2_MPEG_VIDEO_H264_LEVEL_3_0;
++	case 31: return V4L2_MPEG_VIDEO_H264_LEVEL_3_1;
++	case 32: return V4L2_MPEG_VIDEO_H264_LEVEL_3_2;
++	case 40: return V4L2_MPEG_VIDEO_H264_LEVEL_4_0;
++	case 41: return V4L2_MPEG_VIDEO_H264_LEVEL_4_1;
++	case 42: return V4L2_MPEG_VIDEO_H264_LEVEL_4_2;
++	case 50: return V4L2_MPEG_VIDEO_H264_LEVEL_5_0;
++	case 51: return V4L2_MPEG_VIDEO_H264_LEVEL_5_1;
++	case 52: return V4L2_MPEG_VIDEO_H264_LEVEL_5_2;
++	case 60: return V4L2_MPEG_VIDEO_H264_LEVEL_6_0;
++	case 61: return V4L2_MPEG_VIDEO_H264_LEVEL_6_1;
++	default: return V4L2_MPEG_VIDEO_H264_LEVEL_6_2;
++	}
++}
++
++/*
++ * The level is a consequence of the coded size and the frame rate, not a
++ * request: device_run derives it for the slice header and the SPS carries the
++ * same value, both from rkvenc_h264_level_idc(). Report that, rather than let
++ * a client set a level the stream it gets back will contradict.
++ */
++static void rkvenc_update_level(struct rkvenc_ctx *ctx)
++{
++	u8 level_idc;
++
++	if (!ctx->ctrl_level)
++		return;
++
++	level_idc = rkvenc_h264_level_idc(DIV_ROUND_UP(ctx->src_fmt.width, 16),
++					  DIV_ROUND_UP(ctx->src_fmt.height, 16),
++					  ctx->fps_num, ctx->fps_den);
++
++	v4l2_ctrl_s_ctrl(ctx->ctrl_level, rkvenc_level_menu(level_idc));
++}
++
 +static int rkvenc_try_fmt(struct file *file, void *priv, struct v4l2_format *f)
 +{
 +	struct rkvenc_ctx *ctx = file_to_ctx(file);
@@ -913,6 +959,8 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	ctx->dst_fmt.width = ctx->src_fmt.width;
 +	ctx->dst_fmt.height = ctx->src_fmt.height;
 +	rkvenc_fill_coded_fmt(&ctx->dst_fmt);
++
++	rkvenc_update_level(ctx);
 +
 +	return 0;
 +}
@@ -1001,6 +1049,7 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	if (tpf->numerator && tpf->denominator) {
 +		ctx->fps_den = tpf->numerator;
 +		ctx->fps_num = tpf->denominator;
++		rkvenc_update_level(ctx);
 +	}
 +
 +	return rkvenc_g_parm(file, fh, a);
@@ -1346,10 +1395,13 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +			       V4L2_MPEG_VIDEO_H264_PROFILE_HIGH,
 +			       BIT(V4L2_MPEG_VIDEO_H264_PROFILE_EXTENDED),
 +			       V4L2_MPEG_VIDEO_H264_PROFILE_HIGH);
-+	v4l2_ctrl_new_std_menu(hdl, &rkvenc_ctrl_ops,
++	ctx->ctrl_level = v4l2_ctrl_new_std_menu(hdl, &rkvenc_ctrl_ops,
 +			       V4L2_CID_MPEG_VIDEO_H264_LEVEL,
-+			       V4L2_MPEG_VIDEO_H264_LEVEL_5_1, 0,
++			       V4L2_MPEG_VIDEO_H264_LEVEL_6_2,
++			       BIT(V4L2_MPEG_VIDEO_H264_LEVEL_1B),
 +			       V4L2_MPEG_VIDEO_H264_LEVEL_4_0);
++	if (ctx->ctrl_level)
++		ctx->ctrl_level->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 +	v4l2_ctrl_new_std(hdl, &rkvenc_ctrl_ops,
 +			  V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR,
 +			  0, 1, 1, 1);
@@ -1367,7 +1419,14 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +
 +	ctx->fh.ctrl_handler = hdl;
 +
-+	return v4l2_ctrl_handler_setup(hdl);
++	ret = v4l2_ctrl_handler_setup(hdl);
++	if (ret)
++		return ret;
++
++	/* The format and frame rate are settled by now, so the level is too. */
++	rkvenc_update_level(ctx);
++
++	return 0;
 +}
 +
 +static int rkvenc_open(struct file *file)
