@@ -555,7 +555,7 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x Module.symvers -x Kconfig base/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c ktest/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c
 --- a/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c	1970-01-01 00:00:00.000000000 +0000
 +++ b/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c	2026-09-09 08:49:39.497692058 +0000
-@@ -0,0 +1,1471 @@
+@@ -0,0 +1,1485 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Rockchip VEPU580 (RKVENC) H.264 encoder driver
@@ -1138,6 +1138,20 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	spin_lock_irqsave(&ctx->enc->job_lock, flags);
 +	ctx->aborting = false;
 +	spin_unlock_irqrestore(&ctx->enc->job_lock, flags);
++
++	/*
++	 * A stream that starts is a stream a decoder has to be able to join,
++	 * so it opens on an IDR carrying parameter sets. Without resetting the
++	 * GOP phase a client that stops and restarts -- a remote desktop
++	 * changing resolution, which is the common case here -- resumes
++	 * mid-GOP, and its first frame is a P-frame predicted from a picture
++	 * the decoder was never given.
++	 *
++	 * Both queues run this, and no job can start until both are
++	 * streaming, so doing it twice costs nothing.
++	 */
++	ctx->frame_cnt = 0;
++	ctx->force_key_frame = true;
 +
 +	if (V4L2_TYPE_IS_OUTPUT(vq->type))
 +		ctx->sequence_out = 0;
