@@ -555,7 +555,7 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x Module.symvers -x Kconfig base/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c ktest/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c
 --- a/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c	1970-01-01 00:00:00.000000000 +0000
 +++ b/drivers/media/platform/rockchip/rkvenc/rkvenc-core.c	2026-09-09 08:49:39.497692058 +0000
-@@ -0,0 +1,1563 @@
+@@ -0,0 +1,1555 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Rockchip VEPU580 (RKVENC) H.264 encoder driver
@@ -608,7 +608,6 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +
 +#define RKVENC_MIN_BITSTREAM_SIZE	SZ_512K
 +#define RKVENC_MAX_BITSTREAM_SIZE	SZ_16M
-+#define RKVENC_DEFAULT_BITRATE		12000000
 +#define RKVENC_DEFAULT_GOP_SIZE		60
 +#define RKVENC_DEFAULT_QP		26
 +#define RKVENC_MIN_QP			0
@@ -667,7 +666,6 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +	struct v4l2_pix_format_mplane src_fmt;
 +	struct v4l2_pix_format_mplane dst_fmt;
 +	struct v4l2_rect crop;
-+	u32 bitrate;
 +	u32 gop_size;
 +	u32 fps_num;
 +	u32 fps_den;
@@ -1253,9 +1251,6 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +		container_of(ctrl->handler, struct rkvenc_ctx, ctrl_handler);
 +
 +	switch (ctrl->id) {
-+	case V4L2_CID_MPEG_VIDEO_BITRATE:
-+		ctx->bitrate = ctrl->val;
-+		break;
 +	case V4L2_CID_MPEG_VIDEO_GOP_SIZE:
 +		ctx->gop_size = ctrl->val;
 +		break;
@@ -1311,8 +1306,6 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +
 +	v4l2_ctrl_handler_init(hdl, 16);
 +
-+	v4l2_ctrl_new_std(hdl, &rkvenc_ctrl_ops, V4L2_CID_MPEG_VIDEO_BITRATE,
-+			  10000, 200000000, 1, RKVENC_DEFAULT_BITRATE);
 +	v4l2_ctrl_new_std(hdl, &rkvenc_ctrl_ops, V4L2_CID_MPEG_VIDEO_GOP_SIZE,
 +			  0, 1000, 1, RKVENC_DEFAULT_GOP_SIZE);
 +
@@ -1337,13 +1330,17 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +			  RKVENC_MIN_QP, RKVENC_MAX_QP, 1, RKVENC_MAX_QP);
 +	v4l2_ctrl_new_std(hdl, &rkvenc_ctrl_ops,
 +			  V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0, 0, 0, 0);
++	/*
++	 * Constant quality is not a preference here, it is the only mode the
++	 * driver has: RC_CFG is written zero for every frame. Offering VBR or
++	 * CBR -- and defaulting to CBR, as this did -- promised a bitrate
++	 * nothing was ever going to aim for.
++	 */
 +	v4l2_ctrl_new_std_menu(hdl, &rkvenc_ctrl_ops,
 +			       V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
 +			       V4L2_MPEG_VIDEO_BITRATE_MODE_CQ,
-+			       ~(BIT(V4L2_MPEG_VIDEO_BITRATE_MODE_VBR) |
-+				 BIT(V4L2_MPEG_VIDEO_BITRATE_MODE_CBR) |
-+				 BIT(V4L2_MPEG_VIDEO_BITRATE_MODE_CQ)),
-+			       V4L2_MPEG_VIDEO_BITRATE_MODE_CBR);
++			       ~BIT(V4L2_MPEG_VIDEO_BITRATE_MODE_CQ),
++			       V4L2_MPEG_VIDEO_BITRATE_MODE_CQ);
 +	v4l2_ctrl_new_std_menu(hdl, &rkvenc_ctrl_ops,
 +			       V4L2_CID_MPEG_VIDEO_H264_PROFILE,
 +			       V4L2_MPEG_VIDEO_H264_PROFILE_HIGH,
@@ -1353,10 +1350,6 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +			       V4L2_CID_MPEG_VIDEO_H264_LEVEL,
 +			       V4L2_MPEG_VIDEO_H264_LEVEL_5_1, 0,
 +			       V4L2_MPEG_VIDEO_H264_LEVEL_4_0);
-+	v4l2_ctrl_new_std(hdl, &rkvenc_ctrl_ops,
-+			  V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE, 0, 1, 1, 1);
-+	v4l2_ctrl_new_std(hdl, &rkvenc_ctrl_ops,
-+			  V4L2_CID_MPEG_VIDEO_MB_RC_ENABLE, 0, 1, 1, 1);
 +	v4l2_ctrl_new_std(hdl, &rkvenc_ctrl_ops,
 +			  V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR,
 +			  0, 1, 1, 1);
@@ -1388,7 +1381,6 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +		return -ENOMEM;
 +
 +	ctx->enc = enc;
-+	ctx->bitrate = RKVENC_DEFAULT_BITRATE;
 +	ctx->gop_size = RKVENC_DEFAULT_GOP_SIZE;
 +	/*
 +	 * These QPs are what every macroblock gets, so they have to describe a
