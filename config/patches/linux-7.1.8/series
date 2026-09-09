@@ -6,3 +6,4 @@
 0008-media-rockchip-rkvdec-allow-stateless-request-format-controls.patch
 0009-arm64-dts-rockchip-rk3588-add-rkvenc-nodes.patch
 0010-media-rockchip-add-vepu580-h264-encoder-skeleton.patch
+0011-media-rockchip-rkvenc-h264-per-frame-encode.patch
