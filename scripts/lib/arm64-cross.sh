@@ -54,21 +54,20 @@ prepare_cross_chroot() {
  local src_package="$1"
  shift || true
  local marker="$C/.cross-chroot-ready"
+ local apt_opts="-o APT::Sandbox::User=root -o Acquire::Languages=none"
 
  if [[ -e "$marker" ]]; then
   mount_api
-  return 0
- fi
+ else
+  unmount_chroot
+  rm -rf "$C"
+  mkdir -p "$C"
+  tar -xpf "$ROOT/$CROSS_BASE_TARBALL" -C "$C"
+  rm -f "$C/etc/resolv.conf"; cp -L /etc/resolv.conf "$C/etc/resolv.conf"
 
- unmount_chroot
- rm -rf "$C"
- mkdir -p "$C"
- tar -xpf "$ROOT/$CROSS_BASE_TARBALL" -C "$C"
- rm -f "$C/etc/resolv.conf"; cp -L /etc/resolv.conf "$C/etc/resolv.conf"
-
- # amd64 packages come from archive.ubuntu.com, arm64 ones from ports; a
- # multiarch setup that points both at one host fails to find half of them.
- cat > "$C/etc/apt/sources.list.d/ubuntu.sources" <<'APT'
+  # amd64 packages come from archive.ubuntu.com, arm64 ones from ports; a
+  # multiarch setup that points both at one host fails to find half of them.
+  cat > "$C/etc/apt/sources.list.d/ubuntu.sources" <<'APT'
 Types: deb deb-src
 URIs: http://archive.ubuntu.com/ubuntu
 Suites: resolute resolute-updates resolute-security
@@ -83,20 +82,22 @@ Components: main universe restricted multiverse
 Architectures: arm64
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 APT
- printf '#!/bin/sh\nexit 101\n' > "$C/usr/sbin/policy-rc.d"
- chmod 755 "$C/usr/sbin/policy-rc.d"
+  printf '#!/bin/sh\nexit 101\n' > "$C/usr/sbin/policy-rc.d"
+  chmod 755 "$C/usr/sbin/policy-rc.d"
 
- mount_api
- # apt drops privileges to _apt, which cannot write into a freshly unpacked
- # chroot: downloads fail with "Could not open file .../partial/*.deb". Keep
- # apt as root inside the chroot.
- mkdir -p "$C/var/cache/apt/archives/partial" "$C/var/lib/apt/lists/partial"
- APT_OPTS="-o APT::Sandbox::User=root -o Acquire::Languages=none"
- chroot "$C" dpkg --print-architecture | grep -Fqx amd64
- chroot "$C" dpkg --add-architecture arm64
+  mount_api
+  # apt drops privileges to _apt, which cannot write into a freshly unpacked
+  # chroot: downloads fail with "Could not open file .../partial/*.deb". Keep
+  # apt as root inside the chroot.
+  mkdir -p "$C/var/cache/apt/archives/partial" "$C/var/lib/apt/lists/partial"
+  chroot "$C" dpkg --print-architecture | grep -Fqx amd64
+  chroot "$C" dpkg --add-architecture arm64
+  export DEBIAN_FRONTEND=noninteractive
+  chroot "$C" apt-get update $apt_opts
+ fi
+
  export DEBIAN_FRONTEND=noninteractive
- chroot "$C" apt-get update $APT_OPTS
- chroot "$C" apt-get install -y $APT_OPTS --no-install-recommends \
+ chroot "$C" apt-get install -y $apt_opts --no-install-recommends \
   build-essential crossbuild-essential-arm64 fakeroot devscripts dpkg-dev quilt \
   "$@"
  # -a arm64 pulls the target-architecture -dev packages plus the cross toolchain
@@ -111,7 +112,7 @@ APT
  # DEB_BUILD_OPTIONS=nocheck does NOT do this; build profiles are a separate
  # mechanism.
  if [[ "$src_package" != "-" ]]; then
-  chroot "$C" apt-get build-dep -y $APT_OPTS -a arm64 \
+  chroot "$C" apt-get build-dep -y $apt_opts -a arm64 \
    -P "${BUILD_PROFILES:-nocheck}" "$src_package"
  fi
  touch "$marker"

@@ -1,0 +1,159 @@
+From 5e66964f78cbcd99f2caae537d7295e5cc684667 Mon Sep 17 00:00:00 2001
+From: pencilbsp <pencil.bsp@gmail.com>
+Date: Wed, 2 Sep 2026 01:51:41 +0000
+Subject: [PATCH] hwaccel-vulkan: fall back to the original DRM format modifier
+ query
+
+Physical device selection asks for DRM format modifiers only through
+VkDrmFormatModifierPropertiesList2EXT. A driver may implement the original
+VkDrmFormatModifierPropertiesListEXT and leave the 2 form unanswered, even
+while advertising VK_KHR_format_feature_flags2, which is what makes the 2 form
+valid to ask for at all.
+
+Mesa's panvk does exactly that on Mali. Measured on a Mali-G610, for every
+format gnome-remote-desktop cares about:
+
+  format                  list (v1)   list2 (what is asked for)
+  BGRA8888  (XR24/AR24)       1                 0
+  RGBA8888  (AB24/XB24)       1                 0
+  ABGR2101010                 1                 0
+  NV12                        1                 0
+
+So the GPU is skipped with "No DRM format modifiers available for DRM format
+875713112", the software rasterizer is skipped for want of the extension
+entirely, no physical device is acquired, and the VAAPI encoder is never
+created. The session then encodes H.264 on the CPU, with nothing in the log to
+say the hardware encoder was available and passed over.
+
+Ask the original way when the 2 form comes back empty. The feature bits carry
+over unchanged: VkFormatFeatureFlagBits2 was defined to keep the values of
+VkFormatFeatureFlagBits and only widen the type, so the filtering below is
+unaffected.
+
+With this, the same board reports:
+
+  [HWAccel.Vulkan] Found DRM format modifier 0 for DRM format 875713112
+  [HWAccel.VAAPI] Using VAEntrypoint 6 for profile VAProfileH264High
+  [HWAccel.VAAPI] Successfully initialized VAAPI 1.20 with vendor: v4l2-request
+---
+ src/grd-hwaccel-vulkan.c | 85 ++++++++++++++++++++++++++++++++--------
+ 1 file changed, 69 insertions(+), 16 deletions(-)
+
+diff --git a/src/grd-hwaccel-vulkan.c b/src/grd-hwaccel-vulkan.c
+index c188fa7..2f71ce7 100644
+--- a/src/grd-hwaccel-vulkan.c
++++ b/src/grd-hwaccel-vulkan.c
+@@ -85,6 +85,10 @@ get_egl_vulkan_format_modifier_intersection (GrdHwAccelVulkan       *hwaccel_vul
+   VkFormatProperties2 format_properties_2 = {};
+   VkDrmFormatModifierPropertiesList2EXT modifier_properties_list2 = {};
+   g_autofree VkDrmFormatModifierProperties2EXT *modifier_properties_2 = NULL;
++  VkFormatProperties2 format_properties = {};
++  VkDrmFormatModifierPropertiesListEXT modifier_properties_list = {};
++  g_autofree VkDrmFormatModifierPropertiesEXT *modifier_properties = NULL;
++  uint32_t n_modifier_properties;
+   VkFormat vk_format = VK_FORMAT_UNDEFINED;
+   g_autofree uint64_t *egl_modifiers = NULL;
+   int n_egl_modifiers;
+@@ -103,21 +107,58 @@ get_egl_vulkan_format_modifier_intersection (GrdHwAccelVulkan       *hwaccel_vul
+   vkGetPhysicalDeviceFormatProperties2 (vk_physical_device, vk_format,
+                                         &format_properties_2);
+ 
+-  if (modifier_properties_list2.drmFormatModifierCount == 0)
++  n_modifier_properties = modifier_properties_list2.drmFormatModifierCount;
++
++  if (n_modifier_properties > 0)
+     {
+-      g_set_error (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+-                   "No DRM format modifiers available for DRM format %u",
+-                   drm_format);
+-      return NULL;
++      modifier_properties_2 =
++        g_new0 (VkDrmFormatModifierProperties2EXT, n_modifier_properties);
++
++      modifier_properties_list2.pDrmFormatModifierProperties = modifier_properties_2;
++      vkGetPhysicalDeviceFormatProperties2 (vk_physical_device, vk_format,
++                                            &format_properties_2);
+     }
++  else
++    {
++      /*
++       * A driver can implement the original VkDrmFormatModifierPropertiesListEXT
++       * and leave the 2 form of it unanswered, even while advertising
++       * VK_KHR_format_feature_flags2, which is what makes the 2 form valid to
++       * ask for. Mesa's panvk does exactly that on Mali: every format reports
++       * its modifiers through the original list and none through the 2 form, so
++       * asking only the newer way makes the GPU look like it supports no
++       * modifiers at all and the encoder silently falls back to the CPU.
++       *
++       * Ask the original way before giving up. The feature bits are the same
++       * ones: VkFormatFeatureFlagBits2 was defined to keep the values of
++       * VkFormatFeatureFlagBits and only widen the type, so the flags carry
++       * over unchanged.
++       */
++      format_properties.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2;
++      modifier_properties_list.sType =
++        VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT;
++
++      grd_vk_append_to_chain (&format_properties, &modifier_properties_list);
++
++      vkGetPhysicalDeviceFormatProperties2 (vk_physical_device, vk_format,
++                                            &format_properties);
++
++      n_modifier_properties = modifier_properties_list.drmFormatModifierCount;
++      if (n_modifier_properties == 0)
++        {
++          g_set_error (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
++                       "No DRM format modifiers available for DRM format %u",
++                       drm_format);
++          return NULL;
++        }
+ 
+-  modifier_properties_2 =
+-    g_new0 (VkDrmFormatModifierProperties2EXT,
+-            modifier_properties_list2.drmFormatModifierCount);
++      modifier_properties =
++        g_new0 (VkDrmFormatModifierPropertiesEXT, n_modifier_properties);
+ 
+-  modifier_properties_list2.pDrmFormatModifierProperties = modifier_properties_2;
+-  vkGetPhysicalDeviceFormatProperties2 (vk_physical_device, vk_format,
+-                                        &format_properties_2);
++      modifier_properties_list.pDrmFormatModifierProperties = modifier_properties;
++      vkGetPhysicalDeviceFormatProperties2 (vk_physical_device, vk_format,
++                                            &format_properties);
++    }
+ 
+   if (!grd_egl_thread_get_modifiers_for_format (egl_thread, drm_format,
+                                                 &n_egl_modifiers,
+@@ -131,12 +172,24 @@ get_egl_vulkan_format_modifier_intersection (GrdHwAccelVulkan       *hwaccel_vul
+ 
+   vk_modifiers = g_array_new (FALSE, FALSE, sizeof (uint64_t));
+ 
+-  for (i = 0; i < modifier_properties_list2.drmFormatModifierCount; i++)
++  for (i = 0; i < n_modifier_properties; i++)
+     {
+-      uint64_t modifier = modifier_properties_2[i].drmFormatModifier;
+-      uint32_t n_planes = modifier_properties_2[i].drmFormatModifierPlaneCount;
+-      VkFormatFeatureFlags2 tiling_features =
+-        modifier_properties_2[i].drmFormatModifierTilingFeatures;
++      uint64_t modifier;
++      uint32_t n_planes;
++      VkFormatFeatureFlags2 tiling_features;
++
++      if (modifier_properties_2 != NULL)
++        {
++          modifier = modifier_properties_2[i].drmFormatModifier;
++          n_planes = modifier_properties_2[i].drmFormatModifierPlaneCount;
++          tiling_features = modifier_properties_2[i].drmFormatModifierTilingFeatures;
++        }
++      else
++        {
++          modifier = modifier_properties[i].drmFormatModifier;
++          n_planes = modifier_properties[i].drmFormatModifierPlaneCount;
++          tiling_features = modifier_properties[i].drmFormatModifierTilingFeatures;
++        }
+ 
+       if (required_n_planes &&
+           n_planes != *required_n_planes)
+-- 
+2.43.0
+

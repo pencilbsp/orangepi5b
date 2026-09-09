@@ -1,0 +1,93 @@
+From: pencilbsp <pencil.bsp@gmail.com>
+Subject: [PATCH] vaapi: crop AVC streams back to the visible source size
+
+The VA-API encoder session aligns its working surface to the H.264
+macroblock grid. A 1920x1080 desktop is therefore encoded from a 1920x1088
+surface, which is fine for the hardware, but the SPS must carry frame
+cropping information so decoders present only the original 1080 visible
+lines.
+
+Keep the requested source size beside the aligned surface size, set the
+H.264 crop offsets when the aligned surface is larger, and make the local
+NAL writer emit those offsets instead of asserting that cropping is never
+used.
+---
+ src/grd-encode-session-vaapi.c | 20 ++++++++++++++++++++
+ src/grd-nal-writer.c           | 12 +++++++++++-
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/src/grd-encode-session-vaapi.c b/src/grd-encode-session-vaapi.c
+index 5fae6aa..8ef76fb 100644
+--- a/src/grd-encode-session-vaapi.c
++++ b/src/grd-encode-session-vaapi.c
+@@ -129,6 +129,8 @@ struct _GrdEncodeSessionVaapi
+   VAConfigID va_config;
+   VAContextID va_context;
+ 
++  uint32_t source_width;
++  uint32_t source_height;
+   uint32_t surface_width;
+   uint32_t surface_height;
+   uint32_t refresh_rate;
+@@ -631,6 +633,8 @@ fill_avc_sequence (GrdEncodeSessionVaapi            *encode_session_vaapi,
+ {
+   uint32_t surface_width = encode_session_vaapi->surface_width;
+   uint32_t surface_height = encode_session_vaapi->surface_height;
++  uint32_t crop_right;
++  uint32_t crop_bottom;
+ 
+   g_assert (surface_width % 16 == 0);
+   g_assert (surface_height % 16 == 0);
+@@ -650,6 +654,18 @@ fill_avc_sequence (GrdEncodeSessionVaapi            *encode_session_vaapi,
+   sequence_param->picture_width_in_mbs = surface_width / 16;
+   sequence_param->picture_height_in_mbs = surface_height / 16;
+ 
++  crop_right = surface_width - encode_session_vaapi->source_width;
++  crop_bottom = surface_height - encode_session_vaapi->source_height;
++  if (crop_right || crop_bottom)
++    {
++      g_assert (crop_right % 2 == 0);
++      g_assert (crop_bottom % 2 == 0);
++
++      sequence_param->frame_cropping_flag = 1;
++      sequence_param->frame_crop_right_offset = crop_right / 2;
++      sequence_param->frame_crop_bottom_offset = crop_bottom / 2;
++    }
++
+   sequence_param->seq_fields.value = 0;
+   sequence_param->seq_fields.bits.chroma_format_idc = 1;
+   sequence_param->seq_fields.bits.frame_mbs_only_flag = 1;
+@@ -1806,6 +1822,10 @@ grd_encode_session_vaapi_new (GrdVkDevice   *vk_device,
+   encode_session_vaapi->va_display = va_display;
+   encode_session_vaapi->supports_quality_level = supports_quality_level;
+ 
++  g_assert (source_width <= grd_get_aligned_size (source_width, 32));
++  g_assert (source_height <= grd_get_aligned_size (source_height, 16));
++  encode_session_vaapi->source_width = source_width;
++  encode_session_vaapi->source_height = source_height;
+   encode_session_vaapi->surface_width = grd_get_aligned_size (source_width, 32);
+   encode_session_vaapi->surface_height = grd_get_aligned_size (source_height, 16);
+   encode_session_vaapi->refresh_rate = refresh_rate;
+diff --git a/src/grd-nal-writer.c b/src/grd-nal-writer.c
+index 6e512c1..414271e 100644
+--- a/src/grd-nal-writer.c
++++ b/src/grd-nal-writer.c
+@@ -534,7 +534,17 @@ write_sps_data (GrdNalWriter                           *nal_writer,
+   write_u (nal_writer, direct_8x8_inference_flag, 1);
+   /* frame_cropping_flag */
+   write_u (nal_writer, sequence_param->frame_cropping_flag, 1);
+-  g_assert (!sequence_param->frame_cropping_flag);
++  if (sequence_param->frame_cropping_flag)
++    {
++      /* frame_crop_left_offset */
++      write_ue (nal_writer, sequence_param->frame_crop_left_offset);
++      /* frame_crop_right_offset */
++      write_ue (nal_writer, sequence_param->frame_crop_right_offset);
++      /* frame_crop_top_offset */
++      write_ue (nal_writer, sequence_param->frame_crop_top_offset);
++      /* frame_crop_bottom_offset */
++      write_ue (nal_writer, sequence_param->frame_crop_bottom_offset);
++    }
+ 
+   /* vui_parameters_present_flag */
+   write_u (nal_writer, sequence_param->vui_parameters_present_flag, 1);

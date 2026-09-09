@@ -77,10 +77,26 @@ aarch64-linux-gnu-nm -D --defined-only "$built" | grep -Fq "$symbol" || {
 
 STAGE="$ROOT/build/packages/orangepi5b-va-driver"
 rm -rf "$STAGE"
-mkdir -p "$STAGE/DEBIAN" "$STAGE/$(dirname "$DRIVER_REL")" "$STAGE/usr/lib/environment.d"
+mkdir -p \
+ "$STAGE/DEBIAN" \
+ "$STAGE/$(dirname "$DRIVER_REL")" \
+ "$STAGE/usr/lib/environment.d" \
+ "$STAGE/usr/lib/systemd/system/gnome-remote-desktop.service.d" \
+ "$STAGE/usr/lib/systemd/user/gnome-remote-desktop.service.d" \
+ "$STAGE/usr/lib/systemd/user/gnome-remote-desktop-handover.service.d" \
+ "$STAGE/usr/lib/udev/rules.d"
 install -m 0644 "$built" "$STAGE/$DRIVER_REL"
 install -m 0644 "$TEMPLATE/data/90-orangepi5b-vaapi.conf" \
  "$STAGE/usr/lib/environment.d/90-orangepi5b-vaapi.conf"
+install -m 0644 "$TEMPLATE/data/10-gnome-remote-desktop-vaapi.conf" \
+ "$STAGE/usr/lib/systemd/system/gnome-remote-desktop.service.d/10-vaapi.conf"
+install -m 0644 "$TEMPLATE/data/10-gnome-remote-desktop-vaapi.conf" \
+ "$STAGE/usr/lib/systemd/user/gnome-remote-desktop.service.d/10-vaapi.conf"
+install -m 0644 "$TEMPLATE/data/10-gnome-remote-desktop-vaapi.conf" \
+ "$STAGE/usr/lib/systemd/user/gnome-remote-desktop-handover.service.d/10-vaapi.conf"
+install -m 0644 "$TEMPLATE/data/99-orangepi5b-dma-heap.rules" \
+ "$STAGE/usr/lib/udev/rules.d/99-orangepi5b-dma-heap.rules"
+install -m 0755 "$TEMPLATE/DEBIAN/postinst" "$STAGE/DEBIAN/postinst"
 sed -e "s/@PACKAGE_VERSION@/${PACKAGE_VERSION}/g" \
     -e "s/@LIBVA_VERSION@/${libva_version%.*}/g" \
     "$TEMPLATE/DEBIAN/control.in" > "$STAGE/DEBIAN/control"

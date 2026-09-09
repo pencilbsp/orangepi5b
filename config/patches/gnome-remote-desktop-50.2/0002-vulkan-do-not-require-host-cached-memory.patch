@@ -1,0 +1,23 @@
+From: pencilbsp <pencil.bsp@gmail.com>
+Subject: [PATCH] vulkan: do not require host-cached state buffers
+
+PanVK exposes host-visible coherent memory for the small damage and chroma
+state buffers but does not set HOST_CACHED. Cached access is a performance
+hint, not a correctness requirement, and demanding it stops the VA-API view
+creator from being constructed at all on Mali-G610 -- the encoder is then
+never used and the session silently falls back to encoding on the CPU.
+
+Ask for host-visible and coherent, which is what the buffers actually need.
+---
+--- a/src/grd-rdp-view-creator-avc.c
++++ b/src/grd-rdp-view-creator-avc.c
+@@ -724,8 +724,7 @@
+                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+   buffer_descriptor.size = view_creator_avc->state_buffer_size;
+   buffer_descriptor.memory_flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+-                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+-                                   VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
++                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+ 
+   *state_buffer_host = grd_vk_buffer_new (view_creator_avc->device,
+                                           &buffer_descriptor,

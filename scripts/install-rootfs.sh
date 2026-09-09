@@ -53,6 +53,18 @@ if ((${#resources_debs[@]})); then
   rm -f "$R/tmp/$(basename "$resources_deb")"
 fi
 
+grd_debs=( "$ROOT"/output/debs/gnome-remote-desktop_*+orangepi5b*.deb )
+if ((${#grd_debs[@]})); then
+  mapfile -t grd_debs < <(printf '%s\n' "${grd_debs[@]}" | sort -V)
+  grd_deb=${grd_debs[-1]}
+  install -m 0644 "$grd_deb" "$R/tmp/$(basename "$grd_deb")"
+  chroot "$R" apt-get -y --no-install-recommends install "/tmp/$(basename "$grd_deb")"
+  rm -f "$R/tmp/$(basename "$grd_deb")"
+else
+  echo "Missing patched GNOME Remote Desktop package: run scripts/build-grd-package.sh first" >&2
+  exit 1
+fi
+
 # The VA-API driver for rkvdec. Without it libva finds no backend, Chrome
 # silently drops to FFmpegVideoDecoder and nothing in the log says why -- the
 # fallback is reported to MediaLog, not stderr. Fail loudly instead: an image

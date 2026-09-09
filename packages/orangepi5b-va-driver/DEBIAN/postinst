@@ -1,0 +1,18 @@
+#!/bin/sh
+set -e
+
+if getent passwd gnome-remote-desktop >/dev/null 2>&1; then
+	usermod -aG video,render gnome-remote-desktop >/dev/null 2>&1 || true
+fi
+
+if command -v udevadm >/dev/null 2>&1; then
+	udevadm control --reload-rules >/dev/null 2>&1 || true
+	udevadm trigger --subsystem-match=dma_heap >/dev/null 2>&1 || true
+fi
+
+if command -v systemctl >/dev/null 2>&1; then
+	systemctl daemon-reload >/dev/null 2>&1 || true
+	systemctl try-restart gnome-remote-desktop.service >/dev/null 2>&1 || true
+fi
+
+exit 0
