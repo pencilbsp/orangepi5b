@@ -129,7 +129,7 @@ VAStatus RequestQueryConfigProfiles(VADriverContextP context,
 	 */
 	found = v4l2_find_format_any(driver_data->video_fd,
 				     V4L2_PIX_FMT_H264_SLICE);
-	if (found && index < (V4L2_REQUEST_MAX_CONFIG_ATTRIBUTES - 3)) {
+	if (found && index < (V4L2_REQUEST_MAX_PROFILES - 3)) {
 		profiles[index++] = VAProfileH264ConstrainedBaseline;
 		profiles[index++] = VAProfileH264Main;
 		profiles[index++] = VAProfileH264High;
@@ -137,7 +137,7 @@ VAStatus RequestQueryConfigProfiles(VADriverContextP context,
 
 	found = v4l2_find_format_any(driver_data->video_fd,
 				     V4L2_PIX_FMT_HEVC_SLICE);
-	if (found && index < (V4L2_REQUEST_MAX_CONFIG_ATTRIBUTES - 1))
+	if (found && index < (V4L2_REQUEST_MAX_PROFILES - 1))
 		profiles[index++] = VAProfileHEVCMain;
 
 	*profiles_count = index;

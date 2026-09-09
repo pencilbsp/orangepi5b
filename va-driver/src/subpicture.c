@@ -43,6 +43,14 @@ VAStatus RequestQuerySubpictureFormats(VADriverContextP context,
 				       unsigned int *flags,
 				       unsigned int *formats_count)
 {
+	/*
+	 * No subpicture format is supported, but the count is an output the
+	 * caller reads: returning success without writing it leaves whatever
+	 * was on the caller's stack to be used as a list length.
+	 */
+	if (formats_count != NULL)
+		*formats_count = 0;
+
 	return VA_STATUS_SUCCESS;
 }
 

@@ -425,18 +425,19 @@ VAStatus RequestQuerySurfaceAttributes(VADriverContextP context,
 				       unsigned int *attributes_count)
 {
 	struct request_data *driver_data = context->pDriverData;
-	VASurfaceAttrib *attributes_list;
-	unsigned int attributes_list_size = V4L2_REQUEST_MAX_CONFIG_ATTRIBUTES *
-					    sizeof(*attributes);
+	/*
+	 * Sized by the same constant this driver reports as max_attributes,
+	 * which leaves room to spare: the list below is at most six entries.
+	 */
+	VASurfaceAttrib attributes_list[V4L2_REQUEST_MAX_CONFIG_ATTRIBUTES];
 	struct v4l2_frame_limits limits;
 	int memory_types;
 	unsigned int i = 0;
 
-	attributes_list = malloc(attributes_list_size);
-	if (attributes_list == NULL)
-		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	if (attributes_count == NULL)
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-	memset(attributes_list, 0, attributes_list_size);
+	memset(attributes_list, 0, sizeof(attributes_list));
 
 	attributes_list[i].type = VASurfaceAttribPixelFormat;
 	attributes_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
@@ -495,12 +496,22 @@ VAStatus RequestQuerySurfaceAttributes(VADriverContextP context,
 	attributes_list[i].value.value.i = memory_types;
 	i++;
 
-	attributes_list_size = i * sizeof(*attributes);
+	/*
+	 * attributes_count is in/out: it arrives holding the number of entries
+	 * the caller allocated and leaves holding the number this driver has.
+	 * Passing no array is how a caller asks for that number so it can
+	 * allocate, and a caller whose array is too small has to be told --
+	 * copying the full list regardless writes past the end of memory this
+	 * driver does not own.
+	 */
+	if (attributes != NULL) {
+		if (*attributes_count < i) {
+			*attributes_count = i;
+			return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
+		}
 
-	if (attributes != NULL)
-		memcpy(attributes, attributes_list, attributes_list_size);
-
-	free(attributes_list);
+		memcpy(attributes, attributes_list, i * sizeof(*attributes));
+	}
 
 	*attributes_count = i;
 
