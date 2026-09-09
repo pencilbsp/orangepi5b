@@ -38,6 +38,8 @@ struct encode_picture_params {
 	uint32_t packed_type[REQUEST_ENCODE_MAX_PACKED_HEADERS];
 	const void *packed_data[REQUEST_ENCODE_MAX_PACKED_HEADERS];
 	unsigned int packed_bits[REQUEST_ENCODE_MAX_PACKED_HEADERS];
+	/* Bytes actually behind packed_data, which bounds packed_bits. */
+	unsigned int packed_size[REQUEST_ENCODE_MAX_PACKED_HEADERS];
 };
 
 struct encode_context {

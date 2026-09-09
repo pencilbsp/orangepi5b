@@ -24,6 +24,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -622,16 +623,28 @@ static VAStatus encode_append_packed(struct encode_picture_params *params,
 	unsigned char *dst = segment->buf;
 
 	for (i = 0; i < params->num_packed; i++) {
-		unsigned int bytes = (params->packed_bits[i] + 7) / 8;
+		/*
+		 * bit_length is the client's word for how much of its buffer
+		 * to take, and nothing had checked it against how much that
+		 * buffer holds. Believing it reads off the end of the heap, so
+		 * the buffer's own size is the bound. The arithmetic is done
+		 * wide and the destination check written as a subtraction, so
+		 * neither can wrap past the test meant to catch it.
+		 */
+		uint64_t bits = params->packed_bits[i];
+		uint64_t bytes = (bits + 7) / 8;
 
 		if (params->packed_type[i] != VAEncPackedHeaderRawData)
 			continue;
 
-		if (offset + bytes > segment->size)
+		if (bytes > params->packed_size[i])
+			bytes = params->packed_size[i];
+
+		if (bytes > (uint64_t)segment->size - offset)
 			return VA_STATUS_ERROR_OPERATION_FAILED;
 
-		memcpy(dst + offset, params->packed_data[i], bytes);
-		offset += bytes;
+		memcpy(dst + offset, params->packed_data[i], (size_t)bytes);
+		offset += (unsigned int)bytes;
 	}
 
 	segment->size = offset;
@@ -833,9 +846,14 @@ static void encode_collect_packed(struct encode_picture_params *params,
 	if (params->num_packed < REQUEST_ENCODE_MAX_PACKED_HEADERS) {
 		unsigned int i = params->num_packed++;
 
+		uint64_t bytes = (uint64_t)buffer_object->size *
+				 (uint64_t)buffer_object->count;
+
 		params->packed_type[i] = params->packed_type_pending;
 		params->packed_bits[i] = params->packed_bits_pending;
 		params->packed_data[i] = buffer_object->data;
+		params->packed_size[i] = bytes > UINT_MAX ? UINT_MAX :
+							   (unsigned int)bytes;
 	}
 
 	params->packed_pending = false;
