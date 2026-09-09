@@ -125,8 +125,14 @@ static struct object_base *object_heap_lookup_unlocked(struct object_heap *heap,
 	struct object_base *object;
 	int bucket_index, object_index;
 
+	/*
+	 * heap_size counts slots, so the last valid id is one below
+	 * id_offset + heap_size. Admitting that id read bucket[heap_size /
+	 * heap_increment], one past the last bucket ever filled in, and
+	 * dereferenced whatever realloc had left there.
+	 */
 	if ((id < heap->id_offset) ||
-	    (id > (heap->heap_size + heap->id_offset)))
+	    (id >= (heap->heap_size + heap->id_offset)))
 		return NULL;
 
 	id &= OBJECT_HEAP_ID_MASK;
