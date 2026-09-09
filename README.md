@@ -83,6 +83,16 @@ Muốn đổi bản ship phải chủ động cập nhật version và checksum 
 Việc ghim áp dụng cho bản ship; người dùng vẫn có thể cập nhật Chrome qua APT
 sau khi boot.
 
+GNOME Resources được build lại khi cần bằng `scripts/build-resources-cross-package.sh`, chạy `dpkg-buildpackage -aarm64` trong cross chroot amd64 26.04 thay vì compile dưới qemu.
+Patch local trong `config/patches/resources-1.10.2/` bổ sung nhận diện thermal
+zone RK3588/RK3588S (`package-thermal`, `bigcore0-thermal`,
+`bigcore2-thermal`, `littlecore-thermal`) để Orange Pi 5B hiển thị CPU
+temperature thay vì `N/A`. RAM properties không được synthesize vì target không
+expose DMI/SPD hoặc DMC/devfreq clock đáng tin cậy; Resources vẫn đọc usage từ
+`/proc/meminfo`, còn properties giữ `N/A` thay vì hardcode. Artifact patched đặt
+tại `output/debs/` và `scripts/install-rootfs.sh` sẽ cài đè gói đó trong rootfs
+nếu có.
+
 `config/boot.packages` là danh sách package cần cài. Sau khi desktop package đã resolve dependency/recommends, `scripts/install-rootfs.sh` purge thêm các package trong `config/boot.purge-packages`. Hiện tại danh sách này bỏ `gnome-terminal`/`gnome-terminal-data` vì Ubuntu 26.04 desktop-minimal đã kéo `ptyxis`, và `ptyxis` cung cấp `x-terminal-emulator`. Cuối bước rootfs, script chạy `apt-get clean` và xoá apt lists/pkgcache để không ship cache build vào image runtime.
 
 ## Kernel slim profile

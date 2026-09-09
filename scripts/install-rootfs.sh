@@ -44,6 +44,14 @@ mkdir -p "$ROOT/cache/debs"
 shopt -s nullglob
 cp "$R"/var/cache/apt/archives/*.deb "$ROOT/cache/debs/" || true
 chroot "$R" apt-get -y --no-install-suggests install "${packages[@]}"
+resources_debs=( "$ROOT"/output/debs/resources_*+orangepi5b*.deb )
+if ((${#resources_debs[@]})); then
+  mapfile -t resources_debs < <(printf '%s\n' "${resources_debs[@]}" | sort -V)
+  resources_deb=${resources_debs[-1]}
+  install -m 0644 "$resources_deb" "$R/tmp/$(basename "$resources_deb")"
+  chroot "$R" apt-get -y --no-install-recommends install "/tmp/$(basename "$resources_deb")"
+  rm -f "$R/tmp/$(basename "$resources_deb")"
+fi
 mapfile -t purge_packages < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$ROOT/config/boot.purge-packages")
 if ((${#purge_packages[@]})); then
   chroot "$R" apt-get -y purge "${purge_packages[@]}"

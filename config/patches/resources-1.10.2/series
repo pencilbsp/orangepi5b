@@ -1,0 +1,3 @@
+0001-cpu-recognize-rk3588-thermal-zones.patch
+0003-debian-cross-rust-meson.patch
+0004-meson-copy-cross-rust-binaries.patch

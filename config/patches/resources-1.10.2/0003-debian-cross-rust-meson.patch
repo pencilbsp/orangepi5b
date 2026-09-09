@@ -1,0 +1,30 @@
+From: Orange Pi 5B Builder <pencil.bsp@gmail.com>
+Subject: debian: provide rust compiler in Meson cross builds
+
+Debhelper's generated Meson cross file for this package carries the C/C++
+toolchain but not the Rust compiler.  Meson requires a rust binary entry when
+the project language list contains Rust, even when the compiler itself is the
+native rustc driving a target build.
+---
+ debian/rules | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/debian/rules b/debian/rules
+index c6de2ef..49a4581 100755
+--- a/debian/rules
++++ b/debian/rules
+@@ -10,7 +10,13 @@ endif
+ 
+ override_dh_auto_configure:
+ 	dh_auto_configure -- \
+-		-Dprofile=default
++		$(if $(filter-out $(DEB_HOST_ARCH),$(DEB_BUILD_ARCH)),--cross-file ../debian/meson-rust-cross-file.conf) \
++		-Dprofile=default
++
++execute_before_dh_auto_configure:
++	if [ "$(DEB_BUILD_ARCH)" != "$(DEB_HOST_ARCH)" ]; then \
++		printf "[binaries]\nrust = ['rustc', '--target', 'aarch64-unknown-linux-gnu']\n" > debian/meson-rust-cross-file.conf; \
++	fi
+ 
+ vendor:
+ 	dh_quilt_patch

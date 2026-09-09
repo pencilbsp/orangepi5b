@@ -1,0 +1,57 @@
+From: Orange Pi 5B Builder <pencil.bsp@gmail.com>
+Subject: meson: copy Cargo binaries from the cross target directory
+
+Cargo writes cross-built binaries below <target-triple>/<profile>. The Meson
+rules copied from <profile> directly, which only exists for native builds.
+---
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -27,6 +27,11 @@
+   message('Building in debug mode')
+ endif
+ 
++cargo_output_dir = rust_target
++if meson.is_cross_build() and host_machine.cpu_family() == 'aarch64'
++  cargo_output_dir = 'aarch64-unknown-linux-gnu' / rust_target
++endif
++
+ cargo_env = ['CARGO_HOME=' + meson.project_build_root() / 'cargo']
+ 
+ test(
+@@ -63,7 +68,7 @@
+   output: meson.project_name(),
+   command: [
+     'cp',
+-    'src' / rust_target / meson.project_name(),
++    'src' / cargo_output_dir / meson.project_name(),
+     '@OUTPUT@',
+   ],
+ )
+@@ -78,7 +83,7 @@
+   output: meson.project_name() + '-kill',
+   command: [
+     'cp',
+-    'src' / rust_target / meson.project_name() + '-kill',
++    'src' / cargo_output_dir / meson.project_name() + '-kill',
+     '@OUTPUT@',
+   ],
+ )
+@@ -93,7 +98,7 @@
+   output: meson.project_name() + '-processes',
+   command: [
+     'cp',
+-    'src' / rust_target / meson.project_name() + '-processes',
++    'src' / cargo_output_dir / meson.project_name() + '-processes',
+     '@OUTPUT@',
+   ],
+ )
+@@ -108,7 +113,7 @@
+   output: meson.project_name() + '-adjust',
+   command: [
+     'cp',
+-    'src' / rust_target / meson.project_name() + '-adjust',
++    'src' / cargo_output_dir / meson.project_name() + '-adjust',
+     '@OUTPUT@',
+   ],
+ )
+\ No newline at end of file

@@ -1,0 +1,27 @@
+Description: cpu: recognize RK3588 CPU thermal zones
+ Rockchip RK3588/RK3588S boards expose CPU/SoC temperatures through OF
+ thermal zones named package-thermal, bigcore*-thermal and littlecore-thermal.
+ Treat those as CPU temperature sensors so Resources can show CPU temperature
+ on Orange Pi 5B instead of N/A.
+Author: Orange Pi 5B Builder <pencil.bsp@gmail.com>
+Forwarded: not-needed
+
+--- a/src/utils/cpu.rs
++++ b/src/utils/cpu.rs
+@@ -14,7 +14,15 @@ const PROC_STAT: &str = "/proc/stat";
+ 
+ const KNOWN_HWMONS: &[&str] = &["zenpower", "coretemp", "k10temp"];
+ 
+-const KNOWN_THERMAL_ZONES: &[&str] = &["cpu-thermal", "x86_pkg_temp", "acpitz"];
++const KNOWN_THERMAL_ZONES: &[&str] = &[
++    "cpu-thermal",
++    "x86_pkg_temp",
++    "acpitz",
++    "package-thermal",
++    "bigcore0-thermal",
++    "bigcore2-thermal",
++    "littlecore-thermal",
++];
+ 
+ static RE_LSCPU_MODEL_NAME: Lazy<Regex> = lazy_regex!(r"Model name:\s*(.*)");
+ 
