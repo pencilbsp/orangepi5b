@@ -26,6 +26,7 @@
 
 #include "buffer.h"
 #include "context.h"
+#include "encode.h"
 #include "request.h"
 #include "surface.h"
 #include "video.h"
@@ -155,11 +156,30 @@ VAStatus RequestDestroyBuffer(VADriverContextP context, VABufferID buffer_id)
 	return VA_STATUS_SUCCESS;
 }
 
+/*
+ * An image derived from an encode surface hands the client the dma-buf
+ * mapping itself, so the client's access to it needs the same bracket as
+ * any other CPU access to a dma-buf. A buffer backed by plain memory
+ * resolves to no surface, or to one whose store fell back to malloc, and
+ * the sync is then a no-op.
+ */
+static struct object_surface *
+buffer_dmabuf_surface(struct request_data *driver_data,
+		      struct object_buffer *buffer_object)
+{
+	if (!buffer_object->data_borrowed ||
+	    buffer_object->derived_surface_id == VA_INVALID_ID)
+		return NULL;
+
+	return SURFACE(driver_data, buffer_object->derived_surface_id);
+}
+
 VAStatus RequestMapBuffer(VADriverContextP context, VABufferID buffer_id,
 			  void **data_map)
 {
 	struct request_data *driver_data = context->pDriverData;
 	struct object_buffer *buffer_object;
+	struct object_surface *surface_object;
 
 	buffer_object = BUFFER(driver_data, buffer_id);
 	if (buffer_object == NULL || buffer_object->data == NULL)
@@ -168,6 +188,10 @@ VAStatus RequestMapBuffer(VADriverContextP context, VABufferID buffer_id,
 	/* Our buffers are always mapped. */
 	*data_map = buffer_object->data;
 
+	surface_object = buffer_dmabuf_surface(driver_data, buffer_object);
+	if (surface_object != NULL)
+		encode_surface_cpu_begin(surface_object, ENCODE_CPU_RW);
+
 	return VA_STATUS_SUCCESS;
 }
 
@@ -175,12 +199,16 @@ VAStatus RequestUnmapBuffer(VADriverContextP context, VABufferID buffer_id)
 {
 	struct request_data *driver_data = context->pDriverData;
 	struct object_buffer *buffer_object;
+	struct object_surface *surface_object;
 
 	buffer_object = BUFFER(driver_data, buffer_id);
 	if (buffer_object == NULL || buffer_object->data == NULL)
 		return VA_STATUS_ERROR_INVALID_BUFFER;
 
-	/* Our buffers are always mapped. */
+	/* Our buffers stay mapped, but the sync bracket still has to close. */
+	surface_object = buffer_dmabuf_surface(driver_data, buffer_object);
+	if (surface_object != NULL)
+		encode_surface_cpu_end(surface_object, ENCODE_CPU_RW);
 
 	return VA_STATUS_SUCCESS;
 }

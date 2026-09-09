@@ -32,6 +32,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <linux/dma-buf.h>
 #include <linux/dma-heap.h>
 #include <linux/v4l2-controls.h>
 #include <linux/videodev2.h>
@@ -577,6 +578,13 @@ static void encode_fill_raw(struct encode_context *encode, unsigned int index,
 	    dst_pitch == 0 || dst_height == 0)
 		return;
 
+	/*
+	 * Whatever produced this frame -- the client's CPU writes, or a GPU
+	 * through the exported PRIME handle -- the copy below reads it back
+	 * through a cached mapping.
+	 */
+	encode_surface_cpu_begin(surface_object, ENCODE_CPU_READ);
+
 	memset(dst, 0, encode->raw_size);
 
 	luma_rows = src_height < dst_height ? src_height : dst_height;
@@ -602,6 +610,8 @@ static void encode_fill_raw(struct encode_context *encode, unsigned int index,
 		memcpy(dst + dst_pitch * i,
 		       src + src_pitch * (chroma_rows ? chroma_rows - 1 : 0),
 		       copy);
+
+	encode_surface_cpu_end(surface_object, ENCODE_CPU_READ);
 }
 
 static VAStatus encode_append_packed(struct encode_picture_params *params,
@@ -878,6 +888,59 @@ VAStatus encode_params_collect(struct encode_picture_params *params,
 	return VA_STATUS_SUCCESS;
 }
 
+/*
+ * A dma-buf mapped for the CPU is not coherent by itself. The exporter is
+ * free to hand out a cached mapping and the dma-heaps here do, so every CPU
+ * access through such a mapping has to be bracketed by DMA_BUF_IOCTL_SYNC:
+ * that is what lets the exporter invalidate before a read and flush after a
+ * write. Documentation/driver-api/dma-buf.rst states this as a requirement,
+ * not an optimisation, and this store is exported to the client as a DRM
+ * PRIME handle -- another device really can be on the other side of it, so
+ * a machine where the unsynchronised version happens to work is not
+ * evidence of anything.
+ *
+ * The ioctl is documented as restartable, so a signal must not be allowed
+ * to skip the cache maintenance.
+ */
+static void encode_dmabuf_sync(int fd, __u64 flags)
+{
+	struct dma_buf_sync sync = { .flags = flags };
+	int rc;
+
+	if (fd < 0)
+		return;
+
+	do {
+		rc = ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+	} while (rc < 0 && (errno == EINTR || errno == EAGAIN));
+}
+
+static __u64 encode_sync_flags(unsigned int rw)
+{
+	__u64 flags = 0;
+
+	if (rw & ENCODE_CPU_READ)
+		flags |= DMA_BUF_SYNC_READ;
+	if (rw & ENCODE_CPU_WRITE)
+		flags |= DMA_BUF_SYNC_WRITE;
+
+	return flags;
+}
+
+void encode_surface_cpu_begin(struct object_surface *surface_object,
+			      unsigned int rw)
+{
+	encode_dmabuf_sync(surface_object->encode_fd,
+			   DMA_BUF_SYNC_START | encode_sync_flags(rw));
+}
+
+void encode_surface_cpu_end(struct object_surface *surface_object,
+			    unsigned int rw)
+{
+	encode_dmabuf_sync(surface_object->encode_fd,
+			   DMA_BUF_SYNC_END | encode_sync_flags(rw));
+}
+
 VAStatus encode_surface_storage(struct object_surface *surface_object)
 {
 	unsigned int pitch = ALIGN_UP((unsigned int)surface_object->width, 16);
@@ -897,9 +960,13 @@ VAStatus encode_surface_storage(struct object_surface *surface_object)
 			close(fd);
 			fd = -1;
 		} else {
-			memset(map, 0, size);
 			surface_object->encode_data = map;
 			surface_object->encode_fd = fd;
+			encode_surface_cpu_begin(surface_object,
+						 ENCODE_CPU_WRITE);
+			memset(map, 0, size);
+			encode_surface_cpu_end(surface_object,
+					       ENCODE_CPU_WRITE);
 		}
 	}
 

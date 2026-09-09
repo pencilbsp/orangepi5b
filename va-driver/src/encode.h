@@ -88,6 +88,24 @@ void encode_params_reset(struct encode_picture_params *params);
 VAStatus encode_params_collect(struct encode_picture_params *params,
 			       struct object_buffer *buffer_object);
 
+/*
+ * Bracket CPU access to a surface's dma-buf staging store. The dma-buf
+ * contract requires this around every access through the mapping, in both
+ * directions; it is a no-op when the store fell back to plain memory.
+ *
+ * The direction is spelled out here rather than passed through as the
+ * kernel's own DMA_BUF_SYNC_* bits, so that including this header does not
+ * drag uapi definitions into every translation unit that sees it.
+ */
+#define ENCODE_CPU_READ		(1u << 0)
+#define ENCODE_CPU_WRITE	(1u << 1)
+#define ENCODE_CPU_RW		(ENCODE_CPU_READ | ENCODE_CPU_WRITE)
+
+void encode_surface_cpu_begin(struct object_surface *surface_object,
+			      unsigned int rw);
+void encode_surface_cpu_end(struct object_surface *surface_object,
+			    unsigned int rw);
+
 VAStatus encode_surface_storage(struct object_surface *surface_object);
 void encode_surface_release(struct object_surface *surface_object);
 
