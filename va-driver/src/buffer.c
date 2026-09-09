@@ -33,6 +33,8 @@
 
 #include <unistd.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -53,6 +55,7 @@ VAStatus RequestCreateBuffer(VADriverContextP context, VAContextID context_id,
 	struct request_data *driver_data = context->pDriverData;
 	struct object_buffer *buffer_object = NULL;
 	void *buffer_data;
+	uint64_t total;
 	VAStatus status;
 	VABufferID id;
 
@@ -83,9 +86,22 @@ VAStatus RequestCreateBuffer(VADriverContextP context, VAContextID context_id,
 		goto error;
 	}
 
+	/*
+	 * size and count are both unsigned int and both come from the client,
+	 * so their product wraps long before malloc would refuse it: a small
+	 * allocation followed by writes sized from the original numbers. Widen
+	 * the multiply and reject anything that would not fit back into the
+	 * unsigned int fields this buffer records.
+	 */
+	total = (uint64_t)size * (uint64_t)count;
+	if (total > UINT_MAX) {
+		status = VA_STATUS_ERROR_ALLOCATION_FAILED;
+		goto error;
+	}
+
 	if (type == VAEncCodedBufferType) {
 		VACodedBufferSegment *segment;
-		unsigned int capacity = size * count;
+		size_t capacity = (size_t)total;
 
 		buffer_data = malloc(sizeof(*segment) + capacity);
 		if (buffer_data == NULL) {
@@ -99,16 +115,16 @@ VAStatus RequestCreateBuffer(VADriverContextP context, VAContextID context_id,
 		segment->next = NULL;
 
 		buffer_object->coded_segment = true;
-		buffer_object->coded_capacity = capacity;
+		buffer_object->coded_capacity = (unsigned int)capacity;
 	} else {
-		buffer_data = malloc(size * count);
+		buffer_data = malloc((size_t)total);
 		if (buffer_data == NULL) {
 			status = VA_STATUS_ERROR_ALLOCATION_FAILED;
 			goto error;
 		}
 
 		if (data != NULL)
-			memcpy(buffer_data, data, size * count);
+			memcpy(buffer_data, data, (size_t)total);
 
 		buffer_object->coded_segment = false;
 		buffer_object->coded_capacity = 0;
