@@ -1,0 +1,19 @@
+Package: orangepi5b-va-driver
+Version: @PACKAGE_VERSION@
+Architecture: arm64
+Maintainer: Orange Pi 5B Builder <pencil.bsp@gmail.com>
+Section: libs
+Priority: optional
+Depends: libva2 (>= @LIBVA_VERSION@)
+Description: VA-API driver for the Orange Pi 5B video codecs
+ Bridges libva to the V4L2 stateless codecs on RK3588S. H.264 and HEVC decode
+ run on the mainline rkvdec driver; AV1 has a Hantro block of its own and the
+ driver picks the device from the codec.
+ .
+ Chrome on Linux has no V4L2 decode path -- it is compiled behind
+ BUILDFLAG(IS_CHROMEOS) -- so VA-API is the only way to reach these blocks from
+ a desktop browser. GNOME Remote Desktop likewise encodes through VA-API.
+ .
+ Built against the libva of this release: a VA-API driver exports a
+ version-stamped entry point, so one built for a different libva is never
+ loaded and the client only reports that vaInitialize failed.
