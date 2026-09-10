@@ -28,6 +28,7 @@
 #include <stdbool.h>
 
 #define SOURCE_SIZE_MAX						(1024 * 1024)
+#define SOURCE_SIZE_MAX_4K					(4 * 1024 * 1024)
 
 unsigned int v4l2_type_video_output(bool mplane);
 unsigned int v4l2_type_video_capture(bool mplane);

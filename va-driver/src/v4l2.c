@@ -98,7 +98,18 @@ static void v4l2_setup_format(struct v4l2_format *format, unsigned int type,
 	memset(format, 0, sizeof(*format));
 	format->type = type;
 
-	sizeimage = v4l2_type_is_output(type) ? SOURCE_SIZE_MAX : 0;
+	/*
+	 * Every compressed frame must fit in one OUTPUT buffer. Real 4K60
+	 * streams contain occasional frames larger than 1 MiB; rkvdec honours
+	 * the requested sizeimage, so use the same 4 MiB-above-1080p rule as
+	 * Chromium's native V4L2 path. CAPTURE size remains kernel-derived.
+	 */
+	if (!v4l2_type_is_output(type))
+		sizeimage = 0;
+	else if ((unsigned long)width * height > 1920ul * 1088ul)
+		sizeimage = SOURCE_SIZE_MAX_4K;
+	else
+		sizeimage = SOURCE_SIZE_MAX;
 
 	if (v4l2_type_is_mplane(type)) {
 		format->fmt.pix_mp.width = width;

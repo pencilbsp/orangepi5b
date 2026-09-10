@@ -466,7 +466,7 @@ mpv/VLC — board không cài hai thứ đó nên chưa kiểm được. **Đừ
 | Hai luồng đồng thời, bit-exact | **xong** |
 | Chrome phát nối tiếp nhiều clip, không crash GPU process | **xong** 2026-09-09 |
 | Review: 0 cảnh báo ở mức tối đa, 0 hàm chết, cấp phát có kiểm NULL | **xong** 2026-09-09 |
-| Bitstream buffer 4 MiB trên 1080p | chưa — chỉ lộ ra với nội dung dài, bitrate cao |
+| Bitstream buffer 4 MiB trên 1080p | **xong** 2026-09-10 — sửa lỗi frame lớn làm Chrome đen hình |
 | HEVC ext RPS khi `num_short_term_ref_pic_sets != 0` | chưa — x265 mặc định không cần |
 
 ## Thứ tự làm
