@@ -1,4 +1,4 @@
-# VA-API driver cho RK3588S — thiết kế, phạm vi H.264 + HEVC
+# VA-API driver cho RK3588S — thiết kế, phạm vi H.264 + HEVC + VP9
 
 Tài liệu này rút bài học từ queue 37 patch của project tham chiếu
 (`/root/orangepi5b/patches/libva-v4l2-request/ed4bc90/`) để **viết mới**, không
@@ -9,15 +9,17 @@ Nguồn: `README.md` (1088 dòng) của queue đó, cộng nội dung từng pat
 
 ## Phạm vi
 
-Chỉ **H.264 và HEVC decode**, chỉ **rkvdec (VDPU381)**, chỉ **8-bit NV12**.
+Chỉ **H.264, HEVC và VP9 Profile 0 decode**, chỉ **rkvdec (VDPU381)**,
+chỉ **8-bit NV12**.
 
-Không làm: AV1, VP8, VP9, MPEG-2, 10-bit, multi-core. Cắt được vì:
+Không làm: AV1, VP8, VP9 Profile 2, MPEG-2, 10-bit, multi-core. Cắt được vì:
 - AV1 nằm trên block Hantro khác, node khác — logic chọn thiết bị đa codec biến mất
 - 10-bit HEVC bị chặn ở **biểu diễn format**, không phải silicon: rkvdec chỉ ra
   NV15 (layout 10-bit nén chặt của Rockchip) và **libva không có FOURCC cho NV15**
   (`P010`, `P016`, `I010` có; NV15 không). rkvdec không có postprocessor để
   chuyển. Nên không có gì để đưa cho client
-- VP9 chỉ NV12; MPEG-2 trong base là stub 19 dòng
+- backend VP9 hiện chỉ có NV12/Profile 0; Profile 2 cần đường output 10-bit
+- MPEG-2 trong base là stub 19 dòng
 
 ## Nguyên tắc bao trùm
 
@@ -146,6 +148,45 @@ nên clip mặc định lẫn clip `keyint=30:bframes=2` đều báo
 `num_short_term_ref_pic_sets = 0` trong SPS và decode đúng mà không cần control
 mở rộng. **Làm ánh xạ VA→V4L2 trước; parser `st_ref_pic_set()` từ SPS RBSP là
 bước hai, chỉ kích hoạt khi `num_short_term_ref_pic_sets != 0`.**
+
+## VP9 Profile 0 — bắt đầu 2026-09-10
+
+Đường này cần cả hai nửa. Patch kernel `0012` đăng ký `VP9_FRAME` và hai
+control stateless trên VDPU381; VA driver chỉ quảng cáo `VAProfileVP9Profile0`
+khi chính node đã advertise format đó. Như vậy kernel cũ không làm Chrome chọn
+nhầm một backend chưa tồn tại.
+
+VP9 khác H.264/HEVC ở ba điểm:
+
+- OUTPUT là nguyên frame VP9, không có start code Annex-B. `slice_data_offset`
+  được bỏ khỏi đầu buffer và `slice_data_size` quyết định số byte queue.
+- VA-API không mang base quantizer, delta loop-filter và feature data của
+  segmentation. Driver phải đọc lại uncompressed header và giữ các giá trị
+  có tính kế thừa trong `object_context`.
+- rkvdec cần cả `V4L2_CID_STATELESS_VP9_FRAME` lẫn
+  `V4L2_CID_STATELESS_VP9_COMPRESSED_HDR`. Hai control phải đi trong **một**
+  `VIDIOC_S_EXT_CTRLS`; tách làm hai lần khiến probability context trôi ở các
+  inter frame.
+
+Chỉ nhận profile 0, 8-bit, 4:2:0. Profile 2 không được quảng cáo vì backend
+kernel hiện chỉ sinh NV12. Reference timestamp cũng bị giới hạn vào đúng
+decoder session, tránh vô tình tham chiếu surface của context khác.
+
+### Regression khi triển khai VP9 — 2026-09-10
+
+Lần build module VP9 đầu tiên lấy trực tiếp từ một cây `sources/` cũ, trong đó
+thiếu patch kernel `0008-media-rockchip-rkvdec-allow-stateless-request-format-controls.patch`.
+Module đang chạy trước đó có fix này, nên việc thay module vô tình làm H.264 và
+HEVC mất một sửa lỗi đã ship dù patch VP9 không sửa đường decode của hai codec.
+
+Triệu chứng trên H.264 4K là SPS đầu tiên bị `-EBUSY` trước `STREAMON`: CAPTURE
+đã có buffer, `image_fmt` chuyển từ `ANY` sang `420_8BIT`, nhưng FOURCC vẫn là
+NV12. Patch `0008` cho phép chuyển đổi không đổi FOURCC này và vẫn từ chối thay
+đổi thật sự sang NV15/NV16/NV20 để tránh dùng buffer sai kích thước.
+
+Sau khi build lại với đúng queue `0008` rồi `0012`, file
+`bbb_sunflower_2160p_60fps_normal.mp4` đã PASS 120/120 frame bit-identical ở
+3840x2160; HEVC PASS 60/60 và hai stream VP9 PASS 180/180 + 120/120.
 
 ## STREAMON phải đợi sequence header — phát hiện khi viết, 2026-09-08
 
@@ -411,13 +452,15 @@ tốn gì và chỉ có ý nghĩa với thứ tự "export trước, tạo conte
 mpv/VLC — board không cài hai thứ đó nên chưa kiểm được. **Đừng coi chúng là
 đang gánh việc.**
 
-## Trạng thái, 2026-09-09
+## Trạng thái, 2026-09-10
 
 | | |
 |---|---|
 | Khung driver, khoá, context tự mở node | **xong** |
 | Xếp hạng thiết bị, chọn rkvdec | **xong** |
-| H.264 + HEVC, bit-exact 18/18 stream | **xong** |
+| H.264 + HEVC, bit-exact 18/18 stream | **xong**; H.264 4K regression `0008` đã retest 2026-09-10 |
+| VP9 Profile 0: kernel + VA driver cross-build | **xong** 2026-09-10 |
+| VP9 Profile 0: vainfo/FFmpeg/Chrome trên board | **xong** 2026-09-10 — bit-exact 2/2, Chrome dùng `VaapiVideoDecoder` |
 | Buffer sizing theo độ phân giải (8K) | **xong** |
 | Chrome: export surface chưa bind, separate layers | **xong** |
 | Hai luồng đồng thời, bit-exact | **xong** |
@@ -435,9 +478,10 @@ mpv/VLC — board không cài hai thứ đó nên chưa kiểm được. **Đừ
    coverage trong README nguồn: High/Main/Baseline, CABAC/CAVLC, B-frame,
    multi-slice, không chia hết macroblock, IDR dày)
 5. HEVC: bốn control, cùng quy tắc DPB
-6. Buffer sizing theo độ phân giải
-7. Chrome: export surface chưa bind, separate layers
-8. Concurrent decode: hai stream một VADisplay
+6. VP9 Profile 0: kernel VDPU381, uncompressed/compressed header và state kế thừa
+7. Buffer sizing theo độ phân giải
+8. Chrome: export surface chưa bind, separate layers
+9. Concurrent decode: hai stream một VADisplay
 
 **Không bỏ qua bước 4.** Lỗi DPB-có-lỗ chỉ lộ ra khi so bit-exact trên stream có
 IDR thứ hai; clip ngắn một GOP luôn đúng.

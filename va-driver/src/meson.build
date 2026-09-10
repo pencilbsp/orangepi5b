@@ -47,6 +47,9 @@ sources = [
 	'session.c',
 	'h264.c',
 	'h265.c',
+	'vp9.c',
+	'vp9_parser.c',
+	'vpx_rac.c',
 ]
 
 headers = [
@@ -69,6 +72,9 @@ headers = [
 	'session.h',
 	'h264.h',
 	'h265.h',
+	'vp9.h',
+	'vp9_parser.h',
+	'vpx_rac.h',
 ]
 
 includes = [

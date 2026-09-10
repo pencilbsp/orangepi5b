@@ -35,6 +35,16 @@ enc265() {
 	printf '  %-34s %s\n' "$name.h265" "$(stat -c%s "$OUT/$name.h265") bytes"
 }
 
+encvp9() {
+	local name="$1" opts="$2" frames="$3" size="$4"
+	# IVF keeps VP9 frame boundaries explicit, matching VA's one-frame slice.
+	# shellcheck disable=SC2046
+	ffmpeg -hide_banner -loglevel error -y $(src "$frames" "$size") \
+		-pix_fmt yuv420p -c:v libvpx-vp9 -deadline good -cpu-used 4 \
+		-g 30 $opts -f ivf "$OUT/$name.ivf"
+	printf '  %-34s %s\n' "$name.ivf" "$(stat -c%s "$OUT/$name.ivf") bytes"
+}
+
 echo "H.264:"
 # Profile and entropy coder coverage.
 enc h264-baseline-cavlc "-profile:v baseline -bf 0 -coder 0 -g 30"        60  1280x720
@@ -60,6 +70,12 @@ enc265 hevc-main-basic    "keyint=30"                                     60  12
 enc265 hevc-main-bframes  "keyint=30:bframes=3"                          120  1280x720
 enc265 hevc-idr-every-5   "keyint=5:min-keyint=5:bframes=2"              120  1280x720
 enc265 hevc-1080p         "keyint=30:bframes=2"                          120  1920x1080
+
+echo "VP9 Profile 0:"
+# Repeated keyframes exercise probability-context reset and inherited state.
+encvp9 vp9-profile0-repeated "-auto-alt-ref 1 -lag-in-frames 16"          180  1280x720
+# More than one tile column exercises tile_info parsing and kernel layout.
+encvp9 vp9-profile0-tiles    "-tile-columns 2 -row-mt 1"                  120  1920x1080
 
 echo
 echo "Streams in $OUT"

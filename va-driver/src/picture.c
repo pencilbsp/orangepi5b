@@ -35,6 +35,7 @@
 
 #include "h264.h"
 #include "h265.h"
+#include "vp9.h"
 
 #include <assert.h>
 #include <string.h>
@@ -194,6 +195,8 @@ static VAStatus codec_store_buffer(struct request_data *driver_data,
 	case VASliceDataBufferType: {
 		static const unsigned char start_code[] = { 0x00, 0x00, 0x00, 0x01 };
 		unsigned int size = buffer_object->size * buffer_object->count;
+		unsigned int prefix_size = profile == VAProfileVP9Profile0 ? 0 :
+					   sizeof(start_code);
 
 		/*
 		 * Since there is no guarantee that the allocation order is the
@@ -208,15 +211,18 @@ static VAStatus codec_store_buffer(struct request_data *driver_data,
 		 * handed a buffer with no start code at offset 0 and every
 		 * frame fails to decode.
 		 */
-		if (surface_object->slices_size + sizeof(start_code) + size >
+		if (surface_object->slices_size + prefix_size + size >
 		    surface_object->source_size) {
 			request_log("picture: slice does not fit the coded buffer\n");
 			return VA_STATUS_ERROR_NOT_ENOUGH_BUFFER;
 		}
 
-		memcpy(surface_object->source_data + surface_object->slices_size,
-		       start_code, sizeof(start_code));
-		surface_object->slices_size += sizeof(start_code);
+		/* VP9_FRAME is an unframed frame. H.264/HEVC require Annex-B. */
+		if (prefix_size != 0) {
+			memcpy(surface_object->source_data + surface_object->slices_size,
+			       start_code, sizeof(start_code));
+			surface_object->slices_size += sizeof(start_code);
+		}
 
 		memcpy(surface_object->source_data + surface_object->slices_size,
 		       buffer_object->data, size);
@@ -241,6 +247,13 @@ static VAStatus codec_store_buffer(struct request_data *driver_data,
 			       sizeof(surface_object->params.h265.picture));
 			break;
 
+		case VAProfileVP9Profile0:
+			memcpy(&surface_object->params.vp9.picture,
+			       buffer_object->data,
+			       sizeof(surface_object->params.vp9.picture));
+			surface_object->params.vp9.picture_set = true;
+			break;
+
 		default:
 			break;
 		}
@@ -260,6 +273,13 @@ static VAStatus codec_store_buffer(struct request_data *driver_data,
 			memcpy(&surface_object->params.h265.slice,
 			       buffer_object->data,
 			       sizeof(surface_object->params.h265.slice));
+			break;
+
+		case VAProfileVP9Profile0:
+			memcpy(&surface_object->params.vp9.slice,
+			       buffer_object->data,
+			       sizeof(surface_object->params.vp9.slice));
+			surface_object->params.vp9.slice_set = true;
 			break;
 
 		default:
@@ -315,6 +335,13 @@ static VAStatus codec_set_controls(struct request_data *driver_data,
 
 	case VAProfileHEVCMain:
 		rc = h265_set_controls(driver_data, session, context, surface_object);
+		if (rc < 0)
+			return VA_STATUS_ERROR_OPERATION_FAILED;
+		break;
+
+	case VAProfileVP9Profile0:
+		rc = vp9_set_controls(driver_data, session, context,
+				      surface_object);
 		if (rc < 0)
 			return VA_STATUS_ERROR_OPERATION_FAILED;
 		break;
@@ -480,6 +507,9 @@ VAStatus RequestBeginPicture(VADriverContextP context, VAContextID context_id,
 	surface_object->status = VASurfaceRendering;
 	surface_object->slices_count = 0;
 	surface_object->slices_size = 0;
+	if (config_object->profile == VAProfileVP9Profile0)
+		memset(&surface_object->params.vp9, 0,
+		       sizeof(surface_object->params.vp9));
 	context_object->render_surface_id = surface_id;
 
 	return VA_STATUS_SUCCESS;
@@ -561,6 +591,11 @@ static int codec_begin_streaming(struct decoder_session *session,
 		rc = h265_set_device_sps(session, surface);
 		break;
 
+	case VAProfileVP9Profile0:
+		/* VP9 has no sequence control that must precede STREAMON. */
+		rc = 0;
+		break;
+
 	default:
 		return -1;
 	}
@@ -578,6 +613,30 @@ static int codec_begin_streaming(struct decoder_session *session,
 	}
 
 	session->streaming = true;
+	return 0;
+}
+
+/* Put the one VP9 frame at byte zero of the V4L2 OUTPUT buffer. */
+static int vp9_prepare_frame_data(struct object_surface *surface)
+{
+	const VASliceParameterBufferVP9 *slice = &surface->params.vp9.slice;
+	unsigned int offset;
+	unsigned int size;
+
+	if (!surface->params.vp9.picture_set ||
+	    !surface->params.vp9.slice_set || surface->slices_count != 1)
+		return -1;
+
+	offset = slice->slice_data_offset;
+	size = slice->slice_data_size;
+	if (offset > surface->slices_size ||
+	    size > surface->slices_size - offset)
+		return -1;
+
+	if (offset != 0)
+		memmove(surface->source_data,
+			(unsigned char *)surface->source_data + offset, size);
+	surface->slices_size = size;
 	return 0;
 }
 
@@ -638,6 +697,12 @@ VAStatus RequestEndPicture(VADriverContextP context, VAContextID context_id)
 
 	output_type = v4l2_type_video_output(video_format->v4l2_mplane);
 	capture_type = v4l2_type_video_capture(video_format->v4l2_mplane);
+
+	if (config_object->profile == VAProfileVP9Profile0 &&
+	    vp9_prepare_frame_data(surface_object) < 0) {
+		request_log("picture: invalid VP9 picture/slice data\n");
+		return VA_STATUS_ERROR_INVALID_BUFFER;
+	}
 
 	gettimeofday(&surface_object->timestamp, NULL);
 

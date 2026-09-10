@@ -53,7 +53,7 @@
 static int rank_device(int fd, const char *path, const char *wanted_path)
 {
 	struct v4l2_capability capability;
-	bool has_h264, has_hevc;
+	bool has_h264, has_hevc, has_vp9;
 
 	if (wanted_path != NULL && strcmp(path, wanted_path) == 0)
 		return RANK_ENVIRONMENT;
@@ -67,7 +67,8 @@ static int rank_device(int fd, const char *path, const char *wanted_path)
 
 	has_h264 = v4l2_find_format_any(fd, V4L2_PIX_FMT_H264_SLICE);
 	has_hevc = v4l2_find_format_any(fd, V4L2_PIX_FMT_HEVC_SLICE);
-	if (!has_h264 && !has_hevc)
+	has_vp9 = v4l2_find_format_any(fd, V4L2_PIX_FMT_VP9_FRAME);
+	if (!has_h264 && !has_hevc && !has_vp9)
 		return RANK_NONE;
 
 	if (strstr((const char *)capability.card, "rkvdec") != NULL ||
@@ -185,7 +186,7 @@ int decoder_device_open(int *video_fd_out, int *media_fd_out,
 	closedir(dir);
 
 	if (best_rank == RANK_NONE) {
-		request_log("device: no V4L2 stateless H.264/HEVC decoder found\n");
+		request_log("device: no V4L2 stateless H.264/HEVC/VP9 decoder found\n");
 		return -1;
 	}
 

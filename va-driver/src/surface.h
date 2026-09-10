@@ -30,6 +30,7 @@
 #include <linux/videodev2.h>
 
 #include <va/va_backend.h>
+#include <va/va_dec_vp9.h>
 
 #include "object_heap.h"
 #include "session.h"
@@ -101,6 +102,12 @@ struct object_surface {
 			VAIQMatrixBufferHEVC iqmatrix;
 			bool iqmatrix_set;
 		} h265;
+		struct {
+			VADecPictureParameterBufferVP9 picture;
+			VASliceParameterBufferVP9 slice;
+			bool picture_set;
+			bool slice_set;
+		} vp9;
 	} params;
 
 	int request_fd;

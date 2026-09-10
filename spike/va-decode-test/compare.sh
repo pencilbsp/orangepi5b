@@ -11,7 +11,7 @@ DEV=/dev/dri/renderD128
 
 pass=0; fail=0; skip=0
 
-for f in "$DIR"/*.h264 "$DIR"/*.h265; do
+for f in "$DIR"/*.h264 "$DIR"/*.h265 "$DIR"/*.ivf; do
 	[ -e "$f" ] || continue
 	name=$(basename "$f")
 

@@ -36,6 +36,7 @@
 #include "object_heap.h"
 #include "h264.h"
 #include "session.h"
+#include "vp9.h"
 
 #define CONTEXT(data, id)                                                      \
 	((struct object_context *)object_heap_lookup(&(data)->context_heap, id))
@@ -60,6 +61,9 @@ struct object_context {
 
 	/* H264 only */
 	struct h264_dpb dpb;
+
+	/* VP9 loop-filter and segmentation state inherited across frames. */
+	struct vp9_persistent_state vp9_state;
 
 };
 

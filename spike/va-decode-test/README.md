@@ -37,6 +37,8 @@ Không phải bộ conformance codec. Mỗi stream nhắm một thứ đã từn
 | `h264-854x482` | không chia hết macroblock, kiểm cropping |
 | `h264-baseline-cavlc`, `main-cavlc` | CAVLC thay vì CABAC |
 | `hevc-idr-every-5` | như trên, phía HEVC |
+| `vp9-profile0-repeated` | reset/kế thừa probability context qua nhiều GOP |
+| `vp9-profile0-tiles` | compressed header và tile layout nhiều cột |
 
 **Clip ngắn một GOP không chứng minh được gì.** Lỗi DPB-có-lỗ để GOP đầu hoàn
 hảo và chỉ hỏng từ sau IDR thứ hai.
@@ -61,6 +63,27 @@ hảo và chỉ hỏng từ sau IDR thứ hai.
 
 pass=14 fail=0 skip=0
 ```
+
+Kết quả VP9 sau khi boot kernel có patch `0012` và cài VA driver mới,
+2026-09-10:
+
+```
+  vp9-profile0-repeated.ivf  PASS  180 frames bit-identical
+  vp9-profile0-tiles.ivf     PASS  120 frames bit-identical
+
+pass=2 fail=0 skip=0
+```
+
+`vainfo` quảng bá `VAProfileVP9Profile0: VAEntrypointVLD`. Bản export
+`chrome://media-internals` cho clip VP9 Profile 0 1920x1080 ghi
+`kVideoDecoderName = VaapiVideoDecoder` và `kIsPlatformVideoDecoder = true`,
+không có warning fallback hay pipeline error.
+
+Regression deploy cùng ngày: module VP9 đầu tiên được build từ cây tạm thiếu
+patch kernel `0008`, làm H.264 4K bị `-EBUSY` khi gửi SPS đầu tiên. Sau khi
+build lại đủ queue, chính file Chrome đã fallback
+`bbb_sunflower_2160p_60fps_normal.mp4` PASS 120/120 frame bit-identical ở
+3840x2160. HEVC 1080p PASS 60/60 và cả hai ca VP9 ở trên vẫn PASS.
 
 ## Độ phân giải cao
 

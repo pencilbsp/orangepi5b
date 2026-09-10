@@ -146,6 +146,7 @@ VAStatus RequestCreateConfig(VADriverContextP context, VAProfile profile,
 		return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
 
 	case VAProfileHEVCMain:
+	case VAProfileVP9Profile0:
 		if (entrypoint != VAEntrypointVLD)
 			return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
 		break;
@@ -218,7 +219,7 @@ VAStatus RequestQueryConfigProfiles(VADriverContextP context,
 	 *
 	 * Deliberately absent:
 	 *   MPEG-2            - no backend here
-	 *   VP9, AV1, VP8     - out of scope; AV1 lives on a different block
+	 *   AV1, VP8          - out of scope; AV1 lives on a different block
 	 *   H264 Multiview /
 	 *   Stereo High       - rkvdec decodes a single view
 	 *   HEVC Main 10      - the hardware manages it, but rkvdec only emits
@@ -237,6 +238,12 @@ VAStatus RequestQueryConfigProfiles(VADriverContextP context,
 				     V4L2_PIX_FMT_HEVC_SLICE);
 	if (found && index < (V4L2_REQUEST_MAX_PROFILES - 1))
 		profiles[index++] = VAProfileHEVCMain;
+
+	/* VDPU381 exposes only Profile 0 and produces 8-bit NV12. */
+	found = v4l2_find_format_any(driver_data->video_fd,
+				     V4L2_PIX_FMT_VP9_FRAME);
+	if (found && index < (V4L2_REQUEST_MAX_PROFILES - 1))
+		profiles[index++] = VAProfileVP9Profile0;
 
 	*profiles_count = index;
 
@@ -266,6 +273,7 @@ VAStatus RequestQueryConfigEntrypoints(VADriverContextP context,
 		break;
 
 	case VAProfileHEVCMain:
+	case VAProfileVP9Profile0:
 		entrypoints[0] = VAEntrypointVLD;
 		*entrypoints_count = 1;
 		break;

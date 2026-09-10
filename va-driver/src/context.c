@@ -140,6 +140,10 @@ int profile_to_pixelformat(VAProfile profile, unsigned int *pixelformat)
 		*pixelformat = V4L2_PIX_FMT_HEVC_SLICE;
 		return 0;
 
+	case VAProfileVP9Profile0:
+		*pixelformat = V4L2_PIX_FMT_VP9_FRAME;
+		return 0;
+
 	default:
 		return -1;
 	}
