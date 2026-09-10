@@ -34,6 +34,8 @@
 #include "video.h"
 
 #include <assert.h>
+#include <limits.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -150,15 +152,20 @@ VAStatus RequestCreateImage(VADriverContextP context, VAImageFormat *format,
 			    int width, int height, VAImage *image)
 {
 	struct request_data *driver_data = context->pDriverData;
-	unsigned int destination_sizes[VIDEO_MAX_PLANES];
-	unsigned int destination_bytesperlines[VIDEO_MAX_PLANES];
-	unsigned int destination_planes_count;
+	struct object_buffer *buffer_object;
+	unsigned int pitch;
+	unsigned int luma_size;
+	unsigned int chroma_size;
 	unsigned int size;
+	uint64_t aligned_width;
+	uint64_t pitch64;
+	uint64_t luma_size64;
+	uint64_t chroma_size64;
+	uint64_t size64;
 	struct object_image *image_object;
 	VABufferID buffer_id;
 	VAImageID id;
 	VAStatus status;
-	unsigned int i;
 
 	/*
 	 * vaCreateImage names no surface, so there is no queue whose geometry
@@ -170,26 +177,28 @@ VAStatus RequestCreateImage(VADriverContextP context, VAImageFormat *format,
 	 * our own -- tight NV12 at the requested size -- and let vaGetImage
 	 * reconcile it with the surface row by row.
 	 */
+	if (format == NULL || image == NULL || width <= 0 || height <= 0)
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
+
 	if (format->fourcc != VA_FOURCC_NV12)
 		return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
 
-	destination_planes_count = 2;
+	/* NV12 needs room for a complete final UV pair when
+	 * width is odd. All arithmetic is widened before entering VA's u32
+	 * image fields and RequestCreateBuffer. */
+	aligned_width = ((uint64_t)(unsigned int)width + 1) & ~1ull;
+	pitch64 = aligned_width;
+	luma_size64 = pitch64 * (unsigned int)height;
+	chroma_size64 = pitch64 * (((unsigned int)height + 1) / 2);
+	size64 = luma_size64 + chroma_size64;
+	if (pitch64 > UINT_MAX || luma_size64 > UINT_MAX ||
+	    chroma_size64 > UINT_MAX || size64 > UINT_MAX)
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
 
-	destination_bytesperlines[0] = width;
-	destination_sizes[0] = destination_bytesperlines[0] * height;
-	destination_bytesperlines[1] = width;
-	destination_sizes[1] = destination_bytesperlines[1] * (height / 2);
-
-	size = destination_sizes[0] + destination_sizes[1];
-
-	/* Here we calculate the sizes assuming NV12. */
-
-	destination_sizes[0] = destination_bytesperlines[0] * height;
-
-	for (i = 1; i < destination_planes_count; i++) {
-		destination_bytesperlines[i] = destination_bytesperlines[0];
-		destination_sizes[i] = destination_sizes[0] / 2;
-	}
+	pitch = (unsigned int)pitch64;
+	luma_size = (unsigned int)luma_size64;
+	chroma_size = (unsigned int)chroma_size64;
+	size = (unsigned int)size64;
 
 	id = object_heap_allocate(&driver_data->image_heap);
 	image_object = IMAGE(driver_data, id);
@@ -203,6 +212,14 @@ VAStatus RequestCreateImage(VADriverContextP context, VAImageFormat *format,
 				 (struct object_base *)image_object);
 		return status;
 	}
+	buffer_object = BUFFER(driver_data, buffer_id);
+	if (buffer_object == NULL || buffer_object->data == NULL) {
+		RequestDestroyBuffer(context, buffer_id);
+		object_heap_free(&driver_data->image_heap,
+				 (struct object_base *)image_object);
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	}
+	memset(buffer_object->data, 0, size);
 
 	memset(image, 0, sizeof(*image));
 
@@ -212,13 +229,13 @@ VAStatus RequestCreateImage(VADriverContextP context, VAImageFormat *format,
 	image->buf = buffer_id;
 	image->image_id = id;
 
-	image->num_planes = destination_planes_count;
+	image->num_planes = 2;
 	image->data_size = size;
-
-	for (i = 0; i < image->num_planes; i++) {
-		image->pitches[i] = destination_bytesperlines[i];
-		image->offsets[i] = i > 0 ? destination_sizes[i - 1] : 0;
-	}
+	image->pitches[0] = pitch;
+	image->pitches[1] = pitch;
+	image->offsets[0] = 0;
+	image->offsets[1] = luma_size;
+	(void)chroma_size;
 
 	image_object->image = *image;
 
@@ -253,7 +270,8 @@ static VAStatus copy_surface_to_image (struct request_data *driver_data,
 	unsigned int i;
 
 	buffer_object = BUFFER(driver_data, image->buf);
-	if (buffer_object == NULL)
+	if (buffer_object == NULL || buffer_object->data == NULL ||
+	    buffer_object->size < image->data_size)
 		return VA_STATUS_ERROR_INVALID_BUFFER;
 
 	/*
@@ -270,6 +288,10 @@ static VAStatus copy_surface_to_image (struct request_data *driver_data,
 	    surface_object->destination_data[0] == NULL)
 		return VA_STATUS_SUCCESS;
 
+	if (image->format.fourcc != VA_FOURCC_NV12 ||
+	    surface_object->pixel_format != VA_FOURCC_NV12)
+		return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+
 	/*
 	 * The surface's pitch is whatever the hardware chose; the image's is
 	 * whatever RequestCreateImage chose. Copy a row at a time so the two
@@ -282,10 +304,23 @@ static VAStatus copy_surface_to_image (struct request_data *driver_data,
 			surface_object->destination_bytesperlines[i];
 		unsigned int dst_pitch = image->pitches[i];
 		unsigned int pitch = src_pitch < dst_pitch ? src_pitch : dst_pitch;
-		unsigned int rows = i == 0 ? image->height : image->height / 2;
+		unsigned int rows = i == 0 ? image->height :
+						     (image->height + 1) / 2;
 		unsigned char *src = surface_object->destination_data[i];
 		unsigned char *dst = buffer_object->data + image->offsets[i];
 		unsigned int row;
+
+		uint64_t source_end;
+		uint64_t destination_end;
+
+		if (rows == 0)
+			continue;
+		source_end = (uint64_t)(rows - 1) * src_pitch + pitch;
+		destination_end = (uint64_t)image->offsets[i] +
+				  (uint64_t)(rows - 1) * dst_pitch + pitch;
+		if (source_end > surface_object->destination_sizes[i] ||
+		    destination_end > image->data_size)
+			return VA_STATUS_ERROR_OPERATION_FAILED;
 
 		for (row = 0; row < rows; row++)
 			memcpy(dst + (size_t)row * dst_pitch,
@@ -303,6 +338,7 @@ VAStatus RequestDeriveImage(VADriverContextP context, VASurfaceID surface_id,
 	struct object_buffer *buffer_object;
 	VAImageFormat format;
 	VAStatus status;
+	bool encode_surface;
 
 	surface_object = SURFACE(driver_data, surface_id);
 	if (surface_object == NULL)
@@ -314,14 +350,19 @@ VAStatus RequestDeriveImage(VADriverContextP context, VASurfaceID surface_id,
 			return status;
 	}
 
-	format.fourcc = VA_FOURCC_NV12;
+	encode_surface = image_surface_is_encode(driver_data, surface_object);
+	memset(&format, 0, sizeof(format));
+	format.fourcc = encode_surface ? VA_FOURCC_NV12 :
+				       surface_object->pixel_format;
+	format.byte_order = VA_LSB_FIRST;
+	format.bits_per_pixel = 12;
 
 	status = RequestCreateImage(context, &format, surface_object->width,
 				    surface_object->height, image);
 	if (status != VA_STATUS_SUCCESS)
 		return status;
 
-	if (image_surface_is_encode(driver_data, surface_object)) {
+	if (encode_surface) {
 		status = alias_encode_surface_to_image(driver_data,
 						       surface_object, image);
 		if (status != VA_STATUS_SUCCESS)
@@ -332,8 +373,10 @@ VAStatus RequestDeriveImage(VADriverContextP context, VASurfaceID surface_id,
 	}
 
 	status = copy_surface_to_image (driver_data, surface_object, image);
-	if (status != VA_STATUS_SUCCESS)
+	if (status != VA_STATUS_SUCCESS) {
+		RequestDestroyImage(context, image->image_id);
 		return status;
+	}
 
 	surface_object->status = VASurfaceReady;
 
@@ -346,7 +389,17 @@ VAStatus RequestDeriveImage(VADriverContextP context, VASurfaceID surface_id,
 VAStatus RequestQueryImageFormats(VADriverContextP context,
 				  VAImageFormat *formats, int *formats_count)
 {
+	if (formats_count == NULL)
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
+	if (formats == NULL) {
+		*formats_count = 1;
+		return VA_STATUS_SUCCESS;
+	}
+
+	memset(formats, 0, sizeof(*formats));
 	formats[0].fourcc = VA_FOURCC_NV12;
+	formats[0].byte_order = VA_LSB_FIRST;
+	formats[0].bits_per_pixel = 12;
 	*formats_count = 1;
 
 	return VA_STATUS_SUCCESS;
@@ -366,6 +419,7 @@ VAStatus RequestGetImage(VADriverContextP context, VASurfaceID surface_id,
 	struct object_surface *surface_object;
 	struct object_image *image_object;
 	VAImage *image;
+	VAStatus status;
 
 	surface_object = SURFACE(driver_data, surface_id);
 	if (surface_object == NULL)
@@ -376,8 +430,15 @@ VAStatus RequestGetImage(VADriverContextP context, VASurfaceID surface_id,
 		return VA_STATUS_ERROR_INVALID_IMAGE;
 
 	image = &image_object->image;
-	if (x != 0 || y != 0 || width != image->width || height != image->height)
+	if (x != 0 || y != 0 || width != image->width || height != image->height ||
+	    width != (unsigned int)surface_object->width ||
+	    height != (unsigned int)surface_object->height)
 		return VA_STATUS_ERROR_UNIMPLEMENTED;
+	if (surface_object->status == VASurfaceRendering) {
+		status = RequestSyncSurface(context, surface_id);
+		if (status != VA_STATUS_SUCCESS)
+			return status;
+	}
 
 	return copy_surface_to_image (driver_data, surface_object, image);
 }

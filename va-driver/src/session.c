@@ -56,5 +56,6 @@ void decoder_session_close(struct decoder_session *session)
 	session->next_capture_buf = 0;
 	session->free_output_count = 0;
 	session->free_capture_count = 0;
+	session->programmed_profile = VAProfileNone;
 	session->streaming = false;
 }

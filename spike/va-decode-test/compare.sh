@@ -8,25 +8,37 @@ set -uo pipefail
 DIR="${1:-$HOME/streams}"
 export LIBVA_DRIVER_NAME=v4l2_request
 DEV=/dev/dri/renderD128
+FFMPEG_TIMEOUT=${FFMPEG_TIMEOUT:-120}
 
 pass=0; fail=0; skip=0
 
 for f in "$DIR"/*.h264 "$DIR"/*.h265 "$DIR"/*.ivf; do
 	[ -e "$f" ] || continue
 	name=$(basename "$f")
+	case "$name" in
+		vp9-profile2-*)
+			printf '  %-26s SKIP  (Profile 2 intentionally not advertised)\n' "$name"
+			skip=$((skip+1))
+			continue
+			;;
+	esac
+	frame_format=nv12
 
 	sw=$(mktemp); hw=$(mktemp); log=$(mktemp)
 
-	ffmpeg -y -hide_banner -loglevel error -i "$f" \
-		-pix_fmt nv12 -f framemd5 "$sw" 2>"$log"
+	timeout -k 5 "$FFMPEG_TIMEOUT" ffmpeg -nostdin -y -hide_banner \
+		-loglevel error -i "$f" \
+		-pix_fmt "$frame_format" -f framemd5 "$sw" 2>"$log"
 	if [ $? -ne 0 ]; then
 		printf '  %-26s SKIP  (software decode failed)\n' "$name"
 		skip=$((skip+1)); rm -f "$sw" "$hw" "$log"; continue
 	fi
 
-	ffmpeg -y -hide_banner -loglevel error \
+	timeout -k 5 "$FFMPEG_TIMEOUT" ffmpeg -nostdin -y -hide_banner \
+		-loglevel error \
 		-hwaccel vaapi -hwaccel_device "$DEV" -hwaccel_output_format vaapi \
-		-i "$f" -vf 'hwdownload,format=nv12' -f framemd5 "$hw" 2>"$log"
+		-i "$f" -vf "hwdownload,format=$frame_format" \
+		-f framemd5 "$hw" 2>"$log"
 	rc=$?
 
 	sw_frames=$(grep -c '^[0-9]' "$sw" 2>/dev/null)

@@ -55,6 +55,7 @@ struct decoder_session {
 	 * is how adaptive streaming changes quality -- must reprogram them.
 	 */
 	unsigned int programmed_pixelformat;
+	int programmed_profile;
 	int programmed_width;
 	int programmed_height;
 

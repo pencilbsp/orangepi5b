@@ -29,6 +29,7 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -52,7 +53,8 @@
 
 static struct decoder_session *
 find_unique_context_session(struct request_data *driver_data,
-			    unsigned int width, unsigned int height)
+			    unsigned int width, unsigned int height,
+			    unsigned int capture_format)
 {
 	struct decoder_session *session = NULL;
 	struct object_context *context_object;
@@ -62,6 +64,8 @@ find_unique_context_session(struct request_data *driver_data,
 		&driver_data->context_heap, &iterator);
 	while (context_object != NULL) {
 		if (context_object->session.video_format != NULL &&
+		    context_object->session.video_format->v4l2_format ==
+			capture_format &&
 		    context_object->picture_width == (int)width &&
 		    context_object->picture_height == (int)height) {
 			if (session != NULL)
@@ -155,14 +159,29 @@ VAStatus RequestCreateSurfaces2(VADriverContextP context, unsigned int format,
 {
 	struct request_data *driver_data = context->pDriverData;
 	struct object_surface *surface_object;
+	unsigned int capture_format;
+	unsigned int pixel_format;
 	unsigned int i;
 	VASurfaceID id;
 
-	(void)attributes;
-	(void)attributes_count;
+	if (surfaces_ids == NULL || surfaces_count == 0 ||
+	    (attributes_count > 0 && attributes == NULL) ||
+	    width == 0 || height == 0 || width > INT_MAX || height > INT_MAX)
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
 
 	if (format != VA_RT_FORMAT_YUV420)
 		return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+
+	pixel_format = VA_FOURCC_NV12;
+	capture_format = V4L2_PIX_FMT_NV12;
+
+	for (i = 0; i < attributes_count; i++) {
+		if (attributes[i].type != VASurfaceAttribPixelFormat)
+			continue;
+		if (attributes[i].value.type != VAGenericValueTypeInteger ||
+		    (unsigned int)attributes[i].value.value.i != pixel_format)
+			return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+	}
 
 	for (i = 0; i < surfaces_count; i++) {
 		id = object_heap_allocate(&driver_data->surface_heap);
@@ -202,6 +221,8 @@ VAStatus RequestCreateSurfaces2(VADriverContextP context, unsigned int format,
 		surface_object->encode_fd = -1;
 		surface_object->destination_index = SURFACE_INDEX_UNASSIGNED;
 		surface_object->request_fd = -1;
+		surface_object->rt_format = format;
+		surface_object->pixel_format = pixel_format;
 
 		surfaces_ids[i] = id;
 	}
@@ -220,7 +241,8 @@ VAStatus RequestCreateSurfaces2(VADriverContextP context, unsigned int format,
 	 * real context asks for a different codec or resolution.
 	 */
 	if (driver_data->probe_session.video_format == NULL &&
-	    find_unique_context_session(driver_data, width, height) == NULL) {
+	    find_unique_context_session(driver_data, width, height,
+				capture_format) == NULL) {
 		VAProfile probe_profile;
 		int it;
 		struct object_config *cfg =
@@ -399,6 +421,16 @@ void surface_detach_session(struct request_data *driver_data,
 			       sizeof(surface_object->destination_map));
 			memset(surface_object->destination_map_lengths, 0,
 			       sizeof(surface_object->destination_map_lengths));
+			memset(surface_object->destination_map_offsets, 0,
+			       sizeof(surface_object->destination_map_offsets));
+			memset(surface_object->destination_data, 0,
+			       sizeof(surface_object->destination_data));
+			memset(surface_object->destination_sizes, 0,
+			       sizeof(surface_object->destination_sizes));
+			memset(surface_object->destination_offsets, 0,
+			       sizeof(surface_object->destination_offsets));
+			memset(surface_object->destination_bytesperlines, 0,
+			       sizeof(surface_object->destination_bytesperlines));
 
 			surface_object->destination_index = SURFACE_INDEX_UNASSIGNED;
 			surface_object->destination_buffers_count = 0;
@@ -562,6 +594,7 @@ VAStatus RequestQuerySurfaceAttributes(VADriverContextP context,
 				       unsigned int *attributes_count)
 {
 	struct request_data *driver_data = context->pDriverData;
+	struct object_config *config_object;
 	/*
 	 * Sized by the same constant this driver reports as max_attributes,
 	 * which leaves room to spare: the list below is at most six entries.
@@ -573,6 +606,10 @@ VAStatus RequestQuerySurfaceAttributes(VADriverContextP context,
 
 	if (attributes_count == NULL)
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+	config_object = CONFIG(driver_data, config);
+	if (config_object == NULL)
+		return VA_STATUS_ERROR_INVALID_CONFIG;
 
 	memset(attributes_list, 0, sizeof(attributes_list));
 
@@ -780,6 +817,8 @@ VAStatus RequestExportSurfaceHandle(VADriverContextP context,
 	surface_object = SURFACE(driver_data, surface_id);
 	if (surface_object == NULL)
 		return VA_STATUS_ERROR_INVALID_SURFACE;
+	if (surface_descriptor == NULL)
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
 
 	/*
 	 * The role decides this. Matching an encoder context by picture size,
@@ -813,7 +852,8 @@ VAStatus RequestExportSurfaceHandle(VADriverContextP context,
 	if (session == NULL)
 		session = find_unique_context_session(driver_data,
 						      surface_object->width,
-						      surface_object->height);
+						      surface_object->height,
+						      V4L2_PIX_FMT_NV12);
 	if (session == NULL)
 		session = &driver_data->probe_session;
 	if (session->video_format == NULL)

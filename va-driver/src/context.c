@@ -71,9 +71,10 @@
 #define POOL_FLOOR_BUFFERS	3u
 #define POOL_BUDGET_BYTES	(384u * 1024u * 1024u)
 
-static unsigned int pool_depth(int width, int height)
+static unsigned int pool_depth(int width, int height, unsigned int bpp)
 {
-	unsigned int frame_bytes = (unsigned int)width * (unsigned int)height * 3u / 2u;
+	uint64_t frame_bytes = (uint64_t)(unsigned int)width *
+			       (unsigned int)height * bpp / 8;
 	unsigned int depth;
 
 	if (frame_bytes == 0)
@@ -123,12 +124,26 @@ static unsigned int context_config_rate_control(struct object_config *config)
 	return VA_RC_CQP;
 }
 
-static int detect_capture_format(struct decoder_session *session)
+static bool context_surface_matches_config(struct request_data *driver_data,
+					   VASurfaceID surface_id,
+					   struct object_config *config)
+{
+	struct object_surface *surface = SURFACE(driver_data, surface_id);
+	enum surface_role expected_role =
+		config->entrypoint == VAEntrypointEncSlice ?
+		SURFACE_ROLE_ENCODE : SURFACE_ROLE_DECODE;
+
+	return surface != NULL && surface->rt_format == VA_RT_FORMAT_YUV420 &&
+	       surface->pixel_format == VA_FOURCC_NV12 &&
+	       (surface->role == SURFACE_ROLE_UNKNOWN ||
+		surface->role == expected_role);
+}
+
+static int detect_capture_format(struct decoder_session *session,
+				 unsigned int coded_format)
 {
 	struct video_format *video_format;
-
-	if (session->video_format != NULL)
-		return 0;
+	bool mplane;
 
 	/*
 	 * rkvdec advertises NV12 under VIDEO_CAPTURE_MPLANE. The single-plane
@@ -136,18 +151,18 @@ static int detect_capture_format(struct decoder_session *session)
 	 * format this used to try is not produced by anything on this SoC.
 	 */
 	if (v4l2_find_format(session->video_fd,
-			     V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-			     V4L2_PIX_FMT_NV12)) {
-		video_format = video_format_find_mplane(V4L2_PIX_FMT_NV12,
-							true);
+			     V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+			     coded_format)) {
+		mplane = true;
 	} else if (v4l2_find_format(session->video_fd,
-				    V4L2_BUF_TYPE_VIDEO_CAPTURE,
-				    V4L2_PIX_FMT_NV12)) {
-		video_format = video_format_find_mplane(V4L2_PIX_FMT_NV12,
-							false);
+				    V4L2_BUF_TYPE_VIDEO_OUTPUT,
+				    coded_format)) {
+		mplane = false;
 	} else {
 		return -1;
 	}
+
+	video_format = video_format_find_mplane(V4L2_PIX_FMT_NV12, mplane);
 
 	if (video_format == NULL)
 		return -1;
@@ -205,6 +220,7 @@ int request_ensure_v4l2_initialized(struct decoder_session *session,
 	if (session->video_format != NULL &&
 	    session->num_capture_buffers > 0 &&
 	    session->programmed_pixelformat == pixelformat &&
+	    session->programmed_profile == profile &&
 	    session->programmed_width == picture_width &&
 	    session->programmed_height == picture_height)
 		return 0;
@@ -236,8 +252,9 @@ int request_ensure_v4l2_initialized(struct decoder_session *session,
 		session->streaming = false;
 	}
 
-	if (detect_capture_format(session) < 0) {
-		request_log("context: NV12 CAPTURE not advertised by driver\n");
+	if (detect_capture_format(session, pixelformat) < 0) {
+		request_log("context: no CAPTURE layout for VA profile %d\n",
+			    profile);
 		return -1;
 	}
 
@@ -253,6 +270,26 @@ int request_ensure_v4l2_initialized(struct decoder_session *session,
 			     picture_width, picture_height);
 	if (rc < 0) {
 		request_log("context: S_FMT(OUTPUT 0x%x) failed\n", pixelformat);
+		return -1;
+	}
+
+	/* S_FMT(OUTPUT) resets rkvdec's image-format state. Select Profile 0
+	 * before CAPTURE S_FMT/REQBUFS so this VA backend always receives
+	 * NV12. Profile 2 remains available through the raw V4L2 interface. */
+	if (profile == VAProfileVP9Profile0) {
+		rc = v4l2_set_control_value(session->video_fd, -1,
+					    V4L2_CID_MPEG_VIDEO_VP9_PROFILE,
+					    V4L2_MPEG_VIDEO_VP9_PROFILE_0);
+		if (rc < 0) {
+			request_log("context: VP9 Profile 0 rejected\n");
+			return -1;
+		}
+	}
+
+	if (!v4l2_find_format(session->video_fd, capture_type,
+			      video_format->v4l2_format)) {
+		request_log("context: CAPTURE 0x%x not advertised for profile %d\n",
+			    video_format->v4l2_format, profile);
 		return -1;
 	}
 
@@ -290,7 +327,8 @@ int request_ensure_v4l2_initialized(struct decoder_session *session,
 			V4L2_STATELESS_HEVC_START_CODE_ANNEX_B);
 	}
 
-	capture_depth = pool_depth(picture_width, picture_height);
+	capture_depth = pool_depth(picture_width, picture_height,
+				   video_format->bpp);
 
 	rc = request_buffers_backoff(session->video_fd, output_type,
 				     output_depth, &output_count);
@@ -333,6 +371,7 @@ int request_ensure_v4l2_initialized(struct decoder_session *session,
 	session->free_output_count = 0;
 	session->free_capture_count = 0;
 	session->programmed_pixelformat = pixelformat;
+	session->programmed_profile = profile;
 	session->programmed_width = picture_width;
 	session->programmed_height = picture_height;
 
@@ -360,6 +399,14 @@ VAStatus RequestCreateContext(VADriverContextP context, VAConfigID config_id,
 	config_object = CONFIG(driver_data, config_id);
 	if (config_object == NULL)
 		return VA_STATUS_ERROR_INVALID_CONFIG;
+	if (picture_width <= 0 || picture_height <= 0 || surfaces_count < 0 ||
+	    (surfaces_count > 0 && surfaces_ids == NULL))
+		return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+	for (i = 0; i < surfaces_count; i++)
+		if (!context_surface_matches_config(driver_data, surfaces_ids[i],
+						    config_object))
+			return VA_STATUS_ERROR_INVALID_SURFACE;
 
 	id = object_heap_allocate(&driver_data->context_heap);
 	context_object = CONTEXT(driver_data, id);

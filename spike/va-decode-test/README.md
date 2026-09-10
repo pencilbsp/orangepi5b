@@ -8,9 +8,13 @@ bại, chúng làm ra ảnh sai.
 
 ```bash
 # 1. Sinh stream (trong chroot amd64, chạy native — encode không liên quan kiến trúc đích)
-chroot build/cross-chroot bash /build/make-streams.sh /build/streams
+install -m 0755 spike/va-decode-test/make-streams.sh \
+  build/cross-chroot/build/make-streams.sh
+sudo chroot build/cross-chroot \
+  bash /build/make-streams.sh /build/streams
 
 # 2. Đẩy sang board
+ssh board 'mkdir -p ~/streams'
 tar -C build/cross-chroot/build/streams -cf - . | ssh board 'tar -C ~/streams -xf -'
 scp spike/va-decode-test/compare.sh board:~/
 
@@ -39,6 +43,7 @@ Không phải bộ conformance codec. Mỗi stream nhắm một thứ đã từn
 | `hevc-idr-every-5` | như trên, phía HEVC |
 | `vp9-profile0-repeated` | reset/kế thừa probability context qua nhiều GOP |
 | `vp9-profile0-tiles` | compressed header và tile layout nhiều cột |
+| `vp9-profile2-*` | fixture tạm giữ cho raw V4L2/zero-copy NV15 về sau; VA test hiện skip |
 
 **Clip ngắn một GOP không chứng minh được gì.** Lỗi DPB-có-lỗ để GOP đầu hoàn
 hảo và chỉ hỏng từ sau IDR thứ hai.
@@ -84,6 +89,85 @@ patch kernel `0008`, làm H.264 4K bị `-EBUSY` khi gửi SPS đầu tiên. Sau
 build lại đủ queue, chính file Chrome đã fallback
 `bbb_sunflower_2160p_60fps_normal.mp4` PASS 120/120 frame bit-identical ở
 3840x2160. HEVC 1080p PASS 60/60 và cả hai ca VP9 ở trên vẫn PASS.
+
+## VP9 Profile 2: fixture tạm hoãn
+
+Kernel vẫn hỗ trợ control VP9 Profile 2 và CAPTURE NV15, nhưng VA driver không
+quảng bá Profile 2 và không còn đường CPU staging NV15→P010. `compare.sh` vì
+vậy in `SKIP (Profile 2 intentionally not advertised)` cho các file này; bộ
+regression đang hoạt động là 14 stream H.264/HEVC và 2 stream VP9 Profile 0.
+
+Mặc định `make-streams.sh` không sinh fixture Profile 2. Khi cần kiểm raw V4L2
+hoặc phát triển đường Chrome zero-copy sau này, bật rõ ràng:
+
+```bash
+GENERATE_VP9_PROFILE2=1 bash make-streams.sh /build/streams
+```
+
+Ba IVF vẫn được kiểm bằng `ffprobe` để bảo đảm đúng VP9 Profile 2,
+`yuv420p10le` và visible size; file WebM chỉ là remux có `streamhash` giống
+bitstream IVF.
+
+### Probe Mesa/EGL cho zero-copy NV15
+
+Probe này phân biệt rõ ba khái niệm thường bị gộp thành “Mesa có hỗ trợ”:
+format có trong query, GBM có tự cấp BO được, và một dma-buf do producer khác
+cấp có thật sự import + sample được hay không.
+
+```bash
+# Sysroot cross-build cần libgles2-mesa-dev:arm64 bên cạnh EGL/GBM/libdrm.
+spike/va-decode-test/build-nv15-egl-probe.sh
+scp build/nv15-egl-probe board:/tmp/
+ssh board '/tmp/nv15-egl-probe /dev/dri/renderD128'
+```
+
+Pass thật cho NV15 phải có cả hai trường sau, không chỉ `import=yes`:
+
+```text
+EGL NV15: actual_import=yes ... external_sample=yes rgba=130,130,130,255
+```
+
+Probe dùng surfaceless GLES2 context và FBO riêng vì EGL/GBM trên board không
+có PBuffer config. Ảnh đầu vào là Y=U=V=512 được pack theo nhóm 4 sample/5
+byte, nên kết quả phải là xám trung tính. `GBM NV15: create=no` không phải lỗi
+decode: rkvdec là producer của dma-buf, Mesa chỉ cần import và đã làm được.
+
+Kết luận và hai phép A/B Chrome nằm trong `docs/VA-DRIVER-DESIGN.md`, mục
+“Điều tra zero-copy NV15”.
+
+Kiểm metadata stream vừa sinh:
+
+```bash
+sudo chroot build/cross-chroot bash -c '
+  for f in /build/streams/vp9-profile2-*.ivf; do
+    ffprobe -v error -select_streams v:0 \
+      -show_entries stream=codec_name,profile,pix_fmt,width,height \
+      -of default=nw=1 "$f"
+  done
+'
+```
+
+Mỗi file phải là VP9 `Profile 2`, `yuv420p10le`; file `854x482` phải giữ đúng
+visible size đó.
+
+### Checklist chính sách trên board
+
+- `vainfo` phải có `VAProfileVP9Profile0` nhưng không có
+  `VAProfileVP9Profile2`.
+- `v4l2-ctl` trên node rkvdec vẫn phải có menu control VP9 Profile 2; sau khi
+  chọn Profile 2, CAPTURE vẫn advertise NV15. Đây là bằng chứng phần cứng không
+  bị tắt, chỉ lớp VA bị ẩn.
+- `compare.sh` phải PASS đủ 16 stream H.264/HEVC/VP9 Profile 0. Nếu thư mục còn
+  ba IVF Profile 2 cũ, chúng phải hiện thành policy SKIP chứ không chạy VA.
+- Với Chrome, Profile 0/H.264/HEVC vẫn phải dùng `VaapiVideoDecoder`. Nội dung
+  Profile 2 có thể bị Chrome tự fallback sang `FFmpegVideoDecoder`; fallback
+  đó thuộc Chrome, không phải CPU staging trong VA driver.
+
+Kết quả sau khi gỡ staging ngày 2026-09-10: `pass=16 fail=0 skip=3`.
+Chrome phát luân phiên VP9 Profile 0/H.264 cho canvas `14400/14400` pixel khác
+đen, GPU process còn sống và IRQ rkvdec tăng `+553`. Khi ép mở trực tiếp WebM
+Profile 2, video vẫn chạy nhưng IRQ tăng `0`: Chrome đã dùng đường software
+của chính nó, không đi qua VA/rkvdec.
 
 ## Độ phân giải cao
 

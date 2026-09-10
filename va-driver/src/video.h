@@ -36,10 +36,13 @@ struct video_format {
 	uint64_t drm_modifier;
 	unsigned int planes_count;
 	unsigned int bpp;
+	unsigned int height_alignment;
 };
 
 struct video_format *video_format_find_mplane(unsigned int pixelformat,
 					      bool mplane);
 bool video_format_is_linear(struct video_format *format);
+unsigned int video_format_storage_height(struct video_format *format,
+					 unsigned int height);
 
 #endif

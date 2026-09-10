@@ -43,7 +43,8 @@ static struct video_format formats[] = {
 		.drm_format		= DRM_FORMAT_NV12,
 		.drm_modifier		= DRM_FORMAT_MOD_NONE,
 		.planes_count		= 2,
-		.bpp			= 16,
+		.bpp			= 12,
+		.height_alignment	= 1,
 	},
 	{
 		.description		= "NV12 YUV",
@@ -53,7 +54,8 @@ static struct video_format formats[] = {
 		.drm_format		= DRM_FORMAT_NV12,
 		.drm_modifier		= DRM_FORMAT_MOD_NONE,
 		.planes_count		= 2,
-		.bpp			= 16,
+		.bpp			= 12,
+		.height_alignment	= 1,
 	},
 	{
 		.description		= "Sunxi tiled NV12 YUV",
@@ -63,7 +65,8 @@ static struct video_format formats[] = {
 		.drm_format		= DRM_FORMAT_NV12,
 		.drm_modifier		= DRM_FORMAT_MOD_ALLWINNER_TILED,
 		.planes_count		= 2,
-		.bpp			= 16
+		.bpp			= 12,
+		.height_alignment	= 1,
 	},
 };
 
@@ -88,4 +91,19 @@ bool video_format_is_linear(struct video_format *format)
 		return true;
 
 	return format->drm_modifier == DRM_FORMAT_MOD_NONE;
+}
+
+unsigned int video_format_storage_height(struct video_format *format,
+					 unsigned int height)
+{
+	unsigned int alignment;
+
+	if (format == NULL)
+		return height;
+
+	alignment = format->height_alignment;
+	if (alignment <= 1)
+		return height;
+
+	return (height + alignment - 1) & ~(alignment - 1);
 }

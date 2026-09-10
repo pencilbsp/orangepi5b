@@ -530,15 +530,22 @@ static int fill_vp9_frame(struct v4l2_ctrl_vp9_frame *frame,
 {
 	const VADecPictureParameterBufferVP9 *pic =
 		&surface->params.vp9.picture;
+	struct object_config *config = CONFIG(driver_data, context->config_id);
 	struct vp9_persistent_state *state = &context->vp9_state;
 	struct vp9_parsed_header parsed;
+	bool profile_matches;
 	int rc;
 
-	if (pic->profile != 0 || pic->bit_depth != 8 ||
+	profile_matches = config != NULL &&
+		config->profile == VAProfileVP9Profile0 &&
+		pic->profile == 0 && pic->bit_depth == 8;
+	if (!profile_matches ||
 	    !pic->pic_fields.bits.subsampling_x ||
 	    !pic->pic_fields.bits.subsampling_y ||
 	    pic->frame_width == 0 || pic->frame_height == 0) {
-		request_log("VP9: only Profile 0, 8-bit 4:2:0 is supported\n");
+		request_log("VP9: profile/bit-depth/config mismatch (VA %d, stream %u/%u-bit)\n",
+			    config != NULL ? config->profile : VAProfileNone,
+			    pic->profile, pic->bit_depth);
 		return -EINVAL;
 	}
 

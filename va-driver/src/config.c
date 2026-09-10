@@ -36,8 +36,6 @@
 #include <sys/ioctl.h>
 
 #include <linux/videodev2.h>
-
-
 #include "context.h"
 #include "utils.h"
 #include "v4l2.h"
@@ -171,6 +169,11 @@ VAStatus RequestCreateConfig(VADriverContextP context, VAProfile profile,
 
 	for (i = 0; i < attributes_count; i++) {
 		if (attributes[i].type == VAConfigAttribRTFormat) {
+			if (attributes[i].value != VA_RT_FORMAT_YUV420) {
+				object_heap_free(&driver_data->config_heap,
+						 (struct object_base *)config_object);
+				return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+			}
 			config_object->attributes[0].value = attributes[i].value;
 			continue;
 		}
@@ -222,9 +225,10 @@ VAStatus RequestQueryConfigProfiles(VADriverContextP context,
 	 *   AV1, VP8          - out of scope; AV1 lives on a different block
 	 *   H264 Multiview /
 	 *   Stereo High       - rkvdec decodes a single view
-	 *   HEVC Main 10      - the hardware manages it, but rkvdec only emits
-	 *                       NV15 and libva has no FOURCC for that layout,
-	 *                       so there is nothing to hand a client
+	 *   HEVC Main 10      - not wired through this VA backend
+	 *   VP9 Profile 2     - kernel/NV15 support remains enabled, but the VA
+	 *                       path stays hidden until Chrome preserves the
+	 *                       physical DRM fourcc end to end
 	 */
 	found = v4l2_find_format_any(driver_data->video_fd,
 				     V4L2_PIX_FMT_H264_SLICE);
@@ -239,12 +243,10 @@ VAStatus RequestQueryConfigProfiles(VADriverContextP context,
 	if (found && index < (V4L2_REQUEST_MAX_PROFILES - 1))
 		profiles[index++] = VAProfileHEVCMain;
 
-	/* VDPU381 exposes only Profile 0 and produces 8-bit NV12. */
 	found = v4l2_find_format_any(driver_data->video_fd,
 				     V4L2_PIX_FMT_VP9_FRAME);
-	if (found && index < (V4L2_REQUEST_MAX_PROFILES - 1))
+	if (found && index < V4L2_REQUEST_MAX_PROFILES)
 		profiles[index++] = VAProfileVP9Profile0;
-
 	*profiles_count = index;
 
 	return VA_STATUS_SUCCESS;
@@ -326,6 +328,7 @@ VAStatus RequestGetConfigAttributes(VADriverContextP context, VAProfile profile,
 	struct v4l2_frame_limits limits;
 	unsigned int pixelformat;
 	bool have_limits = false;
+	bool supported_decode = false;
 	int i;
 
 	if (entrypoint == VAEntrypointEncSlice && config_profile_is_h264(profile) &&
@@ -339,14 +342,17 @@ VAStatus RequestGetConfigAttributes(VADriverContextP context, VAProfile profile,
 		return VA_STATUS_SUCCESS;
 	}
 
-	if (profile_to_pixelformat(profile, &pixelformat) == 0)
+	supported_decode = entrypoint == VAEntrypointVLD &&
+		profile_to_pixelformat(profile, &pixelformat) == 0;
+	if (supported_decode)
 		have_limits = v4l2_get_frame_sizes(driver_data->video_fd,
 						   pixelformat, &limits) == 0;
 
 	for (i = 0; i < attributes_count; i++) {
 		switch (attributes[i].type) {
 		case VAConfigAttribRTFormat:
-			attributes[i].value = VA_RT_FORMAT_YUV420;
+			attributes[i].value = supported_decode ?
+				VA_RT_FORMAT_YUV420 : VA_ATTRIB_NOT_SUPPORTED;
 			break;
 
 		/*

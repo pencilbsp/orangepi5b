@@ -1,4 +1,4 @@
-# VA-API driver cho RK3588S — thiết kế, phạm vi H.264 + HEVC + VP9
+# VA-API driver cho RK3588S — thiết kế H.264 + HEVC + VP9
 
 Tài liệu này rút bài học từ queue 37 patch của project tham chiếu
 (`/root/orangepi5b/patches/libva-v4l2-request/ed4bc90/`) để **viết mới**, không
@@ -9,16 +9,16 @@ Nguồn: `README.md` (1088 dòng) của queue đó, cộng nội dung từng pat
 
 ## Phạm vi
 
-Chỉ **H.264, HEVC và VP9 Profile 0 decode**, chỉ **rkvdec (VDPU381)**,
-chỉ **8-bit NV12**.
+VA driver chỉ quảng bá **H.264, HEVC Main và VP9 Profile 0 decode**, chỉ qua
+**rkvdec (VDPU381)** và 8-bit NV12. Kernel vẫn giữ VP9 Profile 2 + NV15 để
+phần cứng sẵn sàng cho client có thể truyền đúng DRM fourcc end-to-end.
 
-Không làm: AV1, VP8, VP9 Profile 2, MPEG-2, 10-bit, multi-core. Cắt được vì:
+Không làm: AV1, VP8, VP9 Profile 1/2/3 qua VA, MPEG-2, HEVC Main 10,
+multi-core. Cắt được vì:
 - AV1 nằm trên block Hantro khác, node khác — logic chọn thiết bị đa codec biến mất
-- 10-bit HEVC bị chặn ở **biểu diễn format**, không phải silicon: rkvdec chỉ ra
-  NV15 (layout 10-bit nén chặt của Rockchip) và **libva không có FOURCC cho NV15**
-  (`P010`, `P016`, `I010` có; NV15 không). rkvdec không có postprocessor để
-  chuyển. Nên không có gì để đưa cho client
-- backend VP9 hiện chỉ có NV12/Profile 0; Profile 2 cần đường output 10-bit
+- VP9 Profile 2 và HEVC Main 10 cần NV15 end-to-end. Không dùng CPU staging
+  NV15→P010 vì nó phá zero-copy và không giữ được 1080p60 ổn định trong Chrome
+- VP9 Profile 1/3 cần chroma 4:2:2 hoặc 4:4:4 mà backend VDPU381 này không hỗ trợ
 - MPEG-2 trong base là stub 19 dòng
 
 ## Nguyên tắc bao trùm
@@ -152,9 +152,9 @@ bước hai, chỉ kích hoạt khi `num_short_term_ref_pic_sets != 0`.**
 ## VP9 Profile 0 — bắt đầu 2026-09-10
 
 Đường này cần cả hai nửa. Patch kernel `0012` đăng ký `VP9_FRAME` và hai
-control stateless trên VDPU381; VA driver chỉ quảng cáo `VAProfileVP9Profile0`
-khi chính node đã advertise format đó. Như vậy kernel cũ không làm Chrome chọn
-nhầm một backend chưa tồn tại.
+control stateless trên VDPU381; VA driver chỉ quảng cáo Profile 0 khi node có
+format VP9. Như vậy kernel cũ không làm Chrome chọn nhầm một backend chưa tồn
+tại.
 
 VP9 khác H.264/HEVC ở ba điểm:
 
@@ -168,9 +168,91 @@ VP9 khác H.264/HEVC ở ba điểm:
   `VIDIOC_S_EXT_CTRLS`; tách làm hai lần khiến probability context trôi ở các
   inter frame.
 
-Chỉ nhận profile 0, 8-bit, 4:2:0. Profile 2 không được quảng cáo vì backend
-kernel hiện chỉ sinh NV12. Reference timestamp cũng bị giới hạn vào đúng
-decoder session, tránh vô tình tham chiếu surface của context khác.
+Profile 0 nhận 8-bit 4:2:0 và xuất NV12. Reference timestamp cũng bị giới hạn
+vào đúng decoder session, tránh vô tình tham chiếu surface của context khác.
+
+### Profile 2 tạm hoãn: giữ phần cứng, ẩn khỏi VA
+
+Profile 2 vẫn là 4:2:0 nhưng mỗi component có 10 bit. VDPU381 ghi **NV15**:
+bốn sample 10-bit được đóng liên tiếp trong một word 40-bit/five-byte group.
+P010 lại dùng một word little-endian 16-bit cho mỗi sample, với 10 bit dữ liệu
+nằm ở phía MSB. Hai format chứa cùng giá trị pixel nhưng **không cùng layout**;
+gắn nhãn P010 trực tiếp lên dmabuf NV15 sẽ cho ảnh sai và còn làm client đọc
+quá kích thước plane.
+
+libva không có VA FOURCC cho NV15, còn Chrome hiện chỉ hiểu định danh logic
+P010 và làm mất `layers[].drm_format = DRM_FORMAT_NV15` trước khi tạo EGLImage.
+Không thể gắn nhãn P010 lên buffer NV15 vì layout và kích thước khác nhau.
+
+Đường thử nghiệm trước đây unpack NV15→P010 qua CPU cho kết quả bit-exact,
+nhưng chỉ đạt khoảng 17 fps scalar, 37.82 fps NEON một luồng và 64.66 fps với
+ba worker big-core trong benchmark riêng. Khi cộng compositor và JavaScript,
+1080p60 bị dropped frame sau vài giây. Vì vậy đường staging đó đã bị gỡ hoàn
+toàn; không còn cấp phát P010 presentation buffer, CPU unpack hay P010 export
+trong VA driver.
+
+Ranh giới hiện tại:
+
+- patch kernel `0012`, control V4L2 Profile 2 và CAPTURE NV15 vẫn giữ nguyên;
+- `vaQueryConfigProfiles` không quảng bá `VAProfileVP9Profile2`;
+- tạo config Profile 2 hoặc surface `VA_RT_FORMAT_YUV420_10` bị từ chối;
+- Chrome có thể tự chọn software decoder; VA driver không thực hiện fallback
+  hay copy qua CPU.
+
+### Điều tra zero-copy NV15 — 2026-09-10
+
+`spike/va-decode-test/nv15-egl-probe.c` kiểm riêng đường dma-buf của
+Mesa/Panthor, không đi qua VA driver. Probe cấp một dma-buf từ system heap,
+điền ảnh xám đúng layout của NV12, NV15 hoặc P010, gọi `eglCreateImageKHR`,
+bind nó vào `GL_TEXTURE_EXTERNAL_OES`, render qua shader và đọc lại một pixel.
+Trên `/dev/dri/renderD128`, cả ba format đều import và sample được:
+
+```text
+EGL NV12: actual_import=yes external_sample=yes rgba=130,130,130,255
+EGL NV15: actual_import=yes external_sample=yes rgba=130,130,130,255
+EGL P010: actual_import=yes external_sample=yes rgba=129,130,129,255
+```
+
+Mesa liệt kê ba modifier cho NV15, gồm linear `0x0`, và đánh dấu cả ba
+`external=yes`. Điều này xác nhận đường hợp lệ là một composed external image;
+không được giả vờ rằng hai plane packed là các texture R16/GR1616 độc lập.
+
+GBM không cấp phát được NV15 (`gbm_bo_create`: `EINVAL`), nhưng đó không phải
+blocker cho decode: V4L2 đã cấp dma-buf và Chrome chỉ cần Mesa **import** nó.
+KMS cũng advertise NV15 linear. Vì vậy kernel dma-buf, Mesa EGL và shader
+external sampler đã đủ khả năng cho zero-copy NV15.
+
+Blocker nằm trong Chrome 152.0.7977.82. Hai phép A/B với chế độ export thử
+nghiệm của VA driver đã cô lập được từng lớp:
+
+1. Khi `VADRMPRIMESurfaceDescriptor.fourcc` là NV15, Chrome tạo rồi huỷ
+   `VaapiVideoDecoder` trước frame đầu tiên; IRQ rkvdec tăng 0. Mã nguồn đúng
+   tag chỉ ánh xạ `IMC3`, `NV12`, `P010`, `ARGB` trong
+   `VaapiWrapper::ExportVASurfaceAsNativePixmapDmaBufUnwrapped()`.
+2. Khi giữ fourcc logic là P010 và trả hai plane NV15 để vừa giả định
+   `SEPARATE_LAYERS` của Chrome, decode phần cứng chạy (`IRQ +273`) nhưng canvas
+   đen hoàn toàn. Log lặp lại `Failed to create EGLImage` vì Chrome bỏ
+   `layers[].drm_format = DRM_FORMAT_NV15`, dựng `SharedImageFormat::kP010`,
+   rồi EGL binding gửi `DRM_FORMAT_P010` cùng pitch/offset của NV15.
+
+Một patch zero-copy đúng không thể chỉ thêm một `case VA_FOURCC_NV15`. Nó phải
+giữ **hai danh tính** xuyên suốt pipeline: pixel logic vẫn là 10-bit YUV420
+(để `VideoFrame`/màu sắc hoạt động như P010), còn storage DRM là NV15 (để EGL
+nhận đúng packed layout). Tối thiểu cần:
+
+- làm exporter VA đọc cả `layer.drm_format` và mọi plane của một composed
+  layer, thay vì giả định mỗi layer luôn đúng một plane;
+- mang DRM fourcc vật lý trong `NativePixmap`/`GpuMemoryBufferHandle` qua
+  SharedImage creation, độc lập với `SharedImageFormat` logic;
+- cho `NativePixmapEGLBinding` dùng DRM fourcc vật lý đó khi tạo EGLImage;
+- thêm validation/test cho stride NV15 10 bpp, không áp row-bytes 16 bpp của
+  P010 lên handle;
+- giữ `PrefersExternalSampler`, vì tách NV15 thành texture R16/GR1616 theo
+  plane là sai layout; Mesa phải sample ảnh NV15 composed.
+
+Image hiện ship Google Chrome binary nên repo không thể kiểm chứng patch
+Chromium này bằng cách sửa VA driver. Các fixture Profile 2 và probe EGL NV15
+vẫn được giữ cho lần triển khai sau, nhưng `compare.sh` chủ động skip chúng.
 
 ### Regression khi triển khai VP9 — 2026-09-10
 
@@ -485,9 +567,12 @@ mpv/VLC — board không cài hai thứ đó nên chưa kiểm được. **Đừ
 |---|---|
 | Khung driver, khoá, context tự mở node | **xong** |
 | Xếp hạng thiết bị, chọn rkvdec | **xong** |
-| H.264 + HEVC, bit-exact 18/18 stream | **xong**; H.264 4K regression `0008` đã retest 2026-09-10 |
+| H.264 + HEVC, bit-exact 14/14 stream | **xong**; H.264 4K regression `0008` đã retest 2026-09-10 |
 | VP9 Profile 0: kernel + VA driver cross-build | **xong** 2026-09-10 |
 | VP9 Profile 0: vainfo/FFmpeg/Chrome trên board | **xong** 2026-09-10 — bit-exact 2/2, Chrome dùng `VaapiVideoDecoder` |
+| VP9 Profile 2: kernel control + NV15 CAPTURE | **giữ nguyên** — raw V4L2 vẫn có capability phần cứng |
+| VP9 Profile 2 qua VA/Chrome | **tạm tắt** — không quảng bá; đã gỡ CPU staging NV15→P010 |
+| Zero-copy NV15 qua Mesa | Mesa **xong**; Chrome 152 còn làm mất DRM fourcc vật lý trước EGL, cần Chromium downstream build |
 | Buffer sizing theo độ phân giải (8K) | **xong** |
 | Chrome: export surface chưa bind, separate layers | **xong** |
 | Hai luồng đồng thời, bit-exact | **xong** |
@@ -510,6 +595,7 @@ mpv/VLC — board không cài hai thứ đó nên chưa kiểm được. **Đừ
 7. Buffer sizing theo độ phân giải
 8. Chrome: export surface chưa bind, separate layers
 9. Concurrent decode: hai stream một VADisplay
+10. VP9 Profile 2: chỉ bật VA sau khi Chrome giữ được NV15 DRM fourcc end-to-end
 
 **Không bỏ qua bước 4.** Lỗi DPB-có-lỗ chỉ lộ ra khi so bit-exact trên stream có
 IDR thứ hai; clip ngắn một GOP luôn đúng.

@@ -38,6 +38,8 @@
 #include "vp9.h"
 
 #include <assert.h>
+#include <limits.h>
+#include <stdint.h>
 #include <string.h>
 
 #include <errno.h>
@@ -68,7 +70,10 @@ static int bind_source_buffer(struct decoder_session *session,
 	int rc;
 
 	if (surface_object->source_index != SURFACE_INDEX_UNASSIGNED)
-		return 0;
+		return surface_object->session == session &&
+		       surface_object->source_data != NULL ? 0 : -1;
+	if (surface_object->session != NULL && surface_object->session != session)
+		return -1;
 
 	if (session->free_output_count == 0 &&
 	    session->next_output_buf >= session->num_output_buffers) {
@@ -89,17 +94,28 @@ static int bind_source_buffer(struct decoder_session *session,
 			       surface_object->source_index, &length, &offset,
 			       1);
 	if (rc < 0)
-		return -1;
+		goto error;
+	if (length == 0)
+		goto error;
 
 	surface_object->source_data = mmap(NULL, length,
 					   PROT_READ | PROT_WRITE, MAP_SHARED,
 					   session->video_fd, offset);
 	if (surface_object->source_data == MAP_FAILED) {
 		surface_object->source_data = NULL;
-		return -1;
+		goto error;
 	}
 	surface_object->source_size = length;
 	return 0;
+
+error:
+	if (session->free_output_count < DECODER_SESSION_MAX_BUFFERS)
+		session->free_output[session->free_output_count++] =
+			surface_object->source_index;
+	surface_object->source_index = SURFACE_INDEX_UNASSIGNED;
+	surface_object->source_data = NULL;
+	surface_object->source_size = 0;
+	return -1;
 }
 
 /*
@@ -130,16 +146,34 @@ static void release_source_buffer(struct decoder_session *session,
 int request_bind_destination_buffer(struct decoder_session *session,
 				    struct object_surface *surface_object)
 {
-	struct video_format *video_format = session->video_format;
+	struct video_format *video_format;
 	unsigned int capture_type, format_width, format_height;
 	unsigned int destination_sizes[VIDEO_MAX_PLANES] = { 0 };
 	unsigned int destination_bytesperlines[VIDEO_MAX_PLANES] = { 0 };
-	unsigned int destination_planes_count = video_format->planes_count;
+	unsigned int destination_planes_count;
+	unsigned int storage_height;
+	uint64_t luma_size;
+	uint64_t chroma_size;
+	uint64_t image_size;
+	bool set_session = false;
 	unsigned int j;
 	int rc;
 
+	if (session == NULL || surface_object == NULL ||
+	    session->video_format == NULL)
+		return -1;
+	video_format = session->video_format;
+	destination_planes_count = video_format->planes_count;
+	if (video_format->v4l2_buffers_count == 0 ||
+	    video_format->v4l2_buffers_count > VIDEO_MAX_PLANES ||
+	    destination_planes_count == 0 ||
+	    destination_planes_count > VIDEO_MAX_PLANES)
+		return -1;
+
 	if (surface_object->destination_index != SURFACE_INDEX_UNASSIGNED)
-		return 0;
+		return surface_object->session == session ? 0 : -1;
+	if (surface_object->session != NULL && surface_object->session != session)
+		return -1;
 
 	if (session->free_capture_count == 0 &&
 	    session->next_capture_buf >= session->num_capture_buffers) {
@@ -156,6 +190,7 @@ int request_bind_destination_buffer(struct decoder_session *session,
 			     NULL);
 	if (rc < 0)
 		return -1;
+	(void)format_width;
 
 	if (session->free_capture_count > 0)
 		surface_object->destination_index =
@@ -163,7 +198,10 @@ int request_bind_destination_buffer(struct decoder_session *session,
 	else
 		surface_object->destination_index = session->next_capture_buf++;
 	/* Remember where the buffer came from: only this session can use it. */
-	surface_object->session = session;
+	if (surface_object->session == NULL) {
+		surface_object->session = session;
+		set_session = true;
+	}
 	surface_object->destination_buffers_count =
 		video_format->v4l2_buffers_count;
 	surface_object->destination_planes_count = destination_planes_count;
@@ -174,9 +212,11 @@ int request_bind_destination_buffer(struct decoder_session *session,
 			       surface_object->destination_map_offsets,
 			       video_format->v4l2_buffers_count);
 	if (rc < 0)
-		return -1;
+		goto error;
 
 	for (j = 0; j < video_format->v4l2_buffers_count; j++) {
+		if (surface_object->destination_map_lengths[j] == 0)
+			goto error;
 		surface_object->destination_map[j] =
 			mmap(NULL,
 			     surface_object->destination_map_lengths[j],
@@ -185,29 +225,52 @@ int request_bind_destination_buffer(struct decoder_session *session,
 			     surface_object->destination_map_offsets[j]);
 		if (surface_object->destination_map[j] == MAP_FAILED) {
 			surface_object->destination_map[j] = NULL;
-			return -1;
+			goto error;
 		}
 	}
 
 	if (video_format->v4l2_buffers_count == 1) {
-		destination_sizes[0] = destination_bytesperlines[0] *
-				       format_height;
-		for (j = 1; j < destination_planes_count; j++)
-			destination_sizes[j] = destination_sizes[0] / 2;
+		/* This semi-planar capture format is one memory plane with two
+		 * component planes. VDPU381 starts chroma after the hardware-aligned
+		 * luma body, not after visible_height rows. */
+		if (destination_planes_count != 2 ||
+		    destination_bytesperlines[0] == 0)
+			goto error;
 
-		for (j = 0; j < destination_planes_count; j++) {
-			surface_object->destination_offsets[j] =
-				j > 0 ? destination_sizes[j - 1] : 0;
-			surface_object->destination_data[j] =
-				(unsigned char *)surface_object->destination_map[0] +
-				surface_object->destination_offsets[j];
-			surface_object->destination_sizes[j] =
-				destination_sizes[j];
-			surface_object->destination_bytesperlines[j] =
-				destination_bytesperlines[0];
+		storage_height = video_format_storage_height(video_format,
+						     format_height);
+		if (storage_height == 0)
+			goto error;
+
+		luma_size = (uint64_t)destination_bytesperlines[0] *
+			    storage_height;
+		chroma_size = (uint64_t)destination_bytesperlines[0] *
+			      ((storage_height + 1) / 2);
+		image_size = luma_size + chroma_size;
+		if (luma_size > UINT_MAX || chroma_size > UINT_MAX ||
+		    image_size > surface_object->destination_map_lengths[0]) {
+			request_log("picture: decoded layout exceeds CAPTURE mapping\n");
+			goto error;
 		}
+
+		surface_object->destination_offsets[0] = 0;
+		surface_object->destination_offsets[1] = (unsigned int)luma_size;
+		surface_object->destination_data[0] =
+			surface_object->destination_map[0];
+		surface_object->destination_data[1] =
+			(unsigned char *)surface_object->destination_map[0] +
+			luma_size;
+		surface_object->destination_sizes[0] = (unsigned int)luma_size;
+		surface_object->destination_sizes[1] = (unsigned int)chroma_size;
+		surface_object->destination_bytesperlines[0] =
+			destination_bytesperlines[0];
+		surface_object->destination_bytesperlines[1] =
+			destination_bytesperlines[0];
 	} else if (video_format->v4l2_buffers_count == destination_planes_count) {
 		for (j = 0; j < destination_planes_count; j++) {
+			if (destination_sizes[j] >
+			    surface_object->destination_map_lengths[j])
+				goto error;
 			surface_object->destination_offsets[j] = 0;
 			surface_object->destination_data[j] =
 				surface_object->destination_map[j];
@@ -217,10 +280,44 @@ int request_bind_destination_buffer(struct decoder_session *session,
 				destination_bytesperlines[j];
 		}
 	} else {
-		return -1;
+		goto error;
 	}
 
 	return 0;
+
+error:
+	for (j = 0; j < video_format->v4l2_buffers_count; j++) {
+		if (surface_object->destination_map[j] != NULL &&
+		    surface_object->destination_map[j] != MAP_FAILED &&
+		    surface_object->destination_map_lengths[j] > 0)
+			munmap(surface_object->destination_map[j],
+			       surface_object->destination_map_lengths[j]);
+	}
+	if (surface_object->destination_index != SURFACE_INDEX_UNASSIGNED &&
+	    session->free_capture_count < DECODER_SESSION_MAX_BUFFERS)
+		session->free_capture[session->free_capture_count++] =
+			surface_object->destination_index;
+
+	surface_object->destination_index = SURFACE_INDEX_UNASSIGNED;
+	surface_object->destination_buffers_count = 0;
+	surface_object->destination_planes_count = 0;
+	memset(surface_object->destination_map, 0,
+	       sizeof(surface_object->destination_map));
+	memset(surface_object->destination_map_lengths, 0,
+	       sizeof(surface_object->destination_map_lengths));
+	memset(surface_object->destination_map_offsets, 0,
+	       sizeof(surface_object->destination_map_offsets));
+	memset(surface_object->destination_data, 0,
+	       sizeof(surface_object->destination_data));
+	memset(surface_object->destination_sizes, 0,
+	       sizeof(surface_object->destination_sizes));
+	memset(surface_object->destination_offsets, 0,
+	       sizeof(surface_object->destination_offsets));
+	memset(surface_object->destination_bytesperlines, 0,
+	       sizeof(surface_object->destination_bytesperlines));
+	if (set_session)
+		surface_object->session = NULL;
+	return -1;
 }
 
 static VAStatus codec_store_buffer(struct request_data *driver_data,
@@ -402,6 +499,7 @@ static bool session_matches_context(struct decoder_session *session,
 	return session->video_format != NULL &&
 	       session->num_capture_buffers > 0 &&
 	       session->programmed_pixelformat == pixelformat &&
+	       session->programmed_profile == config_object->profile &&
 	       session->programmed_width == context_object->picture_width &&
 	       session->programmed_height == context_object->picture_height;
 }
@@ -477,6 +575,19 @@ static int context_adopt_probe_session(struct request_data *driver_data,
 	return 0;
 }
 
+static bool picture_surface_matches_config(struct object_surface *surface,
+					   struct object_config *config,
+					   bool encoder)
+{
+	enum surface_role expected_role = encoder ? SURFACE_ROLE_ENCODE :
+						 SURFACE_ROLE_DECODE;
+
+	return surface->rt_format == VA_RT_FORMAT_YUV420 &&
+	       surface->pixel_format == VA_FOURCC_NV12 &&
+	       (surface->role == SURFACE_ROLE_UNKNOWN ||
+		surface->role == expected_role);
+}
+
 VAStatus RequestBeginPicture(VADriverContextP context, VAContextID context_id,
 			     VASurfaceID surface_id)
 {
@@ -497,6 +608,9 @@ VAStatus RequestBeginPicture(VADriverContextP context, VAContextID context_id,
 
 	surface_object = SURFACE(driver_data, surface_id);
 	if (surface_object == NULL)
+		return VA_STATUS_ERROR_INVALID_SURFACE;
+	if (!picture_surface_matches_config(surface_object, config_object,
+					    context_object->is_encoder))
 		return VA_STATUS_ERROR_INVALID_SURFACE;
 
 	/*
@@ -529,8 +643,11 @@ VAStatus RequestBeginPicture(VADriverContextP context, VAContextID context_id,
 					config_object, surface_object) < 0)
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 
-	if (surface_object->status == VASurfaceRendering)
-		RequestSyncSurface(context, surface_id);
+	if (surface_object->status == VASurfaceRendering) {
+		status = RequestSyncSurface(context, surface_id);
+		if (status != VA_STATUS_SUCCESS)
+			return status;
+	}
 
 	rc = bind_source_buffer(&context_object->session, surface_object);
 	if (rc < 0)
