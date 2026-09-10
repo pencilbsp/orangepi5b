@@ -1712,11 +1712,11 @@ diff -uNr -x '.*' -x '*.o' -x '*.ko' -x '*.mod' -x '*.mod.c' -x modules.order -x
 +					      DIV_ROUND_UP(ctx->src_fmt.height, 16),
 +					      ctx->fps_num, ctx->fps_den);
 +
-+	dev_info(enc->dev,
-+		 "job: src %pad+%pad bs %pad+%u/%u recon %pad body %pad thumb %pad\n",
-+		 &job.src_y, &job.src_c, &job.bs_base, job.bs_offset,
-+		 job.bs_size, &job.recon_hdr, &job.recon_body,
-+		 &job.recon_thumb);
++	dev_dbg(enc->dev,
++		"job: src %pad+%pad bs %pad+%u/%u recon %pad body %pad thumb %pad\n",
++		&job.src_y, &job.src_c, &job.bs_base, job.bs_offset,
++		job.bs_size, &job.recon_hdr, &job.recon_body,
++		&job.recon_thumb);
 +
 +	/*
 +	 * STREAMOFF may race the m2m scheduler after it selected this context
