@@ -57,14 +57,19 @@
  *
  * But the pool cannot be a constant. An 8K NV12 frame is about 50 MiB, so 64
  * of them would ask for 3.2 GiB from a 512 MiB CMA region -- the allocation
- * fails and the stream never starts. Scale the depth down as frames grow, and
- * never below what the codec's reference handling actually needs.
+ * fails and the stream never starts. Scale the CAPTURE depth down as frames
+ * grow, and never below what the codec's reference handling actually needs.
+ *
+ * OUTPUT is different: decoding is synchronous and picture.c releases the
+ * compressed-frame slot as soon as the request completes. Three OUTPUT slots
+ * therefore suffice and, at 4 MiB each for 4K, leave enough CMA for the 32
+ * live CAPTURE surfaces Chrome reaches while presenting a 4K stream.
  */
-#define POOL_MAX_BUFFERS	64u
+#define POOL_MAX_BUFFERS	DECODER_SESSION_MAX_BUFFERS
 #define POOL_MIN_BUFFERS	20u
 /* Below this the pool cannot hold a reference frame and the current one. */
 #define POOL_FLOOR_BUFFERS	3u
-#define POOL_BUDGET_BYTES	(192u * 1024u * 1024u)
+#define POOL_BUDGET_BYTES	(384u * 1024u * 1024u)
 
 static unsigned int pool_depth(int width, int height)
 {
@@ -81,6 +86,30 @@ static unsigned int pool_depth(int width, int height)
 		depth = POOL_MIN_BUFFERS;
 
 	return depth;
+}
+
+/*
+ * REQBUFS may fail outright when CMA is fragmented instead of returning a
+ * smaller allocation. Try the desired size first, then retreat. Values above
+ * @want are skipped; the ladder is fallback policy, not implicit rounding.
+ */
+static int request_buffers_backoff(int video_fd, unsigned int type,
+				   unsigned int want, unsigned int *count)
+{
+	static const unsigned int ladder[] = { 64, 48, 32, 24, 20, 16, 12, 10, 6, 3 };
+	unsigned int i;
+
+	if (v4l2_request_buffers(video_fd, type, want, count) >= 0)
+		return 0;
+
+	for (i = 0; i < sizeof(ladder) / sizeof(ladder[0]); i++) {
+		if (ladder[i] >= want)
+			continue;
+		if (v4l2_request_buffers(video_fd, type, ladder[i], count) >= 0)
+			return 0;
+	}
+
+	return -1;
 }
 
 static unsigned int context_config_rate_control(struct object_config *config)
@@ -157,7 +186,8 @@ int request_ensure_v4l2_initialized(struct decoder_session *session,
 	struct video_format *video_format;
 	unsigned int output_type, capture_type;
 	unsigned int pixelformat;
-	unsigned int depth;
+	unsigned int capture_depth;
+	unsigned int output_depth = POOL_FLOOR_BUFFERS;
 	unsigned int output_count = 0;
 	unsigned int capture_count = 0;
 	int rc;
@@ -201,6 +231,8 @@ int request_ensure_v4l2_initialized(struct decoder_session *session,
 		session->num_capture_buffers = 0;
 		session->next_output_buf = 0;
 		session->next_capture_buf = 0;
+		session->free_output_count = 0;
+		session->free_capture_count = 0;
 		session->streaming = false;
 	}
 
@@ -258,19 +290,21 @@ int request_ensure_v4l2_initialized(struct decoder_session *session,
 			V4L2_STATELESS_HEVC_START_CODE_ANNEX_B);
 	}
 
-	depth = pool_depth(picture_width, picture_height);
+	capture_depth = pool_depth(picture_width, picture_height);
 
-	rc = v4l2_request_buffers(session->video_fd, output_type, depth,
-				  &output_count);
+	rc = request_buffers_backoff(session->video_fd, output_type,
+				     output_depth, &output_count);
 	if (rc < 0) {
-		request_log("context: REQBUFS(OUTPUT, %u) failed\n", depth);
+		request_log("context: REQBUFS(OUTPUT, %u) failed\n",
+			    output_depth);
 		return -1;
 	}
 
-	rc = v4l2_request_buffers(session->video_fd, capture_type, depth,
-				  &capture_count);
+	rc = request_buffers_backoff(session->video_fd, capture_type,
+				     capture_depth, &capture_count);
 	if (rc < 0) {
-		request_log("context: REQBUFS(CAPTURE, %u) failed\n", depth);
+		request_log("context: REQBUFS(CAPTURE, %u) failed\n",
+			    capture_depth);
 		return -1;
 	}
 
@@ -282,19 +316,22 @@ int request_ensure_v4l2_initialized(struct decoder_session *session,
 	if (output_count < POOL_FLOOR_BUFFERS ||
 	    capture_count < POOL_FLOOR_BUFFERS) {
 		request_log("context: pool too small: %u output, %u capture "
-			    "of %u requested\n", output_count, capture_count,
-			    depth);
+			    "(%u/%u requested)\n", output_count, capture_count,
+			    output_depth, capture_depth);
 		return -1;
 	}
 
-	if (output_count < depth || capture_count < depth)
-		request_log("context: pool short of %u: %u output, %u capture\n",
-			    depth, output_count, capture_count);
+	if (output_count < output_depth || capture_count < capture_depth)
+		request_log("context: pool short: %u/%u output, %u/%u capture\n",
+			    output_count, output_depth,
+			    capture_count, capture_depth);
 
 	session->num_output_buffers = output_count;
 	session->num_capture_buffers = capture_count;
 	session->next_output_buf = 0;
 	session->next_capture_buf = 0;
+	session->free_output_count = 0;
+	session->free_capture_count = 0;
 	session->programmed_pixelformat = pixelformat;
 	session->programmed_width = picture_width;
 	session->programmed_height = picture_height;

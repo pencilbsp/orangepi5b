@@ -52,5 +52,9 @@ void decoder_session_close(struct decoder_session *session)
 	session->video_format = NULL;
 	session->num_output_buffers = 0;
 	session->num_capture_buffers = 0;
+	session->next_output_buf = 0;
+	session->next_capture_buf = 0;
+	session->free_output_count = 0;
+	session->free_capture_count = 0;
 	session->streaming = false;
 }

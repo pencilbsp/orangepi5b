@@ -231,9 +231,14 @@ Base cấp pool cố định 64 buffer cho cả CAPTURE lẫn OUTPUT. Ở 1080p 
 Ở 8K, một frame NV12 khoảng **50 MiB**, nên 64 buffer đòi **3.2 GiB** từ vùng
 CMA **512 MiB** — REQBUFS thất bại và stream không bao giờ khởi động.
 
-Cho pool co theo kích thước frame: ngân sách cố định (192 MiB) chia cho kích
-thước frame, kẹp trong [20, 64]. Cận dưới 20 vì H.264 cho phép 16 reference
-cộng frame hiện tại cộng dư cho hàng đợi hiển thị.
+Cho CAPTURE pool co theo kích thước frame: ngân sách cố định (384 MiB) chia cho
+kích thước frame, kẹp trong [20, 64]. Cận dưới 20 vì H.264 cho phép 16
+reference cộng frame hiện tại cộng dư cho hàng đợi hiển thị. Kernel hiện chỉ
+cấp tối đa 32; tại 4K con số này vừa khớp tập surface sống mà Chrome cần.
+
+OUTPUT pool chỉ cần 3 slot vì đường decode hiện đồng bộ; coded slot được trả
+ngay sau `EndPicture`. Tách hai độ sâu tránh nhân 32 coded buffer 4 MiB vào CMA
+và dành vùng nhớ cho CAPTURE surface thực sự phải sống tới lúc compositor trả.
 
 Và đừng ghim độ phân giải tối đa: hỏi `VIDIOC_ENUM_FRAMESIZES`. Base báo cứng
 3840x2160, biến giới hạn phần cứng thành giới hạn driver — 8K decode được.
@@ -285,6 +290,28 @@ initial decode error".
 
 Chrome phải chạy trong phiên Wayland đang chạy (`--ozone-platform=wayland`).
 Headless vô dụng: GPU process không chạy VA probe trước sandbox.
+
+### `media-internals` báo VAAPI nhưng màn hình vẫn đen, 2026-09-10
+
+`kVideoDecoderName = VaapiVideoDecoder` chỉ chứng minh Chrome đã chọn decoder;
+nó không chứng minh dmabuf của từng output frame đã export thành công. Ca H.264
+4K thực tế vẫn ghi `kPlaying` trong `media-internals`, trong khi log GPU có:
+
+```
+v4l2-request: picture: CAPTURE pool exhausted (20)
+vaExportSurfaceHandle failed, VA error: operation failed
+```
+
+Chrome giữ hơn 20 decoded surface sống cùng lúc. Tăng đồng thời cả hai queue
+không phải lời giải: mỗi OUTPUT buffer 4K tốn thêm 4 MiB dù decode hiện là đồng
+bộ. Driver giờ cấp 3 OUTPUT slot, trả coded slot ngay khi request hoàn tất, và
+dành ngân sách cho 32 CAPTURE slot. Surface bị huỷ cũng trả cả hai index về free
+list để một tiến trình sống lâu không tiêu pool theo kiểu chỉ-tăng.
+
+Kiểm sau sửa với đúng file 3840x2160: Chrome chạy 20 giây, 1125 IRQ rkvdec,
+không có pool/export/render/fallback/pipeline error. Đọc frame qua canvas tại
+2.08 giây cho `min=0`, `max=255`, `mean_rgb=236.47`, 2304/2304 pixel không đen;
+đây là kiểm presentation thực, không chỉ kiểm tên decoder.
 
 ## Chrome — đã làm, 2026-09-08
 
@@ -467,6 +494,7 @@ mpv/VLC — board không cài hai thứ đó nên chưa kiểm được. **Đừ
 | Chrome phát nối tiếp nhiều clip, không crash GPU process | **xong** 2026-09-09 |
 | Review: 0 cảnh báo ở mức tối đa, 0 hàm chết, cấp phát có kiểm NULL | **xong** 2026-09-09 |
 | Bitstream buffer 4 MiB trên 1080p | **xong** 2026-09-10 — sửa lỗi frame lớn làm Chrome đen hình |
+| Tái sử dụng slot pool khi huỷ surface | **xong** 2026-09-10 — tránh Chrome làm cạn CAPTURE pool khi phát lâu |
 | HEVC ext RPS khi `num_short_term_ref_pic_sets != 0` | chưa — x265 mặc định không cần |
 
 ## Thứ tự làm

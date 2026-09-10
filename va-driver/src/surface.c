@@ -264,6 +264,43 @@ VAStatus RequestCreateSurfaces(VADriverContextP context, int width, int height,
 				      surfaces_ids, surfaces_count, NULL, 0);
 }
 
+/*
+ * Return a destroyed surface's V4L2 indices to the session that allocated
+ * them. The buffers themselves remain owned by REQBUFS; only their index-to-
+ * surface assignment is recycled. Without this, Chrome eventually reaches
+ * the end of the pool because it creates and destroys surfaces one at a time.
+ */
+static VAStatus surface_release_buffers(VADriverContextP context,
+					struct object_surface *surface_object)
+{
+	struct decoder_session *session = surface_object->session;
+	VAStatus status = VA_STATUS_SUCCESS;
+
+	if (session == NULL)
+		return VA_STATUS_SUCCESS;
+
+	/* Do not recycle an index while its request can still be in flight. */
+	if (surface_object->status == VASurfaceRendering) {
+		status = RequestSyncSurface(context, surface_object->base.id);
+		if (status != VA_STATUS_SUCCESS)
+			return status;
+	}
+
+	if (surface_object->source_index != SURFACE_INDEX_UNASSIGNED &&
+	    session->free_output_count < DECODER_SESSION_MAX_BUFFERS)
+		session->free_output[session->free_output_count++] =
+			surface_object->source_index;
+
+	if (surface_object->destination_index != SURFACE_INDEX_UNASSIGNED &&
+	    session->free_capture_count < DECODER_SESSION_MAX_BUFFERS)
+		session->free_capture[session->free_capture_count++] =
+			surface_object->destination_index;
+
+	surface_object->source_index = SURFACE_INDEX_UNASSIGNED;
+	surface_object->destination_index = SURFACE_INDEX_UNASSIGNED;
+	return VA_STATUS_SUCCESS;
+}
+
 VAStatus RequestDestroySurfaces(VADriverContextP context,
 				VASurfaceID *surfaces_ids, int surfaces_count)
 {
@@ -290,6 +327,10 @@ VAStatus RequestDestroySurfaces(VADriverContextP context,
 			status = VA_STATUS_ERROR_INVALID_SURFACE;
 			continue;
 		}
+
+		if (surface_release_buffers(context, surface_object) !=
+		    VA_STATUS_SUCCESS)
+			status = VA_STATUS_ERROR_OPERATION_FAILED;
 
 		if (surface_object->source_data != NULL &&
 		    surface_object->source_data != MAP_FAILED &&
@@ -341,6 +382,12 @@ void surface_detach_session(struct request_data *driver_data,
 		&driver_data->surface_heap, &iterator);
 	while (surface_object != NULL) {
 		if (surface_object->session == session) {
+			if (surface_object->source_data != NULL &&
+			    surface_object->source_data != MAP_FAILED &&
+			    surface_object->source_size > 0)
+				munmap(surface_object->source_data,
+				       surface_object->source_size);
+
 			for (i = 0; i < surface_object->destination_buffers_count; i++)
 				if (surface_object->destination_map[i] != NULL &&
 				    surface_object->destination_map[i] != MAP_FAILED &&
@@ -357,6 +404,8 @@ void surface_detach_session(struct request_data *driver_data,
 			surface_object->destination_buffers_count = 0;
 			surface_object->destination_planes_count = 0;
 			surface_object->source_index = SURFACE_INDEX_UNASSIGNED;
+			surface_object->source_data = NULL;
+			surface_object->source_size = 0;
 			surface_object->session = NULL;
 		}
 

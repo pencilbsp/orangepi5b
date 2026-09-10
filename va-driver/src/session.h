@@ -12,6 +12,9 @@
 struct request_data;
 struct video_format;
 
+/* Upper bound of the decoder REQBUFS pool and its recycled-index stacks. */
+#define DECODER_SESSION_MAX_BUFFERS	64u
+
 /*
  * Everything describing one decode in progress.
  *
@@ -33,6 +36,17 @@ struct decoder_session {
 	unsigned int num_capture_buffers;
 	unsigned int next_output_buf;
 	unsigned int next_capture_buf;
+
+	/*
+	 * vaDestroySurfaces returns the V4L2 indices owned by that surface.
+	 * Chrome creates and destroys surfaces continuously, so monotonic-only
+	 * next_* counters would exhaust a finite pool even when few surfaces are
+	 * alive at once.
+	 */
+	unsigned int free_output[DECODER_SESSION_MAX_BUFFERS];
+	unsigned int free_capture[DECODER_SESSION_MAX_BUFFERS];
+	unsigned int free_output_count;
+	unsigned int free_capture_count;
 
 	/*
 	 * What the queues are currently programmed for. On rkvdec the OUTPUT

@@ -56,8 +56,9 @@
 /*
  * Bind a free OUTPUT pool buffer to @surface_object on first use and
  * mmap it as the source-side slice-data staging area. The pool was
- * sized in RequestCreateContext (max(surfaces_count, POOL_MIN_BUFFERS))
- * to absorb FFmpeg's lazy frame growth.
+ * sized in RequestCreateContext to absorb FFmpeg's lazy frame growth.
+ * Destroyed surfaces put their indices on the session's free stacks, so a
+ * long-running Chrome process does not consume the pool monotonically.
  */
 static int bind_source_buffer(struct decoder_session *session,
 			      struct object_surface *surface_object)
@@ -69,14 +70,20 @@ static int bind_source_buffer(struct decoder_session *session,
 	if (surface_object->source_index != SURFACE_INDEX_UNASSIGNED)
 		return 0;
 
-	if (session->next_output_buf >= session->num_output_buffers) {
+	if (session->free_output_count == 0 &&
+	    session->next_output_buf >= session->num_output_buffers) {
 		request_log("picture: OUTPUT pool exhausted (%u)\n",
 			    session->num_output_buffers);
 		return -1;
 	}
 
 	output_type = v4l2_type_video_output(video_format->v4l2_mplane);
-	surface_object->source_index = session->next_output_buf++;
+	if (session->free_output_count > 0)
+		surface_object->source_index =
+			session->free_output[--session->free_output_count];
+	else
+		surface_object->source_index = session->next_output_buf++;
+	surface_object->session = session;
 
 	rc = v4l2_query_buffer(session->video_fd, output_type,
 			       surface_object->source_index, &length, &offset,
@@ -95,6 +102,31 @@ static int bind_source_buffer(struct decoder_session *session,
 	return 0;
 }
 
+/*
+ * A coded OUTPUT buffer is needed only from BeginPicture through the
+ * synchronous completion in EndPicture. Return it immediately afterwards;
+ * keeping one per displayed surface wastes 4 MiB each at 4K and prevents the
+ * CAPTURE pool from being large enough for Chrome's live frame set.
+ */
+static void release_source_buffer(struct decoder_session *session,
+				  struct object_surface *surface_object)
+{
+	if (surface_object->source_data != NULL &&
+	    surface_object->source_data != MAP_FAILED &&
+	    surface_object->source_size > 0)
+		munmap(surface_object->source_data, surface_object->source_size);
+
+	surface_object->source_data = NULL;
+	surface_object->source_size = 0;
+
+	if (surface_object->source_index != SURFACE_INDEX_UNASSIGNED &&
+	    session->free_output_count < DECODER_SESSION_MAX_BUFFERS)
+		session->free_output[session->free_output_count++] =
+			surface_object->source_index;
+
+	surface_object->source_index = SURFACE_INDEX_UNASSIGNED;
+}
+
 int request_bind_destination_buffer(struct decoder_session *session,
 				    struct object_surface *surface_object)
 {
@@ -109,7 +141,8 @@ int request_bind_destination_buffer(struct decoder_session *session,
 	if (surface_object->destination_index != SURFACE_INDEX_UNASSIGNED)
 		return 0;
 
-	if (session->next_capture_buf >= session->num_capture_buffers) {
+	if (session->free_capture_count == 0 &&
+	    session->next_capture_buf >= session->num_capture_buffers) {
 		request_log("picture: CAPTURE pool exhausted (%u)\n",
 			    session->num_capture_buffers);
 		return -1;
@@ -124,7 +157,11 @@ int request_bind_destination_buffer(struct decoder_session *session,
 	if (rc < 0)
 		return -1;
 
-	surface_object->destination_index = session->next_capture_buf++;
+	if (session->free_capture_count > 0)
+		surface_object->destination_index =
+			session->free_capture[--session->free_capture_count];
+	else
+		surface_object->destination_index = session->next_capture_buf++;
 	/* Remember where the buffer came from: only this session can use it. */
 	surface_object->session = session;
 	surface_object->destination_buffers_count =
@@ -743,6 +780,8 @@ VAStatus RequestEndPicture(VADriverContextP context, VAContextID context_id)
 	status = RequestSyncSurface(context, context_object->render_surface_id);
 	if (status != VA_STATUS_SUCCESS)
 		return status;
+
+	release_source_buffer(session, surface_object);
 
 	context_object->render_surface_id = VA_INVALID_ID;
 
