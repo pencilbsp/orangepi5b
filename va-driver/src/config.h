@@ -45,6 +45,9 @@ struct object_config {
 	int attributes_count;
 };
 
+unsigned int config_profile_rt_formats(VAProfile profile);
+unsigned int config_rt_format(const struct object_config *config);
+
 VAStatus RequestCreateConfig(VADriverContextP context, VAProfile profile,
 			     VAEntrypoint entrypoint,
 			     VAConfigAttrib *attributes, int attributes_count,

@@ -31,6 +31,7 @@
 #include <stdint.h>
 
 #include <va/va_backend.h>
+#include <linux/v4l2-controls.h>
 
 #include "encode.h"
 #include "object_heap.h"
@@ -65,6 +66,10 @@ struct object_context {
 	/* VP9 loop-filter and segmentation state inherited across frames. */
 	struct vp9_persistent_state vp9_state;
 
+	/* AV1 sequence control is sent only when the stream changes it. */
+	struct v4l2_ctrl_av1_sequence av1_sequence;
+	bool av1_sequence_sent;
+
 };
 
 int profile_to_pixelformat(VAProfile profile, unsigned int *pixelformat);
@@ -90,7 +95,12 @@ VAStatus RequestDestroyContext(VADriverContextP context,
 struct request_data;
 int request_ensure_v4l2_initialized(struct decoder_session *session,
 				    VAProfile profile,
+				    unsigned int rt_format,
 				    int picture_width,
 				    int picture_height);
+int request_ensure_av1_capture_bit_depth(struct decoder_session *session,
+					 int picture_width,
+					 int picture_height,
+					 unsigned int bit_depth);
 
 #endif

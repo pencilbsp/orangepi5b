@@ -35,6 +35,7 @@
 
 #include "h264.h"
 #include "h265.h"
+#include "av1.h"
 #include "vp9.h"
 
 #include <assert.h>
@@ -329,8 +330,9 @@ static VAStatus codec_store_buffer(struct request_data *driver_data,
 	case VASliceDataBufferType: {
 		static const unsigned char start_code[] = { 0x00, 0x00, 0x00, 0x01 };
 		unsigned int size = buffer_object->size * buffer_object->count;
-		unsigned int prefix_size = profile == VAProfileVP9Profile0 ? 0 :
-					   sizeof(start_code);
+		unsigned int prefix_size =
+			(profile == VAProfileVP9Profile0 ||
+			 profile == VAProfileAV1Profile0) ? 0 : sizeof(start_code);
 
 		/*
 		 * Since there is no guarantee that the allocation order is the
@@ -388,6 +390,13 @@ static VAStatus codec_store_buffer(struct request_data *driver_data,
 			surface_object->params.vp9.picture_set = true;
 			break;
 
+		case VAProfileAV1Profile0:
+			memcpy(&surface_object->params.av1.picture,
+			       buffer_object->data,
+			       sizeof(surface_object->params.av1.picture));
+			surface_object->params.av1.picture_set = true;
+			break;
+
 		default:
 			break;
 		}
@@ -415,6 +424,23 @@ static VAStatus codec_store_buffer(struct request_data *driver_data,
 			       sizeof(surface_object->params.vp9.slice));
 			surface_object->params.vp9.slice_set = true;
 			break;
+
+		case VAProfileAV1Profile0: {
+			const VASliceParameterBufferAV1 *tiles = buffer_object->data;
+			unsigned int max = V4L2_AV1_MAX_TILE_COUNT;
+			unsigned int n = buffer_object->count;
+			unsigned int i;
+
+			if (n > max - surface_object->params.av1.num_tiles) {
+				request_log("AV1: more than %u tiles in a frame\n", max);
+				return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
+			}
+
+			for (i = 0; i < n; i++)
+				surface_object->params.av1.tiles[
+					surface_object->params.av1.num_tiles++] = tiles[i];
+			break;
+		}
 
 		default:
 			break;
@@ -480,6 +506,13 @@ static VAStatus codec_set_controls(struct request_data *driver_data,
 			return VA_STATUS_ERROR_OPERATION_FAILED;
 		break;
 
+	case VAProfileAV1Profile0:
+		rc = av1_set_controls(driver_data, session, context,
+				       surface_object);
+		if (rc < 0)
+			return VA_STATUS_ERROR_OPERATION_FAILED;
+		break;
+
 	default:
 		return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
 	}
@@ -489,15 +522,20 @@ static VAStatus codec_set_controls(struct request_data *driver_data,
 
 static bool session_matches_context(struct decoder_session *session,
 				    struct object_config *config_object,
-				    struct object_context *context_object)
+				    struct object_context *context_object,
+				    struct object_surface *surface_object)
 {
 	unsigned int pixelformat;
+	unsigned int capture_format;
 
 	if (profile_to_pixelformat(config_object->profile, &pixelformat) < 0)
 		return false;
+	capture_format = surface_object->pixel_format == VA_FOURCC_P010 ?
+		V4L2_PIX_FMT_P010 : V4L2_PIX_FMT_NV12;
 
 	return session->video_format != NULL &&
 	       session->num_capture_buffers > 0 &&
+	       session->video_format->v4l2_format == capture_format &&
 	       session->programmed_pixelformat == pixelformat &&
 	       session->programmed_profile == config_object->profile &&
 	       session->programmed_width == context_object->picture_width &&
@@ -551,7 +589,8 @@ static int context_adopt_probe_session(struct request_data *driver_data,
 	}
 
 	if (!session_matches_context(&driver_data->probe_session,
-				     config_object, context_object)) {
+				     config_object, context_object,
+				     surface_object)) {
 		request_log("picture: exported probe session does not match context\n");
 		return -1;
 	}
@@ -582,8 +621,12 @@ static bool picture_surface_matches_config(struct object_surface *surface,
 	enum surface_role expected_role = encoder ? SURFACE_ROLE_ENCODE :
 						 SURFACE_ROLE_DECODE;
 
-	return surface->rt_format == VA_RT_FORMAT_YUV420 &&
-	       surface->pixel_format == VA_FOURCC_NV12 &&
+	return (surface->rt_format &
+		config_profile_rt_formats(config->profile)) != 0 &&
+	       ((surface->rt_format == VA_RT_FORMAT_YUV420 &&
+		 surface->pixel_format == VA_FOURCC_NV12) ||
+		(surface->rt_format == VA_RT_FORMAT_YUV420_10 &&
+		 surface->pixel_format == VA_FOURCC_P010)) &&
 	       (surface->role == SURFACE_ROLE_UNKNOWN ||
 		surface->role == expected_role);
 }
@@ -609,6 +652,13 @@ VAStatus RequestBeginPicture(VADriverContextP context, VAContextID context_id,
 	surface_object = SURFACE(driver_data, surface_id);
 	if (surface_object == NULL)
 		return VA_STATUS_ERROR_INVALID_SURFACE;
+	if (config_object->profile == VAProfileAV1Profile0 &&
+	    context_object->session.video_format != NULL &&
+	    context_object->session.video_format->v4l2_format ==
+		V4L2_PIX_FMT_P010) {
+		surface_object->rt_format = VA_RT_FORMAT_YUV420_10;
+		surface_object->pixel_format = VA_FOURCC_P010;
+	}
 	if (!picture_surface_matches_config(surface_object, config_object,
 					    context_object->is_encoder))
 		return VA_STATUS_ERROR_INVALID_SURFACE;
@@ -653,10 +703,15 @@ VAStatus RequestBeginPicture(VADriverContextP context, VAContextID context_id,
 	if (rc < 0)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
 
-	rc = request_bind_destination_buffer(&context_object->session,
-					     surface_object);
-	if (rc < 0)
-		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	/* AV1 Profile 0 can be 8- or 10-bit. Some clients expose that only in
+	 * the picture parameters, so its CAPTURE buffer is bound at EndPicture
+	 * after the correct NV12/P010 format is known. */
+	if (config_object->profile != VAProfileAV1Profile0) {
+		rc = request_bind_destination_buffer(&context_object->session,
+						     surface_object);
+		if (rc < 0)
+			return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	}
 
 	surface_object->status = VASurfaceRendering;
 	surface_object->slices_count = 0;
@@ -664,6 +719,9 @@ VAStatus RequestBeginPicture(VADriverContextP context, VAContextID context_id,
 	if (config_object->profile == VAProfileVP9Profile0)
 		memset(&surface_object->params.vp9, 0,
 		       sizeof(surface_object->params.vp9));
+	if (config_object->profile == VAProfileAV1Profile0)
+		memset(&surface_object->params.av1, 0,
+		       sizeof(surface_object->params.av1));
 	context_object->render_surface_id = surface_id;
 
 	return VA_STATUS_SUCCESS;
@@ -748,6 +806,10 @@ static int codec_begin_streaming(struct decoder_session *session,
 	case VAProfileVP9Profile0:
 		/* VP9 has no sequence control that must precede STREAMON. */
 		rc = 0;
+		break;
+
+	case VAProfileAV1Profile0:
+		rc = av1_set_device_sequence(session, surface);
 		break;
 
 	default:
@@ -857,6 +919,35 @@ VAStatus RequestEndPicture(VADriverContextP context, VAContextID context_id)
 		request_log("picture: invalid VP9 picture/slice data\n");
 		return VA_STATUS_ERROR_INVALID_BUFFER;
 	}
+
+	if (config_object->profile == VAProfileAV1Profile0) {
+		const VADecPictureParameterBufferAV1 *pic =
+			&surface_object->params.av1.picture;
+		unsigned int bit_depth;
+
+		if (!surface_object->params.av1.picture_set)
+			return VA_STATUS_ERROR_INVALID_BUFFER;
+
+		bit_depth = 8 + 2 * pic->bit_depth_idx;
+		if (request_ensure_av1_capture_bit_depth(
+				session, surface_object->width,
+				surface_object->height, bit_depth) < 0)
+			return VA_STATUS_ERROR_OPERATION_FAILED;
+
+		video_format = session->video_format;
+		if (video_format == NULL)
+			return VA_STATUS_ERROR_OPERATION_FAILED;
+		output_type = v4l2_type_video_output(video_format->v4l2_mplane);
+		capture_type = v4l2_type_video_capture(video_format->v4l2_mplane);
+		surface_object->rt_format = bit_depth == 10 ?
+			VA_RT_FORMAT_YUV420_10 : VA_RT_FORMAT_YUV420;
+		surface_object->pixel_format = bit_depth == 10 ?
+			VA_FOURCC_P010 : VA_FOURCC_NV12;
+	}
+
+	if (surface_object->destination_index == SURFACE_INDEX_UNASSIGNED &&
+	    request_bind_destination_buffer(session, surface_object) < 0)
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
 
 	gettimeofday(&surface_object->timestamp, NULL);
 

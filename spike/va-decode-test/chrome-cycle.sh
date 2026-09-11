@@ -37,7 +37,7 @@ google-chrome-stable \
   --ozone-platform=wayland --user-data-dir="$PROFILE" \
   --no-first-run --no-default-browser-check \
   --autoplay-policy=no-user-gesture-required \
-  --enable-features=VaapiVideoDecodeLinuxGL,VaapiIgnoreDriverChecks \
+  --enable-features=AcceleratedVideoDecodeLinuxGL,AcceleratedVideoDecodeLinuxZeroCopyGL,VaapiIgnoreDriverChecks \
   --ignore-gpu-blocklist --allow-file-access-from-files \
   --enable-logging=stderr --vmodule=*vaapi*=3,*video_decoder*=2 \
   "file://$PAGE" >"$LOG" 2>&1 &

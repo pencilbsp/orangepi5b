@@ -22,7 +22,10 @@ for f in "$DIR"/*.h264 "$DIR"/*.h265 "$DIR"/*.ivf; do
 			continue
 			;;
 	esac
-	frame_format=nv12
+	case "$name" in
+		av1-10bit*) frame_format=p010 ;;
+		*) frame_format=nv12 ;;
+	esac
 
 	sw=$(mktemp); hw=$(mktemp); log=$(mktemp)
 

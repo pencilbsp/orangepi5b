@@ -71,6 +71,13 @@ struct request_data {
 	char video_path[PATH_MAX];
 	char media_path[PATH_MAX];
 
+	/* Separate Hantro VPU981 AV1 discovery handles and node paths. */
+	int av1_video_fd;
+	int av1_media_fd;
+	char av1_video_path[PATH_MAX];
+	char av1_media_path[PATH_MAX];
+	bool has_av1_decoder;
+
 	/*
 	 * The stateful H.264 encoder, when the kernel has one. Empty means no
 	 * encode entrypoint is advertised, which is the correct answer on a

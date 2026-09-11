@@ -47,6 +47,10 @@
 
 #include "autoconfig.h"
 
+#ifndef V4L2_PIX_FMT_P010
+#define V4L2_PIX_FMT_P010 v4l2_fourcc('P', '0', '1', '0')
+#endif
+
 /*
  * CAPTURE/OUTPUT pool size for FFmpeg's lazy frame-pool growth.
  *
@@ -60,6 +64,13 @@
  * fails and the stream never starts. Scale the CAPTURE depth down as frames
  * grow, and never below what the codec's reference handling actually needs.
  *
+ * RK3588 AV1 needs special accounting. Its Hantro post-processor writes the
+ * linear CAPTURE image while the decoder keeps a tiled image plus motion
+ * vectors for the eight AV1 references and the current frame. The kernel caps
+ * that private pool at nine buffers; charge those buffers here before sizing
+ * the public pool. Otherwise 1440p/4K exhausts CMA at STREAMON even though the
+ * CAPTURE allocation itself succeeded.
+ *
  * OUTPUT is different: decoding is synchronous and picture.c releases the
  * compressed-frame slot as soon as the request completes. Three OUTPUT slots
  * therefore suffice and, at 4 MiB each for 4K, leave enough CMA for the 32
@@ -70,21 +81,50 @@
 /* Below this the pool cannot hold a reference frame and the current one. */
 #define POOL_FLOOR_BUFFERS	3u
 #define POOL_BUDGET_BYTES	(384u * 1024u * 1024u)
+#define AV1_POOL_MAX_BUFFERS	25u
+#define AV1_REFERENCE_BUFFERS	9u
+#define AV1_POOL_BUDGET_BYTES	(448u * 1024u * 1024u)
 
-static unsigned int pool_depth(int width, int height, unsigned int bpp)
+static uint64_t av1_motion_vector_bytes(unsigned int width,
+					unsigned int height)
+{
+	uint64_t superblocks = ((uint64_t)width + 63) / 64 *
+			       (((uint64_t)height + 63) / 64);
+
+	/* Keep this in sync with hantro_av1_mv_size() in the kernel driver. */
+	return superblocks * 384 * 2 + 512;
+}
+
+static unsigned int pool_depth(int width, int height, unsigned int bpp,
+			       unsigned int pixelformat)
 {
 	uint64_t frame_bytes = (uint64_t)(unsigned int)width *
 			       (unsigned int)height * bpp / 8;
+	uint64_t budget = POOL_BUDGET_BYTES;
+	unsigned int maximum = POOL_MAX_BUFFERS;
+	unsigned int minimum = POOL_MIN_BUFFERS;
 	unsigned int depth;
 
 	if (frame_bytes == 0)
 		return POOL_MAX_BUFFERS;
 
-	depth = POOL_BUDGET_BYTES / frame_bytes;
-	if (depth > POOL_MAX_BUFFERS)
-		depth = POOL_MAX_BUFFERS;
-	if (depth < POOL_MIN_BUFFERS)
-		depth = POOL_MIN_BUFFERS;
+	if (pixelformat == V4L2_PIX_FMT_AV1_FRAME) {
+		uint64_t private_bytes = frame_bytes +
+			av1_motion_vector_bytes(width, height);
+
+		budget = AV1_POOL_BUDGET_BYTES;
+		maximum = AV1_POOL_MAX_BUFFERS;
+		minimum = AV1_REFERENCE_BUFFERS;
+		if (private_bytes * AV1_REFERENCE_BUFFERS >= budget)
+			return minimum;
+		budget -= private_bytes * AV1_REFERENCE_BUFFERS;
+	}
+
+	depth = budget / frame_bytes;
+	if (depth > maximum)
+		depth = maximum;
+	if (depth < minimum)
+		depth = minimum;
 
 	return depth;
 }
@@ -133,14 +173,20 @@ static bool context_surface_matches_config(struct request_data *driver_data,
 		config->entrypoint == VAEntrypointEncSlice ?
 		SURFACE_ROLE_ENCODE : SURFACE_ROLE_DECODE;
 
-	return surface != NULL && surface->rt_format == VA_RT_FORMAT_YUV420 &&
-	       surface->pixel_format == VA_FOURCC_NV12 &&
+	return surface != NULL &&
+	       (surface->rt_format &
+		config_profile_rt_formats(config->profile)) != 0 &&
+	       ((surface->rt_format == VA_RT_FORMAT_YUV420 &&
+		 surface->pixel_format == VA_FOURCC_NV12) ||
+		(surface->rt_format == VA_RT_FORMAT_YUV420_10 &&
+		 surface->pixel_format == VA_FOURCC_P010)) &&
 	       (surface->role == SURFACE_ROLE_UNKNOWN ||
 		surface->role == expected_role);
 }
 
 static int detect_capture_format(struct decoder_session *session,
-				 unsigned int coded_format)
+				 unsigned int coded_format,
+				 unsigned int capture_format)
 {
 	struct video_format *video_format;
 	bool mplane;
@@ -162,7 +208,7 @@ static int detect_capture_format(struct decoder_session *session,
 		return -1;
 	}
 
-	video_format = video_format_find_mplane(V4L2_PIX_FMT_NV12, mplane);
+	video_format = video_format_find_mplane(capture_format, mplane);
 
 	if (video_format == NULL)
 		return -1;
@@ -188,6 +234,10 @@ int profile_to_pixelformat(VAProfile profile, unsigned int *pixelformat)
 		*pixelformat = V4L2_PIX_FMT_VP9_FRAME;
 		return 0;
 
+	case VAProfileAV1Profile0:
+		*pixelformat = V4L2_PIX_FMT_AV1_FRAME;
+		return 0;
+
 	default:
 		return -1;
 	}
@@ -195,12 +245,14 @@ int profile_to_pixelformat(VAProfile profile, unsigned int *pixelformat)
 
 int request_ensure_v4l2_initialized(struct decoder_session *session,
 				    VAProfile profile,
+				    unsigned int rt_format,
 				    int picture_width,
 				    int picture_height)
 {
 	struct video_format *video_format;
 	unsigned int output_type, capture_type;
 	unsigned int pixelformat;
+	unsigned int capture_pixelformat;
 	unsigned int capture_depth;
 	unsigned int output_depth = POOL_FLOOR_BUFFERS;
 	unsigned int output_count = 0;
@@ -209,6 +261,11 @@ int request_ensure_v4l2_initialized(struct decoder_session *session,
 
 	if (profile_to_pixelformat(profile, &pixelformat) < 0)
 		return -1;
+
+	capture_pixelformat = profile == VAProfileAV1Profile0 &&
+		(rt_format & VA_RT_FORMAT_YUV420_10) != 0 &&
+		(rt_format & VA_RT_FORMAT_YUV420) == 0 ?
+		V4L2_PIX_FMT_P010 : V4L2_PIX_FMT_NV12;
 
 	/*
 	 * Re-enter freely, but only skip the work when the queues already
@@ -219,6 +276,7 @@ int request_ensure_v4l2_initialized(struct decoder_session *session,
 	 */
 	if (session->video_format != NULL &&
 	    session->num_capture_buffers > 0 &&
+	    session->video_format->v4l2_format == capture_pixelformat &&
 	    session->programmed_pixelformat == pixelformat &&
 	    session->programmed_profile == profile &&
 	    session->programmed_width == picture_width &&
@@ -252,7 +310,8 @@ int request_ensure_v4l2_initialized(struct decoder_session *session,
 		session->streaming = false;
 	}
 
-	if (detect_capture_format(session, pixelformat) < 0) {
+	if (detect_capture_format(session, pixelformat,
+				  capture_pixelformat) < 0) {
 		request_log("context: no CAPTURE layout for VA profile %d\n",
 			    profile);
 		return -1;
@@ -282,6 +341,27 @@ int request_ensure_v4l2_initialized(struct decoder_session *session,
 					    V4L2_MPEG_VIDEO_VP9_PROFILE_0);
 		if (rc < 0) {
 			request_log("context: VP9 Profile 0 rejected\n");
+			return -1;
+		}
+	} else if (profile == VAProfileAV1Profile0) {
+		struct v4l2_ctrl_av1_sequence seq;
+
+		/* The Hantro post-processor exposes P010 only after seeing the
+		 * sequence bit depth. Chrome exports its frame pool before the first
+		 * picture, so prime that choice before CAPTURE S_FMT/REQBUFS. */
+		memset(&seq, 0, sizeof(seq));
+		seq.seq_profile = 0;
+		seq.order_hint_bits = 1;
+		seq.bit_depth = capture_pixelformat == V4L2_PIX_FMT_P010 ? 10 : 8;
+		seq.max_frame_width_minus_1 = picture_width - 1;
+		seq.max_frame_height_minus_1 = picture_height - 1;
+		seq.flags = V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X |
+			    V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y;
+		rc = v4l2_set_control(session->video_fd, -1,
+				      V4L2_CID_STATELESS_AV1_SEQUENCE,
+				      &seq, sizeof(seq));
+		if (rc < 0) {
+			request_log("context: AV1 sequence setup failed\n");
 			return -1;
 		}
 	}
@@ -328,7 +408,7 @@ int request_ensure_v4l2_initialized(struct decoder_session *session,
 	}
 
 	capture_depth = pool_depth(picture_width, picture_height,
-				   video_format->bpp);
+				   video_format->bpp, pixelformat);
 
 	rc = request_buffers_backoff(session->video_fd, output_type,
 				     output_depth, &output_count);
@@ -384,6 +464,89 @@ int request_ensure_v4l2_initialized(struct decoder_session *session,
 	return 0;
 }
 
+int request_ensure_av1_capture_bit_depth(struct decoder_session *session,
+					 int picture_width,
+					 int picture_height,
+					 unsigned int bit_depth)
+{
+	struct video_format *old_format = session->video_format;
+	struct v4l2_ctrl_av1_sequence seq;
+	unsigned int old_capture_type, capture_type;
+	unsigned int capture_pixelformat;
+	unsigned int capture_depth, capture_count = 0;
+	int rc;
+
+	if (session->programmed_pixelformat != V4L2_PIX_FMT_AV1_FRAME)
+		return 0;
+
+	if (bit_depth == 8)
+		capture_pixelformat = V4L2_PIX_FMT_NV12;
+	else if (bit_depth == 10)
+		capture_pixelformat = V4L2_PIX_FMT_P010;
+	else
+		return -1;
+
+	if (old_format != NULL &&
+	    old_format->v4l2_format == capture_pixelformat)
+		return 0;
+
+	/* Exported or decoded buffers cannot be silently replaced underneath
+	 * their owner. The fallback is only for clients such as FFmpeg which
+	 * reveal AV1 bit depth with the first picture parameter buffer. */
+	if (old_format == NULL || session->streaming ||
+	    session->next_capture_buf > 0 || session->free_capture_count > 0) {
+		request_log("context: cannot switch AV1 CAPTURE format after buffers were bound\n");
+		return -1;
+	}
+
+	old_capture_type = v4l2_type_video_capture(old_format->v4l2_mplane);
+	if (v4l2_request_buffers(session->video_fd, old_capture_type, 0, NULL) < 0)
+		return -1;
+	session->num_capture_buffers = 0;
+	session->next_capture_buf = 0;
+	session->free_capture_count = 0;
+
+	memset(&seq, 0, sizeof(seq));
+	seq.seq_profile = 0;
+	seq.order_hint_bits = 1;
+	seq.bit_depth = bit_depth;
+	seq.max_frame_width_minus_1 = picture_width - 1;
+	seq.max_frame_height_minus_1 = picture_height - 1;
+	seq.flags = V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X |
+		    V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y;
+	if (v4l2_set_control(session->video_fd, -1,
+			     V4L2_CID_STATELESS_AV1_SEQUENCE,
+			     &seq, sizeof(seq)) < 0)
+		return -1;
+
+	session->video_format = NULL;
+	if (detect_capture_format(session, V4L2_PIX_FMT_AV1_FRAME,
+				  capture_pixelformat) < 0)
+		return -1;
+
+	capture_type = v4l2_type_video_capture(
+		session->video_format->v4l2_mplane);
+	if (!v4l2_find_format(session->video_fd, capture_type,
+			      capture_pixelformat) ||
+	    v4l2_set_format(session->video_fd, capture_type,
+			    capture_pixelformat, picture_width,
+			    picture_height) < 0)
+		return -1;
+
+	capture_depth = pool_depth(picture_width, picture_height,
+				   session->video_format->bpp,
+				   V4L2_PIX_FMT_AV1_FRAME);
+	rc = request_buffers_backoff(session->video_fd, capture_type,
+				     capture_depth, &capture_count);
+	if (rc < 0 || capture_count < POOL_FLOOR_BUFFERS)
+		return -1;
+
+	session->num_capture_buffers = capture_count;
+	request_log("context: switched AV1 CAPTURE to %s for %u-bit stream\n",
+		    session->video_format->description, bit_depth);
+	return 0;
+}
+
 VAStatus RequestCreateContext(VADriverContextP context, VAConfigID config_id,
 			      int picture_width, int picture_height, int flags,
 			      VASurfaceID *surfaces_ids, int surfaces_count,
@@ -431,13 +594,15 @@ VAStatus RequestCreateContext(VADriverContextP context, VAConfigID config_id,
 
 		context_object->is_encoder = true;
 	} else {
-		if (decoder_session_open(driver_data, &context_object->session) < 0) {
+		if (decoder_session_open(driver_data, &context_object->session,
+					 config_object->profile) < 0) {
 			status = VA_STATUS_ERROR_OPERATION_FAILED;
 			goto error;
 		}
 
 		if (request_ensure_v4l2_initialized(&context_object->session,
 						    config_object->profile,
+						    config_rt_format(config_object),
 						    picture_width,
 						    picture_height) < 0) {
 			status = VA_STATUS_ERROR_OPERATION_FAILED;

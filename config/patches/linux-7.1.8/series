@@ -8,3 +8,5 @@
 0010-media-rockchip-add-vepu580-h264-encoder-skeleton.patch
 0011-media-rockchip-rkvenc-h264-per-frame-encode.patch
 0012-media-rockchip-rkvdec-add-vdpu381-vp9-backend.patch
+0013-media-hantro-key-av1-entropy-context-by-frame.patch
+0014-media-hantro-bound-av1-postproc-pool-to-references.patch

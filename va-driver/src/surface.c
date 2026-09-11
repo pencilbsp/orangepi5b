@@ -51,6 +51,10 @@
 #include "v4l2.h"
 #include "video.h"
 
+#ifndef V4L2_PIX_FMT_P010
+#define V4L2_PIX_FMT_P010 v4l2_fourcc('P', '0', '1', '0')
+#endif
+
 static struct decoder_session *
 find_unique_context_session(struct request_data *driver_data,
 			    unsigned int width, unsigned int height,
@@ -169,11 +173,14 @@ VAStatus RequestCreateSurfaces2(VADriverContextP context, unsigned int format,
 	    width == 0 || height == 0 || width > INT_MAX || height > INT_MAX)
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-	if (format != VA_RT_FORMAT_YUV420)
+	if (format != VA_RT_FORMAT_YUV420 &&
+	    format != VA_RT_FORMAT_YUV420_10)
 		return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
 
-	pixel_format = VA_FOURCC_NV12;
-	capture_format = V4L2_PIX_FMT_NV12;
+	pixel_format = format == VA_RT_FORMAT_YUV420_10 ?
+		VA_FOURCC_P010 : VA_FOURCC_NV12;
+	capture_format = format == VA_RT_FORMAT_YUV420_10 ?
+		V4L2_PIX_FMT_P010 : V4L2_PIX_FMT_NV12;
 
 	for (i = 0; i < attributes_count; i++) {
 		if (attributes[i].type != VASurfaceAttribPixelFormat)
@@ -255,9 +262,11 @@ VAStatus RequestCreateSurfaces2(VADriverContextP context, unsigned int format,
 		probe_profile = cfg != NULL ? cfg->profile : VAProfileH264High;
 
 		if (decoder_session_open(driver_data,
-					 &driver_data->probe_session) == 0)
+					 &driver_data->probe_session,
+					 probe_profile) == 0)
 			(void)request_ensure_v4l2_initialized(
 				&driver_data->probe_session, probe_profile,
+				format,
 				(int)width, (int)height);
 	}
 
@@ -585,7 +594,10 @@ static int config_frame_limits(struct request_data *driver_data,
 		return rc;
 	}
 
-	return v4l2_get_frame_sizes(driver_data->video_fd, pixelformat, limits);
+	return v4l2_get_frame_sizes(
+		config_object->profile == VAProfileAV1Profile0 ?
+			driver_data->av1_video_fd : driver_data->video_fd,
+		pixelformat, limits);
 }
 
 VAStatus RequestQuerySurfaceAttributes(VADriverContextP context,
@@ -613,11 +625,22 @@ VAStatus RequestQuerySurfaceAttributes(VADriverContextP context,
 
 	memset(attributes_list, 0, sizeof(attributes_list));
 
-	attributes_list[i].type = VASurfaceAttribPixelFormat;
-	attributes_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
-	attributes_list[i].value.type = VAGenericValueTypeInteger;
-	attributes_list[i].value.value.i = VA_FOURCC_NV12;
-	i++;
+	if (config_rt_format(config_object) & VA_RT_FORMAT_YUV420) {
+		attributes_list[i].type = VASurfaceAttribPixelFormat;
+		attributes_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE |
+					  VA_SURFACE_ATTRIB_SETTABLE;
+		attributes_list[i].value.type = VAGenericValueTypeInteger;
+		attributes_list[i].value.value.i = VA_FOURCC_NV12;
+		i++;
+	}
+	if (config_rt_format(config_object) & VA_RT_FORMAT_YUV420_10) {
+		attributes_list[i].type = VASurfaceAttribPixelFormat;
+		attributes_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE |
+					  VA_SURFACE_ATTRIB_SETTABLE;
+		attributes_list[i].value.type = VAGenericValueTypeInteger;
+		attributes_list[i].value.value.i = VA_FOURCC_P010;
+		i++;
+	}
 
 	/*
 	 * Report what the device accepts, not a constant. rkvdec decodes well
@@ -853,7 +876,10 @@ VAStatus RequestExportSurfaceHandle(VADriverContextP context,
 		session = find_unique_context_session(driver_data,
 						      surface_object->width,
 						      surface_object->height,
-						      V4L2_PIX_FMT_NV12);
+						      surface_object->pixel_format ==
+							VA_FOURCC_P010 ?
+							V4L2_PIX_FMT_P010 :
+							V4L2_PIX_FMT_NV12);
 	if (session == NULL)
 		session = &driver_data->probe_session;
 	if (session->video_format == NULL)
@@ -897,7 +923,7 @@ VAStatus RequestExportSurfaceHandle(VADriverContextP context,
 
 	planes_count = surface_object->destination_planes_count;
 
-	surface_descriptor->fourcc = VA_FOURCC_NV12;
+	surface_descriptor->fourcc = surface_object->pixel_format;
 	surface_descriptor->width = surface_object->width;
 	surface_descriptor->height = surface_object->height;
 	surface_descriptor->num_objects = export_fds_count;
@@ -932,8 +958,12 @@ VAStatus RequestExportSurfaceHandle(VADriverContextP context,
 			 * Each NV12 plane is its own image: luma is one byte
 			 * per sample, chroma is an interleaved Cb/Cr pair.
 			 */
-			surface_descriptor->layers[i].drm_format =
-				i == 0 ? DRM_FORMAT_R8 : DRM_FORMAT_GR88;
+			if (surface_object->pixel_format == VA_FOURCC_P010)
+				surface_descriptor->layers[i].drm_format =
+					i == 0 ? DRM_FORMAT_R16 : DRM_FORMAT_GR1616;
+			else
+				surface_descriptor->layers[i].drm_format =
+					i == 0 ? DRM_FORMAT_R8 : DRM_FORMAT_GR88;
 			surface_descriptor->layers[i].num_planes = 1;
 			surface_descriptor->layers[i].object_index[0] =
 				export_fds_count == 1 ? 0 : i;

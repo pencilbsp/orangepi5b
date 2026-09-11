@@ -68,6 +68,8 @@ VAStatus VA_DRIVER_INIT_FUNC(VADriverContextP context)
 	unsigned int capabilities_required;
 	int video_fd = -1;
 	int media_fd = -1;
+	int av1_video_fd = -1;
+	int av1_media_fd = -1;
 	int rc;
 
 	context->version_major = VA_MAJOR_VERSION;
@@ -135,6 +137,10 @@ VAStatus VA_DRIVER_INIT_FUNC(VADriverContextP context)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
 
 	memset(driver_data, 0, sizeof(*driver_data));
+	driver_data->video_fd = -1;
+	driver_data->media_fd = -1;
+	driver_data->av1_video_fd = -1;
+	driver_data->av1_media_fd = -1;
 
 	context->pDriverData = driver_data;
 
@@ -191,6 +197,20 @@ VAStatus VA_DRIVER_INIT_FUNC(VADriverContextP context)
 	driver_data->video_fd = video_fd;
 	driver_data->media_fd = media_fd;
 
+	/*
+	 * AV1 is optional because it lives on a second Hantro device. Keep the
+	 * rest of VA-API usable on kernels where that node did not probe, and
+	 * advertise AV1 only when discovery succeeds.
+	 */
+	if (av1_decoder_device_open(&av1_video_fd, &av1_media_fd,
+				    driver_data->av1_video_path,
+				    driver_data->av1_media_path,
+				    sizeof(driver_data->av1_video_path)) == 0) {
+		driver_data->av1_video_fd = av1_video_fd;
+		driver_data->av1_media_fd = av1_media_fd;
+		driver_data->has_av1_decoder = true;
+	}
+
 	status = VA_STATUS_SUCCESS;
 	goto complete;
 
@@ -202,6 +222,12 @@ error:
 
 	if (media_fd >= 0)
 		close(media_fd);
+
+	if (av1_video_fd >= 0)
+		close(av1_video_fd);
+
+	if (av1_media_fd >= 0)
+		close(av1_media_fd);
 
 complete:
 	return status;
@@ -217,8 +243,14 @@ VAStatus RequestTerminate(VADriverContextP context)
 	struct object_config *config_object;
 	int iterator;
 
-	close(driver_data->video_fd);
-	close(driver_data->media_fd);
+	if (driver_data->video_fd >= 0)
+		close(driver_data->video_fd);
+	if (driver_data->media_fd >= 0)
+		close(driver_data->media_fd);
+	if (driver_data->av1_video_fd >= 0)
+		close(driver_data->av1_video_fd);
+	if (driver_data->av1_media_fd >= 0)
+		close(driver_data->av1_media_fd);
 
 	/*
 	 * A probe session opened for a client that exported before any

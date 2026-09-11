@@ -154,6 +154,7 @@ VAStatus RequestCreateImage(VADriverContextP context, VAImageFormat *format,
 	struct request_data *driver_data = context->pDriverData;
 	struct object_buffer *buffer_object;
 	unsigned int pitch;
+	unsigned int bytes_per_sample;
 	unsigned int luma_size;
 	unsigned int chroma_size;
 	unsigned int size;
@@ -180,14 +181,17 @@ VAStatus RequestCreateImage(VADriverContextP context, VAImageFormat *format,
 	if (format == NULL || image == NULL || width <= 0 || height <= 0)
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
 
-	if (format->fourcc != VA_FOURCC_NV12)
+	if (format->fourcc != VA_FOURCC_NV12 &&
+	    format->fourcc != VA_FOURCC_P010)
 		return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
 
-	/* NV12 needs room for a complete final UV pair when
+	bytes_per_sample = format->fourcc == VA_FOURCC_P010 ? 2 : 1;
+
+	/* NV12/P010 need room for a complete final UV pair when
 	 * width is odd. All arithmetic is widened before entering VA's u32
 	 * image fields and RequestCreateBuffer. */
 	aligned_width = ((uint64_t)(unsigned int)width + 1) & ~1ull;
-	pitch64 = aligned_width;
+	pitch64 = aligned_width * bytes_per_sample;
 	luma_size64 = pitch64 * (unsigned int)height;
 	chroma_size64 = pitch64 * (((unsigned int)height + 1) / 2);
 	size64 = luma_size64 + chroma_size64;
@@ -288,8 +292,9 @@ static VAStatus copy_surface_to_image (struct request_data *driver_data,
 	    surface_object->destination_data[0] == NULL)
 		return VA_STATUS_SUCCESS;
 
-	if (image->format.fourcc != VA_FOURCC_NV12 ||
-	    surface_object->pixel_format != VA_FOURCC_NV12)
+	if ((image->format.fourcc != VA_FOURCC_NV12 &&
+	     image->format.fourcc != VA_FOURCC_P010) ||
+	    surface_object->pixel_format != image->format.fourcc)
 		return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
 
 	/*
@@ -355,7 +360,7 @@ VAStatus RequestDeriveImage(VADriverContextP context, VASurfaceID surface_id,
 	format.fourcc = encode_surface ? VA_FOURCC_NV12 :
 				       surface_object->pixel_format;
 	format.byte_order = VA_LSB_FIRST;
-	format.bits_per_pixel = 12;
+	format.bits_per_pixel = format.fourcc == VA_FOURCC_P010 ? 24 : 12;
 
 	status = RequestCreateImage(context, &format, surface_object->width,
 				    surface_object->height, image);
@@ -392,7 +397,7 @@ VAStatus RequestQueryImageFormats(VADriverContextP context,
 	if (formats_count == NULL)
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
 	if (formats == NULL) {
-		*formats_count = 1;
+		*formats_count = 2;
 		return VA_STATUS_SUCCESS;
 	}
 
@@ -400,7 +405,11 @@ VAStatus RequestQueryImageFormats(VADriverContextP context,
 	formats[0].fourcc = VA_FOURCC_NV12;
 	formats[0].byte_order = VA_LSB_FIRST;
 	formats[0].bits_per_pixel = 12;
-	*formats_count = 1;
+	memset(&formats[1], 0, sizeof(formats[1]));
+	formats[1].fourcc = VA_FOURCC_P010;
+	formats[1].byte_order = VA_LSB_FIRST;
+	formats[1].bits_per_pixel = 24;
+	*formats_count = 2;
 
 	return VA_STATUS_SUCCESS;
 }

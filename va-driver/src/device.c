@@ -50,7 +50,8 @@
 #define RANK_RKVDEC		2
 #define RANK_ENVIRONMENT	3
 
-static int rank_device(int fd, const char *path, const char *wanted_path)
+static int rank_device(int fd, const char *path, const char *wanted_path,
+		       unsigned int wanted_format, const char *preferred_name)
 {
 	struct v4l2_capability capability;
 	bool has_h264, has_hevc, has_vp9;
@@ -65,14 +66,20 @@ static int rank_device(int fd, const char *path, const char *wanted_path)
 	if (!(capability.capabilities & V4L2_CAP_STREAMING))
 		return RANK_NONE;
 
-	has_h264 = v4l2_find_format_any(fd, V4L2_PIX_FMT_H264_SLICE);
-	has_hevc = v4l2_find_format_any(fd, V4L2_PIX_FMT_HEVC_SLICE);
-	has_vp9 = v4l2_find_format_any(fd, V4L2_PIX_FMT_VP9_FRAME);
-	if (!has_h264 && !has_hevc && !has_vp9)
-		return RANK_NONE;
+	if (wanted_format != 0) {
+		if (!v4l2_find_format_any(fd, wanted_format))
+			return RANK_NONE;
+	} else {
+		has_h264 = v4l2_find_format_any(fd, V4L2_PIX_FMT_H264_SLICE);
+		has_hevc = v4l2_find_format_any(fd, V4L2_PIX_FMT_HEVC_SLICE);
+		has_vp9 = v4l2_find_format_any(fd, V4L2_PIX_FMT_VP9_FRAME);
+		if (!has_h264 && !has_hevc && !has_vp9)
+			return RANK_NONE;
+	}
 
-	if (strstr((const char *)capability.card, "rkvdec") != NULL ||
-	    strstr((const char *)capability.driver, "rkvdec") != NULL)
+	if (preferred_name != NULL &&
+	    (strstr((const char *)capability.card, preferred_name) != NULL ||
+	     strstr((const char *)capability.driver, preferred_name) != NULL))
 		return RANK_RKVDEC;
 
 	return RANK_OTHER;
@@ -126,12 +133,18 @@ static int media_node_for_bus(const char *bus_info, char *out, size_t len)
 	return found;
 }
 
-int decoder_device_open(int *video_fd_out, int *media_fd_out,
-			char *video_path_out, char *media_path_out,
-			size_t path_len)
+static int decoder_device_open_format(unsigned int wanted_format,
+				      const char *preferred_name,
+				      const char *video_environment,
+				      const char *media_environment,
+				      const char *description,
+				      int *video_fd_out, int *media_fd_out,
+				      char *video_path_out,
+				      char *media_path_out,
+				      size_t path_len)
 {
-	const char *wanted_video = getenv("LIBVA_V4L2_REQUEST_VIDEO_PATH");
-	const char *wanted_media = getenv("LIBVA_V4L2_REQUEST_MEDIA_PATH");
+	const char *wanted_video = getenv(video_environment);
+	const char *wanted_media = getenv(media_environment);
 	char best_video[PATH_MAX] = "";
 	char best_bus[sizeof(((struct v4l2_capability *)0)->bus_info)] = "";
 	char media_path[PATH_MAX];
@@ -156,7 +169,8 @@ int decoder_device_open(int *video_fd_out, int *media_fd_out,
 		if (fd < 0)
 			continue;
 
-		rank = rank_device(fd, path, wanted_video);
+		rank = rank_device(fd, path, wanted_video, wanted_format,
+				   preferred_name);
 		if (getenv("LIBVA_V4L2_REQUEST_DEBUG") != NULL) {
 			struct v4l2_capability cap;
 
@@ -186,7 +200,8 @@ int decoder_device_open(int *video_fd_out, int *media_fd_out,
 	closedir(dir);
 
 	if (best_rank == RANK_NONE) {
-		request_log("device: no V4L2 stateless H.264/HEVC/VP9 decoder found\n");
+		request_log("device: no V4L2 stateless %s decoder found\n",
+			    description);
 		return -1;
 	}
 
@@ -217,6 +232,28 @@ int decoder_device_open(int *video_fd_out, int *media_fd_out,
 	snprintf(video_path_out, path_len, "%s", best_video);
 	snprintf(media_path_out, path_len, "%s", media_path);
 	return 0;
+}
+
+int decoder_device_open(int *video_fd_out, int *media_fd_out,
+			char *video_path_out, char *media_path_out,
+			size_t path_len)
+{
+	return decoder_device_open_format(0, "rkvdec",
+		"LIBVA_V4L2_REQUEST_VIDEO_PATH",
+		"LIBVA_V4L2_REQUEST_MEDIA_PATH", "H.264/HEVC/VP9",
+		video_fd_out, media_fd_out, video_path_out, media_path_out,
+		path_len);
+}
+
+int av1_decoder_device_open(int *video_fd_out, int *media_fd_out,
+			    char *video_path_out, char *media_path_out,
+			    size_t path_len)
+{
+	return decoder_device_open_format(V4L2_PIX_FMT_AV1_FRAME, "av1",
+		"LIBVA_V4L2_REQUEST_AV1_VIDEO_PATH",
+		"LIBVA_V4L2_REQUEST_AV1_MEDIA_PATH", "AV1",
+		video_fd_out, media_fd_out, video_path_out, media_path_out,
+		path_len);
 }
 
 /*

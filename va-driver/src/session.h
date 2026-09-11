@@ -65,10 +65,11 @@ struct decoder_session {
 	 * rkvdec_hevc_start() rejects chroma_format_idc == 0.
 	 */
 	bool streaming;
+	bool av1_device;
 };
 
 int decoder_session_open(struct request_data *driver_data,
-			 struct decoder_session *session);
+			 struct decoder_session *session, int profile);
 void decoder_session_close(struct decoder_session *session);
 
 #endif

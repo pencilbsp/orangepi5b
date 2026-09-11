@@ -13,8 +13,14 @@
 #include "utils.h"
 
 int decoder_session_open(struct request_data *driver_data,
-			 struct decoder_session *session)
+			 struct decoder_session *session, int profile)
 {
+	const bool av1 = profile == VAProfileAV1Profile0;
+	const char *video_path = av1 ? driver_data->av1_video_path :
+				       driver_data->video_path;
+	const char *media_path = av1 ? driver_data->av1_media_path :
+				       driver_data->media_path;
+
 	memset(session, 0, sizeof(*session));
 	session->video_fd = -1;
 	session->media_fd = -1;
@@ -23,19 +29,23 @@ int decoder_session_open(struct request_data *driver_data,
 	 * The device was chosen once, at driver init; a session only reopens
 	 * the same nodes so that it gets file handles of its own.
 	 */
-	session->video_fd = open(driver_data->video_path, O_RDWR | O_NONBLOCK);
+	if (av1 && !driver_data->has_av1_decoder)
+		return -1;
+
+	session->video_fd = open(video_path, O_RDWR | O_NONBLOCK);
 	if (session->video_fd < 0) {
-		request_log("session: cannot open %s\n", driver_data->video_path);
+		request_log("session: cannot open %s\n", video_path);
 		return -1;
 	}
 
-	session->media_fd = open(driver_data->media_path, O_RDWR | O_NONBLOCK);
+	session->media_fd = open(media_path, O_RDWR | O_NONBLOCK);
 	if (session->media_fd < 0) {
-		request_log("session: cannot open %s\n", driver_data->media_path);
+		request_log("session: cannot open %s\n", media_path);
 		close(session->video_fd);
 		session->video_fd = -1;
 		return -1;
 	}
+	session->av1_device = av1;
 
 	return 0;
 }
@@ -58,4 +68,5 @@ void decoder_session_close(struct decoder_session *session)
 	session->free_capture_count = 0;
 	session->programmed_profile = VAProfileNone;
 	session->streaming = false;
+	session->av1_device = false;
 }

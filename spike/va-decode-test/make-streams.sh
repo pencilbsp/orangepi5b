@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generate the H.264 / HEVC / VP9 coverage set used to prove the VA driver
+# Generate the H.264 / HEVC / VP9 / AV1 coverage set used to prove the VA driver
 # decodes bit-identically to software.
 #
 # Runs in the amd64 cross chroot, which has ffmpeg: encoding is host work and
@@ -80,6 +80,18 @@ encvp9p2() {
 	printf '  %-34s %s\n' "$name.ivf" "$(stat -c%s "$OUT/$name.ivf") bytes"
 }
 
+encav1() { # name, pixel format, extra opts, frames, size
+	local name="$1" pix_fmt="$2" opts="$3" frames="$4" size="$5"
+	# IVF keeps AV1 frame boundaries explicit. libaom is deliberately run in
+	# a fast deterministic mode: these are decoder fixtures, not quality tests.
+	# shellcheck disable=SC2046
+	ffmpeg -hide_banner -loglevel error -y $(src "$frames" "$size") \
+		-vf "format=$pix_fmt" -pix_fmt "$pix_fmt" \
+		-c:v libaom-av1 -cpu-used 8 -row-mt 1 -g 30 -crf 32 -b:v 0 \
+		$opts -f ivf "$OUT/$name.ivf"
+	printf '  %-34s %s\n' "$name.ivf" "$(stat -c%s "$OUT/$name.ivf") bytes"
+}
+
 echo "H.264:"
 # Profile and entropy coder coverage.
 enc h264-baseline-cavlc "-profile:v baseline -bf 0 -coder 0 -g 30"        60  1280x720
@@ -111,6 +123,19 @@ echo "VP9 Profile 0:"
 encvp9 vp9-profile0-repeated "-auto-alt-ref 1 -lag-in-frames 16"          180  1280x720
 # More than one tile column exercises tile_info parsing and kernel layout.
 encvp9 vp9-profile0-tiles    "-tile-columns 2 -row-mt 1"                  120  1920x1080
+
+echo "AV1 Profile 0:"
+# Repeated keyframes exercise reference-map and entropy-context lifetime.
+encav1 av1-8bit-repeated  yuv420p     ""                                  120  1280x720
+# AV1 10-bit is native P010, not the packed NV15 layout used by VP9 Profile 2.
+encav1 av1-10bit-repeated yuv420p10le ""                                   60  1280x720
+
+# Chrome consumes AV1 in WebM. Remux one fixture without re-encoding.
+ffmpeg -hide_banner -loglevel error -y \
+	-i "$OUT/av1-8bit-repeated.ivf" -c:v copy -an \
+	"$OUT/av1-8bit-chrome.webm"
+printf '  %-34s %s\n' "av1-8bit-chrome.webm" \
+	"$(stat -c%s "$OUT/av1-8bit-chrome.webm") bytes"
 
 if [ "$GENERATE_VP9_PROFILE2" = 1 ]; then
 	echo "VP9 Profile 2 deferred fixtures (10-bit 4:2:0):"

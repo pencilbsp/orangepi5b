@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pencilbsp <pencil.bsp@gmail.com>
+Date: Fri, 11 Sep 2026 10:30:00 +0700
+Subject: [PATCH] media: hantro: bound AV1 postproc buffers to reference slots
+
+The RK3588 AV1 block decodes into a private tiled buffer and uses its
+post-processor to produce the linear CAPTURE buffer. Hantro currently
+allocates one private buffer for every CAPTURE slot and indexes it by vb2
+buffer index.
+
+That is unnecessarily expensive for AV1. Chromium uses up to 25
+presentation surfaces, while AV1 can retain only eight reference frames
+plus the current frame. At 3840x2160 each private image and motion-vector
+allocation is about 13.4 MiB, so duplicating it for every presentation
+surface exhausts a 512 MiB CMA area during STREAMON.
+
+Index the AV1 private buffers by the driver's existing frame_refs slot
+instead. Those slots already track reference lifetime and are bounded by
+AV1_MAX_FRAME_BUF_COUNT. Allocate only that many buffers and reserve them
+before vb2 allocates the public CAPTURE pool. The ordering matters because
+otherwise those large allocations can fail after CAPTURE has fragmented
+CMA even when enough pages remain in total.
+
+Other Hantro codecs retain their existing one-private-buffer-per-CAPTURE
+behaviour.
+
+Signed-off-by: pencilbsp <pencil.bsp@gmail.com>
+---
+--- a/drivers/media/platform/verisilicon/hantro.h
++++ b/drivers/media/platform/verisilicon/hantro.h
+@@ -503,6 +503,8 @@
+ void hantro_postproc_disable(struct hantro_ctx *ctx);
+ void hantro_postproc_enable(struct hantro_ctx *ctx);
+ int hantro_postproc_init(struct hantro_ctx *ctx);
++int hantro_postproc_preallocate(struct hantro_ctx *ctx,
++				unsigned int num_buffers);
+ void hantro_postproc_free(struct hantro_ctx *ctx);
+ int hanto_postproc_enum_framesizes(struct hantro_ctx *ctx,
+ 				   struct v4l2_frmsizeenum *fsize);
+--- a/drivers/media/platform/verisilicon/hantro_drv.c
++++ b/drivers/media/platform/verisilicon/hantro_drv.c
+@@ -693,6 +693,7 @@
+ 	 * to this file.
+ 	 */
+ 	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
++	hantro_postproc_free(ctx);
+ 	v4l2_fh_del(&ctx->fh, filp);
+ 	v4l2_fh_exit(&ctx->fh);
+ 	v4l2_ctrl_handler_free(&ctx->ctrl_handler);
+--- a/drivers/media/platform/verisilicon/hantro_v4l2.c
++++ b/drivers/media/platform/verisilicon/hantro_v4l2.c
+@@ -810,7 +810,7 @@
+ {
+ 	struct hantro_ctx *ctx = vb2_get_drv_priv(vq);
+ 	struct v4l2_pix_format_mplane *pixfmt;
+-	int i;
++	int i, ret;
+ 
+ 	switch (vq->type) {
+ 	case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
+@@ -824,6 +824,19 @@
+ 		return -EINVAL;
+ 	}
+ 
++	/*
++	 * Reserve AV1's physically contiguous reference buffers before vb2
++	 * allocates the larger CAPTURE pool. Doing this later at STREAMON leaves
++	 * CMA too fragmented for a 4K reference buffer even when enough pages are
++	 * free in total.
++	 */
++	if (vq->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
++	    ctx->vpu_src_fmt->fourcc == V4L2_PIX_FMT_AV1_FRAME) {
++		ret = hantro_postproc_preallocate(ctx, AV1_MAX_FRAME_BUF_COUNT);
++		if (ret)
++			return ret;
++	}
++
+ 	if (*num_planes) {
+ 		if (*num_planes != pixfmt->num_planes)
+ 			return -EINVAL;
+--- a/drivers/media/platform/verisilicon/hantro_postproc.c
++++ b/drivers/media/platform/verisilicon/hantro_postproc.c
+@@ -229,6 +229,13 @@
+ 
+ 	if (!buf_size)
+ 		return -EINVAL;
++	if (priv->cpu && priv->size >= buf_size)
++		return 0;
++	if (priv->cpu) {
++		dma_free_attrs(vpu->dev, priv->size, priv->cpu,
++			       priv->dma, priv->attrs);
++		priv->cpu = NULL;
++	}
+ 
+ 	/*
+ 	 * The buffers on this queue are meant as intermediate
+@@ -244,14 +251,22 @@
+ 	return 0;
+ }
+ 
+-int hantro_postproc_init(struct hantro_ctx *ctx)
++int hantro_postproc_preallocate(struct hantro_ctx *ctx,
++				unsigned int num_buffers)
+ {
+-	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
+-	struct vb2_queue *cap_queue = &m2m_ctx->cap_q_ctx.q;
+-	unsigned int num_buffers = vb2_get_num_buffers(cap_queue);
+ 	unsigned int i;
+ 	int ret;
+ 
++	/*
++	 * AV1 keeps at most eight references plus the frame currently being
++	 * decoded. Its backend indexes dec_q[] by that reference slot rather than
++	 * by CAPTURE index, so allocating one tiled shadow for every presentation
++	 * surface only wastes CMA (and makes 1440p/4K fail at STREAMON).
++	 */
++	if (ctx->vpu_src_fmt->fourcc == V4L2_PIX_FMT_AV1_FRAME)
++		num_buffers = min_t(unsigned int, num_buffers,
++				    AV1_MAX_FRAME_BUF_COUNT);
++
+ 	for (i = 0; i < num_buffers; i++) {
+ 		ret = hantro_postproc_alloc(ctx, i);
+ 		if (ret) {
+@@ -263,6 +278,15 @@
+ 	return 0;
+ }
+ 
++int hantro_postproc_init(struct hantro_ctx *ctx)
++{
++	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
++	struct vb2_queue *cap_queue = &m2m_ctx->cap_q_ctx.q;
++
++	return hantro_postproc_preallocate(ctx,
++					  vb2_get_num_buffers(cap_queue));
++}
++
+ dma_addr_t
+ hantro_postproc_get_dec_buf_addr(struct hantro_ctx *ctx, int index)
+ {
+--- a/drivers/media/platform/verisilicon/rockchip_vpu981_hw_av1_dec.c
++++ b/drivers/media/platform/verisilicon/rockchip_vpu981_hw_av1_dec.c
+@@ -749,7 +749,7 @@
+ 	}
+ 
+ 	dst = vb2_to_hantro_decoded_buf(&av1_dec->frame_refs[idx].vb2_ref->vb2_buf);
+-	luma_addr = hantro_get_dec_buf_addr(ctx, &dst->base.vb.vb2_buf);
++	luma_addr = hantro_postproc_get_dec_buf_addr(ctx, idx);
+ 	chroma_addr = luma_addr + dst->av1.chroma_offset;
+ 	mv_addr = luma_addr + dst->av1.mv_offset;
+ 
+@@ -814,7 +814,7 @@
+ 			size_t mv_offset = rockchip_vpu981_av1_dec_chroma_size(ctx);
+ 
+ 			seg = vb2_to_hantro_decoded_buf(&av1_dec->frame_refs[idx].vb2_ref->vb2_buf);
+-			luma_addr = hantro_get_dec_buf_addr(ctx, &seg->base.vb.vb2_buf);
++			luma_addr = hantro_postproc_get_dec_buf_addr(ctx, idx);
+ 			mv_addr = luma_addr + mv_offset;
+ 
+ 			hantro_write_addr(vpu, AV1_SEGMENTATION, mv_addr);
+@@ -2125,7 +2125,7 @@
+ 
+ 	vb2_dst = av1_dec->frame_refs[av1_dec->current_frame_index].vb2_ref;
+ 	dst = vb2_to_hantro_decoded_buf(&vb2_dst->vb2_buf);
+-	luma_addr = hantro_get_dec_buf_addr(ctx, &dst->base.vb.vb2_buf);
++	luma_addr = hantro_postproc_get_dec_buf_addr(ctx, av1_dec->current_frame_index);
+ 	chroma_addr = luma_addr + cr_offset;
+ 	mv_addr = luma_addr + mv_offset;
+ 
+-- 
+2.51.0

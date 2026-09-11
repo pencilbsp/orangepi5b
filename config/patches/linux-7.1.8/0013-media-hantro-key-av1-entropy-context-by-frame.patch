@@ -1,0 +1,195 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pencilbsp <pencil.bsp@gmail.com>
+Date: Thu, 27 Aug 2026 22:40:00 +0700
+Subject: [PATCH] media: hantro: key AV1 entropy context by frame, not by
+ refresh_frame_flags
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The AV1 decoder stores each frame's adapted entropy context into the
+reference slots named by refresh_frame_flags, and loads it back from the
+slot named by ref_frame_idx[primary_ref_frame]. Both are positions in the
+bitstream's eight-slot reference map.
+
+That works for a client which parses the frame header itself, but not for
+one driving this decoder through VA-API. The VA-API AV1 interface does not
+carry refresh_frame_flags: it describes the reference map as it stands
+*before* the frame, and the slots a frame writes only become visible in the
+map of the frame after it. Differencing consecutive maps recovers the value
+exactly, but always one frame too late, so a VA-API driver has to guess —
+and a wrong guess files the context under the wrong slot, which every later
+frame predicting from that reference then inherits. Measured on a 634 s 4K60
+AV1 stream decoded through libva-v4l2-request, 206 of 240 frames came out
+wrong; replaying the correct values recorded from GStreamer's own decode
+made the same stream bit-exact, which is what identified the field.
+
+Nothing about the hardware needs the slot numbering. The driver already
+tracks every live frame in frame_refs[], keyed by the OUTPUT buffer
+timestamp, and already resolves references through it — rockchip_vpu981_-
+get_frame_index() turns a reference index into a frame_refs entry without
+consulting refresh_frame_flags at all. Key the entropy context the same
+way: store it under the deciding frame's own frame_refs slot, and load it
+under the primary reference's. The context then follows the frame it
+belongs to, and refresh_frame_flags stops being load-bearing.
+
+frame_refs[] holds one more entry than the reference map does, so the two
+context arrays grow to match it. Both helpers now take a frame_refs index
+and bounds-check it, and set_prob() falls back to the default context when
+the primary reference cannot be resolved, which previously could not happen
+because the slot index was taken on trust.
+
+Signed-off-by: pencilbsp <pencil.bsp@gmail.com>
+---
+--- a/drivers/media/platform/verisilicon/hantro_hw.h
++++ b/drivers/media/platform/verisilicon/hantro_hw.h
+@@ -312,8 +312,8 @@
+  * @cdfs_ndvc:		current mv probabilities structure
+  * @default_cdfs:	default probabilities structure
+  * @default_cdfs_ndvc:	default mv probabilties structure
+- * @cdfs_last:		stored probabilities structures
+- * @cdfs_last_ndvc:	stored mv probabilities structures
++ * @cdfs_last:		stored probabilities structures, indexed like frame_refs
++ * @cdfs_last_ndvc:	stored mv probabilities structures, indexed like frame_refs
+  * @current_frame_index: index of the current in frame_refs array
+  */
+ struct hantro_av1_dec_hw_ctx {
+@@ -337,8 +337,8 @@
+ 	struct mvcdfs  *cdfs_ndvc;
+ 	struct av1cdfs default_cdfs;
+ 	struct mvcdfs  default_cdfs_ndvc;
+-	struct av1cdfs cdfs_last[NUM_REF_FRAMES];
+-	struct mvcdfs  cdfs_last_ndvc[NUM_REF_FRAMES];
++	struct av1cdfs cdfs_last[AV1_MAX_FRAME_BUF_COUNT];
++	struct mvcdfs  cdfs_last_ndvc[AV1_MAX_FRAME_BUF_COUNT];
+ 	int current_frame_index;
+ };
+ /**
+--- a/drivers/media/platform/verisilicon/rockchip_av1_entropymode.c
++++ b/drivers/media/platform/verisilicon/rockchip_av1_entropymode.c
+@@ -4398,27 +4398,26 @@
+ 	       sizeof(cdfs->compound_idx_cdf));
+ }
+ 
+-void rockchip_av1_get_cdfs(struct hantro_ctx *ctx, u32 ref_idx)
++void rockchip_av1_get_cdfs(struct hantro_ctx *ctx, u32 frame_index)
+ {
+ 	struct hantro_av1_dec_hw_ctx *av1_dec = &ctx->av1_dec;
+ 
+-	av1_dec->cdfs = &av1_dec->cdfs_last[ref_idx];
+-	av1_dec->cdfs_ndvc = &av1_dec->cdfs_last_ndvc[ref_idx];
++	if (frame_index >= AV1_MAX_FRAME_BUF_COUNT)
++		return;
++
++	av1_dec->cdfs = &av1_dec->cdfs_last[frame_index];
++	av1_dec->cdfs_ndvc = &av1_dec->cdfs_last_ndvc[frame_index];
+ }
+ 
+-void rockchip_av1_store_cdfs(struct hantro_ctx *ctx,
+-			     u32 refresh_frame_flags)
++void rockchip_av1_store_cdfs(struct hantro_ctx *ctx, u32 frame_index)
+ {
+ 	struct hantro_av1_dec_hw_ctx *av1_dec = &ctx->av1_dec;
+-	int i;
+ 
+-	for (i = 0; i < NUM_REF_FRAMES; i++) {
+-		if (refresh_frame_flags & (1 << i)) {
+-			if (&av1_dec->cdfs_last[i] != av1_dec->cdfs) {
+-				av1_dec->cdfs_last[i] = *av1_dec->cdfs;
+-				av1_dec->cdfs_last_ndvc[i] =
+-				    *av1_dec->cdfs_ndvc;
+-			}
+-		}
++	if (frame_index >= AV1_MAX_FRAME_BUF_COUNT)
++		return;
++
++	if (&av1_dec->cdfs_last[frame_index] != av1_dec->cdfs) {
++		av1_dec->cdfs_last[frame_index] = *av1_dec->cdfs;
++		av1_dec->cdfs_last_ndvc[frame_index] = *av1_dec->cdfs_ndvc;
+ 	}
+ }
+--- a/drivers/media/platform/verisilicon/rockchip_av1_entropymode.h
++++ b/drivers/media/platform/verisilicon/rockchip_av1_entropymode.h
+@@ -262,9 +262,8 @@
+ 	u16 dummy3[16];
+ };
+ 
+-void rockchip_av1_store_cdfs(struct hantro_ctx *ctx,
+-			     u32 refresh_frame_flags);
+-void rockchip_av1_get_cdfs(struct hantro_ctx *ctx, u32 ref_idx);
++void rockchip_av1_store_cdfs(struct hantro_ctx *ctx, u32 frame_index);
++void rockchip_av1_get_cdfs(struct hantro_ctx *ctx, u32 frame_index);
+ void rockchip_av1_set_default_cdfs(struct av1cdfs *cdfs,
+ 				   struct mvcdfs *cdfs_ndvc);
+ void rockchip_av1_default_coeff_probs(u32 base_qindex, void *ptr);
+--- a/drivers/media/platform/verisilicon/rockchip_vpu981_hw_av1_dec.c
++++ b/drivers/media/platform/verisilicon/rockchip_vpu981_hw_av1_dec.c
+@@ -1135,27 +1135,28 @@
+ 	const struct v4l2_ctrl_av1_frame *frame = ctrls->frame;
+ 	bool frame_is_intra = IS_INTRA(frame->frame_type);
+ 	struct av1cdfs *out_cdfs = (struct av1cdfs *)av1_dec->prob_tbl_out.cpu;
+-	int i;
++	struct mvcdfs stored_mv_cdf;
++	int idx = av1_dec->current_frame_index;
+ 
+ 	if (frame->flags & V4L2_AV1_FRAME_FLAG_DISABLE_FRAME_END_UPDATE_CDF)
+ 		return;
+ 
+-	for (i = 0; i < NUM_REF_FRAMES; i++) {
+-		if (frame->refresh_frame_flags & BIT(i)) {
+-			struct mvcdfs stored_mv_cdf;
++	if (idx == AV1_INVALID_IDX)
++		return;
+ 
+-			rockchip_av1_get_cdfs(ctx, i);
+-			stored_mv_cdf = av1_dec->cdfs->mv_cdf;
+-			*av1_dec->cdfs = *out_cdfs;
+-			if (frame_is_intra) {
+-				av1_dec->cdfs->mv_cdf = stored_mv_cdf;
+-				*av1_dec->cdfs_ndvc = out_cdfs->mv_cdf;
+-			}
+-			rockchip_av1_store_cdfs(ctx,
+-						frame->refresh_frame_flags);
+-			break;
+-		}
++	/*
++	 * The adapted context belongs to the frame that just decoded, so
++	 * keep it under that frame's own slot in frame_refs rather than
++	 * under whichever reference slots it happens to refresh.
++	 */
++	rockchip_av1_get_cdfs(ctx, idx);
++	stored_mv_cdf = av1_dec->cdfs->mv_cdf;
++	*av1_dec->cdfs = *out_cdfs;
++	if (frame_is_intra) {
++		av1_dec->cdfs->mv_cdf = stored_mv_cdf;
++		*av1_dec->cdfs_ndvc = out_cdfs->mv_cdf;
+ 	}
++	rockchip_av1_store_cdfs(ctx, idx);
+ }
+ 
+ void rockchip_vpu981_av1_dec_done(struct hantro_ctx *ctx)
+@@ -1181,9 +1182,19 @@
+ 		rockchip_av1_default_coeff_probs(quantization->base_q_idx,
+ 						 av1_dec->cdfs);
+ 	} else {
+-		rockchip_av1_get_cdfs(ctx, frame->ref_frame_idx[frame->primary_ref_frame]);
++		int idx = rockchip_vpu981_get_frame_index(ctx,
++							 frame->primary_ref_frame);
++
++		if (idx == AV1_INVALID_IDX) {
++			av1_dec->cdfs = &av1_dec->default_cdfs;
++			av1_dec->cdfs_ndvc = &av1_dec->default_cdfs_ndvc;
++			rockchip_av1_default_coeff_probs(quantization->base_q_idx,
++							 av1_dec->cdfs);
++		} else {
++			rockchip_av1_get_cdfs(ctx, idx);
++		}
+ 	}
+-	rockchip_av1_store_cdfs(ctx, frame->refresh_frame_flags);
++	rockchip_av1_store_cdfs(ctx, av1_dec->current_frame_index);
+ 
+ 	memcpy(av1_dec->prob_tbl.cpu, av1_dec->cdfs, sizeof(struct av1cdfs));
+ 
+-- 
+2.50.1
+

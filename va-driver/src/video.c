@@ -34,7 +34,37 @@
 #include "utils.h"
 #include "video.h"
 
+#ifndef V4L2_PIX_FMT_P010
+#define V4L2_PIX_FMT_P010 v4l2_fourcc('P', '0', '1', '0')
+#endif
+
+#ifndef DRM_FORMAT_P010
+#define DRM_FORMAT_P010 fourcc_code('P', '0', '1', '0')
+#endif
+
 static struct video_format formats[] = {
+	{
+		.description		= "P010 YUV (MPLANE)",
+		.v4l2_format		= V4L2_PIX_FMT_P010,
+		.v4l2_buffers_count	= 1,
+		.v4l2_mplane		= true,
+		.drm_format		= DRM_FORMAT_P010,
+		.drm_modifier		= DRM_FORMAT_MOD_NONE,
+		.planes_count		= 2,
+		.bpp			= 24,
+		.height_alignment	= 1,
+	},
+	{
+		.description		= "P010 YUV",
+		.v4l2_format		= V4L2_PIX_FMT_P010,
+		.v4l2_buffers_count	= 1,
+		.v4l2_mplane		= false,
+		.drm_format		= DRM_FORMAT_P010,
+		.drm_modifier		= DRM_FORMAT_MOD_NONE,
+		.planes_count		= 2,
+		.bpp			= 24,
+		.height_alignment	= 1,
+	},
 	{
 		.description		= "NV12 YUV (MPLANE)",
 		.v4l2_format		= V4L2_PIX_FMT_NV12,

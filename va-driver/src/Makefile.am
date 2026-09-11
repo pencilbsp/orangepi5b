@@ -53,7 +53,9 @@ v4l2_request_drv_video_la_SOURCES = request.c \
 	h264.c \
 	h264.h \
 	h265.c \
-	h265.h
+	h265.h \
+	av1.c \
+	av1.h
 
 v4l2_request_drv_video_la_CFLAGS = -I../include $(DRM_CFLAGS) $(LIBVA_CFLAGS)
 v4l2_request_drv_video_la_LDFLAGS = -module -avoid-version -no-undefined \

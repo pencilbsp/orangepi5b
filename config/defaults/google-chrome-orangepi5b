@@ -1,0 +1,11 @@
+#!/bin/sh
+# Chrome's Linux VA-API path is still gated for non-Intel/AMD devices. Keep
+# the board-specific policy in one wrapper so launching from GNOME, xdg-open
+# or either browser alternative reaches the same hardware decoder.
+export LIBVA_DRIVER_NAME=v4l2_request
+
+exec /usr/bin/google-chrome-stable \
+	--ozone-platform=wayland \
+	--enable-features=AcceleratedVideoDecodeLinuxGL,AcceleratedVideoDecodeLinuxZeroCopyGL,VaapiIgnoreDriverChecks \
+	--ignore-gpu-blocklist \
+	"$@"

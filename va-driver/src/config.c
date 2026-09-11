@@ -54,6 +54,27 @@ static bool config_profile_is_h264(VAProfile profile)
 	}
 }
 
+unsigned int config_profile_rt_formats(VAProfile profile)
+{
+	return profile == VAProfileAV1Profile0 ?
+		VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10 :
+		VA_RT_FORMAT_YUV420;
+}
+
+unsigned int config_rt_format(const struct object_config *config)
+{
+	int i;
+
+	if (config == NULL)
+		return VA_RT_FORMAT_YUV420;
+
+	for (i = 0; i < config->attributes_count; i++)
+		if (config->attributes[i].type == VAConfigAttribRTFormat)
+			return config->attributes[i].value;
+
+	return VA_RT_FORMAT_YUV420;
+}
+
 static bool config_encoder_limits(struct request_data *driver_data,
 				  struct v4l2_frame_limits *limits)
 {
@@ -130,6 +151,7 @@ VAStatus RequestCreateConfig(VADriverContextP context, VAProfile profile,
 {
 	struct request_data *driver_data = context->pDriverData;
 	struct object_config *config_object;
+	unsigned int supported_rt_format;
 	VAConfigID id;
 	int i, index;
 
@@ -149,12 +171,21 @@ VAStatus RequestCreateConfig(VADriverContextP context, VAProfile profile,
 			return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
 		break;
 
+	case VAProfileAV1Profile0:
+		if (!driver_data->has_av1_decoder)
+			return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
+		if (entrypoint != VAEntrypointVLD)
+			return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
+		break;
+
 	default:
 		return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
 	}
 
 	if (attributes_count > V4L2_REQUEST_MAX_CONFIG_ATTRIBUTES)
 		attributes_count = V4L2_REQUEST_MAX_CONFIG_ATTRIBUTES;
+
+	supported_rt_format = config_profile_rt_formats(profile);
 
 	id = object_heap_allocate(&driver_data->config_heap);
 	config_object = CONFIG(driver_data, id);
@@ -169,7 +200,8 @@ VAStatus RequestCreateConfig(VADriverContextP context, VAProfile profile,
 
 	for (i = 0; i < attributes_count; i++) {
 		if (attributes[i].type == VAConfigAttribRTFormat) {
-			if (attributes[i].value != VA_RT_FORMAT_YUV420) {
+			if ((attributes[i].value & supported_rt_format) == 0 ||
+			    (attributes[i].value & ~supported_rt_format) != 0) {
 				object_heap_free(&driver_data->config_heap,
 						 (struct object_base *)config_object);
 				return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
@@ -222,7 +254,7 @@ VAStatus RequestQueryConfigProfiles(VADriverContextP context,
 	 *
 	 * Deliberately absent:
 	 *   MPEG-2            - no backend here
-	 *   AV1, VP8          - out of scope; AV1 lives on a different block
+	 *   VP8               - no backend here
 	 *   H264 Multiview /
 	 *   Stereo High       - rkvdec decodes a single view
 	 *   HEVC Main 10      - not wired through this VA backend
@@ -247,6 +279,12 @@ VAStatus RequestQueryConfigProfiles(VADriverContextP context,
 				     V4L2_PIX_FMT_VP9_FRAME);
 	if (found && index < V4L2_REQUEST_MAX_PROFILES)
 		profiles[index++] = VAProfileVP9Profile0;
+
+	found = driver_data->has_av1_decoder &&
+		v4l2_find_format_any(driver_data->av1_video_fd,
+				     V4L2_PIX_FMT_AV1_FRAME);
+	if (found && index < V4L2_REQUEST_MAX_PROFILES)
+		profiles[index++] = VAProfileAV1Profile0;
 	*profiles_count = index;
 
 	return VA_STATUS_SUCCESS;
@@ -278,6 +316,15 @@ VAStatus RequestQueryConfigEntrypoints(VADriverContextP context,
 	case VAProfileVP9Profile0:
 		entrypoints[0] = VAEntrypointVLD;
 		*entrypoints_count = 1;
+		break;
+
+	case VAProfileAV1Profile0:
+		if (driver_data->has_av1_decoder) {
+			entrypoints[0] = VAEntrypointVLD;
+			*entrypoints_count = 1;
+		} else {
+			*entrypoints_count = 0;
+		}
 		break;
 
 	default:
@@ -344,15 +391,20 @@ VAStatus RequestGetConfigAttributes(VADriverContextP context, VAProfile profile,
 
 	supported_decode = entrypoint == VAEntrypointVLD &&
 		profile_to_pixelformat(profile, &pixelformat) == 0;
+	if (profile == VAProfileAV1Profile0 && !driver_data->has_av1_decoder)
+		supported_decode = false;
 	if (supported_decode)
-		have_limits = v4l2_get_frame_sizes(driver_data->video_fd,
+		have_limits = v4l2_get_frame_sizes(
+			profile == VAProfileAV1Profile0 ? driver_data->av1_video_fd :
+							 driver_data->video_fd,
 						   pixelformat, &limits) == 0;
 
 	for (i = 0; i < attributes_count; i++) {
 		switch (attributes[i].type) {
 		case VAConfigAttribRTFormat:
 			attributes[i].value = supported_decode ?
-				VA_RT_FORMAT_YUV420 : VA_ATTRIB_NOT_SUPPORTED;
+				config_profile_rt_formats(profile) :
+				VA_ATTRIB_NOT_SUPPORTED;
 			break;
 
 		/*

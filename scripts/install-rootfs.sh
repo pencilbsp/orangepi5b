@@ -91,8 +91,24 @@ install -m 0644 "$ROOT/cache/debs/$chrome_deb" "$R/tmp/$chrome_deb"
 chroot "$R" apt-get -y --no-install-recommends install "/tmp/$chrome_deb"
 rm -f "$R/tmp/$chrome_deb"
 [[ $(chroot "$R" dpkg-query -W '-f=${Version}' google-chrome-stable) == "$CHROME_VERSION" ]]
-chroot "$R" update-alternatives --set x-www-browser /usr/bin/google-chrome-stable
-chroot "$R" update-alternatives --set gnome-www-browser /usr/bin/google-chrome-stable
+install -D -m 0755 "$ROOT/config/defaults/google-chrome-orangepi5b" \
+  "$R/usr/local/bin/google-chrome-orangepi5b"
+
+# Keep the distro-owned desktop file untouched. /usr/local/share has higher
+# XDG precedence, so this same-id override survives a later Chrome package
+# update and all three launcher actions keep using the VA-API wrapper.
+install -D -m 0644 "$R/usr/share/applications/google-chrome.desktop" \
+  "$R/usr/local/share/applications/google-chrome.desktop"
+sed -i 's#^Exec=/usr/bin/google-chrome-stable#Exec=/usr/local/bin/google-chrome-orangepi5b#' \
+  "$R/usr/local/share/applications/google-chrome.desktop"
+chroot "$R" update-alternatives --install /usr/bin/x-www-browser \
+  x-www-browser /usr/local/bin/google-chrome-orangepi5b 250
+chroot "$R" update-alternatives --install /usr/bin/gnome-www-browser \
+  gnome-www-browser /usr/local/bin/google-chrome-orangepi5b 250
+chroot "$R" update-alternatives --set x-www-browser \
+  /usr/local/bin/google-chrome-orangepi5b
+chroot "$R" update-alternatives --set gnome-www-browser \
+  /usr/local/bin/google-chrome-orangepi5b
 install -D -m 0644 "$ROOT/config/defaults/mimeapps.list" "$R/etc/xdg/mimeapps.list"
 # GNOME-specific defaults take precedence over the generic system defaults.
 install -D -m 0644 "$ROOT/config/defaults/mimeapps.list" "$R/etc/xdg/gnome-mimeapps.list"

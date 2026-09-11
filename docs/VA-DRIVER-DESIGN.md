@@ -1,4 +1,4 @@
-# VA-API driver cho RK3588S — thiết kế H.264 + HEVC + VP9
+# VA-API driver cho RK3588S — thiết kế H.264 + HEVC + VP9 + AV1
 
 Tài liệu này rút bài học từ queue 37 patch của project tham chiếu
 (`/root/orangepi5b/patches/libva-v4l2-request/ed4bc90/`) để **viết mới**, không
@@ -9,13 +9,13 @@ Nguồn: `README.md` (1088 dòng) của queue đó, cộng nội dung từng pat
 
 ## Phạm vi
 
-VA driver chỉ quảng bá **H.264, HEVC Main và VP9 Profile 0 decode**, chỉ qua
-**rkvdec (VDPU381)** và 8-bit NV12. Kernel vẫn giữ VP9 Profile 2 + NV15 để
-phần cứng sẵn sàng cho client có thể truyền đúng DRM fourcc end-to-end.
+VA driver quảng bá **H.264, HEVC Main, VP9 Profile 0 và AV1 Profile 0 decode**.
+Ba codec đầu chạy qua **rkvdec (VDPU381)** với NV12; AV1 chạy trên node Hantro
+riêng, xuất NV12 ở 8-bit hoặc P010 ở 10-bit. Kernel vẫn giữ VP9 Profile 2 +
+NV15 để phần cứng sẵn sàng cho client có thể truyền đúng DRM fourcc end-to-end.
 
-Không làm: AV1, VP8, VP9 Profile 1/2/3 qua VA, MPEG-2, HEVC Main 10,
-multi-core. Cắt được vì:
-- AV1 nằm trên block Hantro khác, node khác — logic chọn thiết bị đa codec biến mất
+Không làm: VP8, VP9 Profile 1/2/3 qua VA, MPEG-2, HEVC Main 10, multi-core.
+Ranh giới này giữ được vì:
 - VP9 Profile 2 và HEVC Main 10 cần NV15 end-to-end. Không dùng CPU staging
   NV15→P010 vì nó phá zero-copy và không giữ được 1080p60 ổn định trong Chrome
 - VP9 Profile 1/3 cần chroma 4:2:2 hoặc 4:4:4 mà backend VDPU381 này không hỗ trợ
@@ -68,6 +68,13 @@ enumerate trước rkvdec — H.264 lặng lẽ thành rác mà **không dòng c
 đổi**. Xếp hạng: thiết bị do biến môi trường chỉ định → rkvdec → còn lại.
 
 Đây là lý do không bao giờ được ghim `/dev/videoN` vào code.
+
+AV1 không nằm trên rkvdec mà trên một node Hantro khác. Discovery vì vậy chạy
+hai lượt độc lập: H.264/HEVC/VP9 ưu tiên card/driver chứa `rkvdec`; AV1 yêu cầu
+`V4L2_PIX_FMT_AV1_FRAME` và ưu tiên tên chứa `av1`. Mỗi context sau đó mở đúng
+cặp video/media node theo profile. Có thể ép đường AV1 khi debug bằng
+`LIBVA_V4L2_REQUEST_AV1_VIDEO_PATH` và
+`LIBVA_V4L2_REQUEST_AV1_MEDIA_PATH`; số node mặc định vẫn không bị ghim cứng.
 
 ### 4. OUTPUT pixelformat chọn backend phần cứng
 
@@ -270,6 +277,42 @@ Sau khi build lại với đúng queue `0008` rồi `0012`, file
 `bbb_sunflower_2160p_60fps_normal.mp4` đã PASS 120/120 frame bit-identical ở
 3840x2160; HEVC PASS 60/60 và hai stream VP9 PASS 180/180 + 120/120.
 
+## AV1 Profile 0 — Hantro, NV12/P010
+
+AV1 dùng `V4L2_PIX_FMT_AV1_FRAME` trên block Hantro VPU981, không dùng node
+rkvdec. Backend chuyển picture/slice VA thành bốn control stateless gửi chung
+trong request: `AV1_SEQUENCE`, `AV1_FRAME`, `AV1_TILE_GROUP_ENTRY` và
+`AV1_FILM_GRAIN`. OUTPUT là nguyên frame AV1, không thêm start code Annex-B.
+
+Hai chi tiết dành riêng cho Chrome:
+
+- Chrome export surface ngay sau `vaCreateSurfaces`, trước frame đầu. Với config
+  10-bit, sequence control tối thiểu phải được đặt trước khi hỏi/lập trình
+  CAPTURE để Hantro postprocessor expose P010 và dmabuf export ngay từ đầu có
+  đúng layout.
+- Tile offset của Chrome có thể bắt đầu sau frame OBU. Backend rebase prefix về
+  biên 16 byte và trừ cùng lượng khỏi mọi tile entry; nếu giữ nguyên, Hantro
+  tính stream length vượt payload và trả frame lỗi.
+
+AV1 Profile 0 nhận cả `VA_RT_FORMAT_YUV420` và `VA_RT_FORMAT_YUV420_10`.
+CAPTURE tương ứng là NV12 và P010; descriptor separate-layers dùng R8/GR88 hoặc
+R16/GR1616 để Chrome import zero-copy. Với client như FFmpeg chỉ khai bit depth
+ở picture parameter đầu tiên, driver còn có thể đổi CAPTURE NV12→P010 trước khi
+bất kỳ buffer nào được bind. Không đổi format sau export/STREAMON vì làm vậy sẽ
+thay bộ nhớ ngay dưới client.
+
+VA không mang `refresh_frame_flags`, trong khi Hantro gốc dùng trường đó để lưu
+entropy CDF vào một trong tám reference slot. Đo trên kernel chưa vá: đường
+userspace vẫn hoàn tất đủ 120/120 frame 8-bit và 60/60 frame 10-bit, nhưng lần
+lượt 112 và 56 frame khác software. Patch kernel `0013` gắn CDF vào chính
+`frame_refs[]` entry của frame theo timestamp, rồi tải bằng primary reference;
+nhờ vậy VA không còn phải đoán refresh slot muộn một frame.
+
+Backend chủ động từ chối hai trường hợp phần cứng/VA contract hiện chưa thể trả
+đúng: intra-block-copy có thể làm request treo, còn film grain với
+`current_display_picture` riêng cần hai output surface trong khi backend chỉ có
+một. Trả lỗi cho phép client fallback, thay vì báo thành công với ảnh sai.
+
 ## STREAMON phải đợi sequence header — phát hiện khi viết, 2026-09-08
 
 **Không có trong tài liệu của reference.** Tự vấp phải và tra ra từ kernel source.
@@ -317,6 +360,15 @@ Cho CAPTURE pool co theo kích thước frame: ngân sách cố định (384 MiB
 kích thước frame, kẹp trong [20, 64]. Cận dưới 20 vì H.264 cho phép 16
 reference cộng frame hiện tại cộng dư cho hàng đợi hiển thị. Kernel hiện chỉ
 cấp tối đa 32; tại 4K con số này vừa khớp tập surface sống mà Chrome cần.
+
+AV1 cần tính riêng. Hantro postprocessor giữ một buffer tiled kèm motion-vector
+ẩn cho mỗi reference; cách cũ cấp một buffer ẩn theo **mọi CAPTURE index**, nên
+25 surface Chrome ở 4K cộng thêm 25 buffer riêng đã vượt CMA 512 MiB. Patch
+kernel `0014` ánh xạ buffer ẩn theo đúng chín `frame_refs` slot (tám reference
+và frame hiện tại), đồng thời cấp chín buffer này ngay trong `queue_setup`,
+trước vb2 CAPTURE để tránh phân mảnh CMA. VA driver trừ chi phí chín buffer ẩn
+khỏi ngân sách AV1 448 MiB rồi giới hạn pool công khai ở tối đa 25 surface,
+đúng mức Chrome yêu cầu.
 
 OUTPUT pool chỉ cần 3 slot vì đường decode hiện đồng bộ; coded slot được trả
 ngay sau `EndPicture`. Tách hai độ sâu tránh nhân 32 coded buffer 4 MiB vào CMA
@@ -372,6 +424,18 @@ initial decode error".
 
 Chrome phải chạy trong phiên Wayland đang chạy (`--ozone-platform=wayland`).
 Headless vô dụng: GPU process không chạy VA probe trước sandbox.
+
+Image cài `/usr/local/bin/google-chrome-orangepi5b` làm browser alternative và
+ghi đè desktop entry bằng cùng application ID trong `/usr/local/share`. Wrapper
+đặt `LIBVA_DRIVER_NAME=v4l2_request`, bật
+`AcceleratedVideoDecodeLinuxGL`, `AcceleratedVideoDecodeLinuxZeroCopyGL` và
+`VaapiIgnoreDriverChecks`, ép Ozone dùng Wayland rồi bỏ GPU blocklist. Không
+được dựa vào lựa chọn `auto`: Chrome 152 vẫn chọn X11 ngay cả khi phiên GNOME
+đang chạy Wayland; ca A/B AV1 4K cho thấy nhánh đó không khởi tạo VA decoder
+(`0` IRQ Hantro), còn `--ozone-platform=wayland` tạo pool 25 frame và decode
+ngay ở lần mở đầu. Nhờ vậy mở Chrome từ GNOME,
+`xdg-open` hay command-line browser alternative đều đi cùng một đường; package
+Chrome cập nhật về sau cũng không ghi đè desktop entry nằm dưới `/usr/local`.
 
 ### `media-internals` báo VAAPI nhưng màn hình vẫn đen, 2026-09-10
 
@@ -573,6 +637,10 @@ mpv/VLC — board không cài hai thứ đó nên chưa kiểm được. **Đừ
 | VP9 Profile 2: kernel control + NV15 CAPTURE | **giữ nguyên** — raw V4L2 vẫn có capability phần cứng |
 | VP9 Profile 2 qua VA/Chrome | **tạm tắt** — không quảng bá; đã gỡ CPU staging NV15→P010 |
 | Zero-copy NV15 qua Mesa | Mesa **xong**; Chrome 152 còn làm mất DRM fourcc vật lý trước EGL, cần Chromium downstream build |
+| AV1 Profile 0 8/10-bit: VA driver + NV12/P010 | **xong** 2026-09-10 — `vainfo` quảng bá, FFmpeg hoàn tất 120/120 + 60/60 frame |
+| AV1 entropy CDF patch `0013` | **xong** 2026-09-10 — module boot đúng; NV12 PASS 120/120 và P010 PASS 60/60 bit-exact |
+| AV1 qua Chrome | **xong** 2026-09-11 — cold-start 4K dùng `VaapiVideoDecoder`, pool 25 frame, Hantro `+147` IRQ/7 giây, không fallback |
+| AV1 1440p/4K trong CMA 512 MiB | **xong** 2026-09-11 — patch `0014`; 1440p/4K cùng 8/10-bit PASS bit-exact, không còn ENOMEM/CMA allocation failure |
 | Buffer sizing theo độ phân giải (8K) | **xong** |
 | Chrome: export surface chưa bind, separate layers | **xong** |
 | Hai luồng đồng thời, bit-exact | **xong** |
@@ -592,10 +660,11 @@ mpv/VLC — board không cài hai thứ đó nên chưa kiểm được. **Đừ
    multi-slice, không chia hết macroblock, IDR dày)
 5. HEVC: bốn control, cùng quy tắc DPB
 6. VP9 Profile 0: kernel VDPU381, uncompressed/compressed header và state kế thừa
-7. Buffer sizing theo độ phân giải
-8. Chrome: export surface chưa bind, separate layers
-9. Concurrent decode: hai stream một VADisplay
-10. VP9 Profile 2: chỉ bật VA sau khi Chrome giữ được NV15 DRM fourcc end-to-end
+7. AV1 Profile 0: chọn node Hantro, ánh xạ control, NV12/P010 và patch entropy CDF
+8. Buffer sizing theo độ phân giải
+9. Chrome: export surface chưa bind, separate layers
+10. Concurrent decode: hai stream một VADisplay
+11. VP9 Profile 2: chỉ bật VA sau khi Chrome giữ được NV15 DRM fourcc end-to-end
 
 **Không bỏ qua bước 4.** Lỗi DPB-có-lỗ chỉ lộ ra khi so bit-exact trên stream có
 IDR thứ hai; clip ngắn một GOP luôn đúng.

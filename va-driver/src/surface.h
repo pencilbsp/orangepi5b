@@ -31,6 +31,7 @@
 
 #include <va/va_backend.h>
 #include <va/va_dec_vp9.h>
+#include <va/va_dec_av1.h>
 
 #include "object_heap.h"
 #include "session.h"
@@ -111,6 +112,13 @@ struct object_surface {
 			bool picture_set;
 			bool slice_set;
 		} vp9;
+		struct {
+			VADecPictureParameterBufferAV1 picture;
+			VASliceParameterBufferAV1 tiles[V4L2_AV1_MAX_TILE_COUNT];
+			unsigned int num_tiles;
+			unsigned int order_hint;
+			bool picture_set;
+		} av1;
 	} params;
 
 	int request_fd;

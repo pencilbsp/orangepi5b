@@ -44,6 +44,8 @@ Không phải bộ conformance codec. Mỗi stream nhắm một thứ đã từn
 | `vp9-profile0-repeated` | reset/kế thừa probability context qua nhiều GOP |
 | `vp9-profile0-tiles` | compressed header và tile layout nhiều cột |
 | `vp9-profile2-*` | fixture tạm giữ cho raw V4L2/zero-copy NV15 về sau; VA test hiện skip |
+| `av1-8bit-repeated` | reference map và entropy context qua nhiều GOP, CAPTURE NV12 |
+| `av1-10bit-repeated` | đường AV1 10-bit zero-copy với CAPTURE P010 |
 
 **Clip ngắn một GOP không chứng minh được gì.** Lỗi DPB-có-lỗ để GOP đầu hoàn
 hảo và chỉ hỏng từ sau IDR thứ hai.
@@ -83,6 +85,17 @@ pass=2 fail=0 skip=0
 `chrome://media-internals` cho clip VP9 Profile 0 1920x1080 ghi
 `kVideoDecoderName = VaapiVideoDecoder` và `kIsPlatformVideoDecoder = true`,
 không có warning fallback hay pipeline error.
+
+Kết quả AV1 sau khi boot module Hantro có patch `0013`, 2026-09-10:
+
+```text
+  av1-8bit.ivf     PASS  120 frames bit-identical (NV12)
+  av1-10bit.ivf    PASS   60 frames bit-identical (P010)
+```
+
+Trước patch, driver vẫn trả đủ frame nhưng 112/120 frame 8-bit và 56/60 frame
+10-bit khác software. Đây là lý do test chỉ đếm frame không đủ để nghiệm thu
+codec; `compare.sh` phải báo bit-identical cho cả NV12 lẫn P010.
 
 Regression deploy cùng ngày: module VP9 đầu tiên được build từ cây tạm thiếu
 patch kernel `0008`, làm H.264 4K bị `-EBUSY` khi gửi SPS đầu tiên. Sau khi

@@ -63,6 +63,10 @@ if not cc.has_header_symbol('linux/videodev2.h', 'V4L2_PIX_FMT_VP9_FRAME',
 			    include_directories : kernel_headers_inc)
     error('Missing stateless VP9 UAPI from Linux Kernel headers')
 endif
+if not cc.has_header_symbol('linux/videodev2.h', 'V4L2_PIX_FMT_AV1_FRAME',
+			    include_directories : kernel_headers_inc)
+    error('Missing stateless AV1 UAPI from Linux Kernel headers')
+endif
 
 libva_dep = dependency('libva', version : '>= 1.1.0')
 libdrm_dep = dependency('libdrm', version : '>= 2.4.52')
