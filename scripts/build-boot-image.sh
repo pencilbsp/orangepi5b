@@ -125,6 +125,19 @@ disable_enabled_group PHY_ \
  --enable DMABUF_HEAPS_CMA
 
 "$K/scripts/config" --file "$K/.config" \
+ --enable WIREGUARD \
+ --enable NF_NAT \
+ --enable NF_TABLES \
+ --enable NFT_MASQ \
+ --enable NFT_CT \
+ --enable NETFILTER_XTABLES \
+ --enable IP_NF_IPTABLES \
+ --enable IP_NF_NAT \
+ --enable NETFILTER_XT_MATCH_CONNTRACK \
+ --enable IP_NF_FILTER \
+ --enable TUN
+
+"$K/scripts/config" --file "$K/.config" \
  --enable IKCONFIG \
  --enable IKCONFIG_PROC \
  --enable STMMAC_ETH \
@@ -190,6 +203,9 @@ for symbol in DRM_PANTHOR VIDEO_HANTRO VIDEO_ROCKCHIP_RGA VIDEO_ROCKCHIP_VDEC VI
 done
 for symbol in DMABUF_HEAPS DMABUF_HEAPS_CMA; do
  grep -qx "CONFIG_${symbol}=y" "$K/.config" || { echo "Required dma-buf heap missing: $symbol"; exit 1; }
+done
+for symbol in WIREGUARD NF_NAT NF_TABLES NFT_MASQ NFT_CT NETFILTER_XTABLES IP_NF_IPTABLES IP_NF_NAT NETFILTER_XT_MATCH_CONNTRACK IP_NF_FILTER TUN; do
+ grep -qx "CONFIG_${symbol}=y" "$K/.config" || { echo "Required WireGuard/netfilter support missing: $symbol"; exit 1; }
 done
 for symbol in CFG80211 MAC80211 RFKILL BRCMFMAC BT BT_BCM BT_HCIUART BT_RFCOMM BT_BNEP BT_HIDP; do
  grep -Eq "^CONFIG_${symbol}=[ym]$" "$K/.config" || { echo "Required Wi-Fi/Bluetooth driver missing: $symbol"; exit 1; }
