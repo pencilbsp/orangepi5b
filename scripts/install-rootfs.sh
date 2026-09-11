@@ -25,6 +25,10 @@ Suites: resolute resolute-updates resolute-security
 Components: main universe restricted multiverse
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 APT
+install -D -m 0644 "$ROOT/config/defaults/ibus-bamboo-archive-keyring.asc" \
+  "$R/etc/apt/keyrings/ibus-bamboo.asc"
+install -D -m 0644 "$ROOT/config/defaults/ibus-bamboo.sources" \
+  "$R/etc/apt/sources.list.d/ibus-bamboo.sources"
 cat > "$R/usr/sbin/policy-rc.d" <<'POLICY'
 #!/bin/sh
 exit 101
@@ -44,6 +48,11 @@ mkdir -p "$ROOT/cache/debs"
 shopt -s nullglob
 cp "$R"/var/cache/apt/archives/*.deb "$ROOT/cache/debs/" || true
 chroot "$R" apt-get -y --no-install-suggests install "${packages[@]}"
+if [[ ! -x "$R/usr/lib/ibus-bamboo/ibus-engine-bamboo" ]] ||
+   ! grep -q '<name>Bamboo</name>' "$R/usr/share/ibus/component/bamboo.xml"; then
+  echo "IBus Bamboo engine is missing or has an unexpected engine ID" >&2
+  exit 1
+fi
 resources_debs=( "$ROOT"/output/debs/resources_*+orangepi5b*.deb )
 if ((${#resources_debs[@]})); then
   mapfile -t resources_debs < <(printf '%s\n' "${resources_debs[@]}" | sort -V)
@@ -113,6 +122,12 @@ install -D -m 0644 "$ROOT/config/defaults/mimeapps.list" "$R/etc/xdg/mimeapps.li
 # GNOME-specific defaults take precedence over the generic system defaults.
 install -D -m 0644 "$ROOT/config/defaults/mimeapps.list" "$R/etc/xdg/gnome-mimeapps.list"
 install -D -m 0644 "$ROOT/config/defaults/mimeapps.list" "$R/etc/skel/.config/mimeapps.list"
+install -D -m 0644 "$ROOT/config/defaults/dconf-user-profile" "$R/etc/dconf/profile/user"
+install -D -m 0644 "$ROOT/config/defaults/ibus-bamboo-input-sources" \
+  "$R/etc/dconf/db/local.d/10-ibus-bamboo-input-sources"
+install -D -m 0644 "$ROOT/config/defaults/ibus-bamboo-preload" \
+  "$R/etc/dconf/db/ibus.d/10-ibus-bamboo-preload"
+chroot "$R" dconf update
 install -D -m 0644 "$ROOT/config/rootfs/orangepi5b-display.conf" "$R/usr/share/initramfs-tools/modules.d/orangepi5b-display.conf"
 install -D -m 0644 "$ROOT/config/rootfs/orangepi5b-ap6275p.conf" "$R/usr/lib/modules-load.d/orangepi5b-ap6275p.conf"
 install -D -m 0644 "$ROOT/config/rootfs/bluetooth.service.d/10-orangepi5b-persistent.conf" "$R/etc/systemd/system/bluetooth.service.d/10-orangepi5b-persistent.conf"

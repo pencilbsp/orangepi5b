@@ -10,6 +10,7 @@ Mục tiêu của dự án này là một image mới, gọn và dễ kiểm ch�
 - SSH bật sẵn và SSH host keys được sinh lại trên thiết bị khi boot; tài khoản người dùng được tạo bằng GNOME Initial Setup ở lần boot đầu.
 - Panthor/Mali firmware được ship qua `linux-firmware-misc`; kernel bật firmware loader `.zst` để GNOME Wayland có render node ngay từ boot.
 - AP6275P Wi-Fi/Bluetooth được bật bằng DT board patch, firmware Broadcom riêng và BlueZ/NetworkManager userspace.
+- IBus Bamboo là bộ gõ tiếng Việt mặc định, với bàn phím US làm nguồn nhập dự phòng.
 - Ptyxis là Terminal app duy nhất; `gnome-terminal` bị purge sau khi cài desktop để tránh hai launcher cùng tên.
 
 
@@ -69,6 +70,12 @@ Image không embed tài khoản người dùng mặc định. GDM bật
 
 SSH service vẫn được bật và host keys vẫn được sinh lại khi boot, nhưng SSH chỉ
 login được sau khi wizard đã tạo tài khoản người dùng.
+
+Tài khoản mới nhận IBus Bamboo (Telex/Unicode) làm nguồn nhập mặc định. Bàn
+phím US vẫn có trong danh sách và có thể chuyển qua lại bằng `Super+Space`;
+đây là giá trị mặc định có thể thay đổi trong Settings, không phải policy bị
+khóa. Gói ARM64 được cài từ PPA chính thức của Bamboo Engine qua khóa
+`Signed-By` riêng trong `/etc/apt/keyrings`.
 
 ## Package trim profile
 

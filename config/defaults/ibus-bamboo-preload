@@ -1,0 +1,4 @@
+[desktop/ibus/general]
+preload-engines=['Bamboo', 'xkb:us::eng']
+engines-order=['Bamboo', 'xkb:us::eng']
+enable-by-default=true

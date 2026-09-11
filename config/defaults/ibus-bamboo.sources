@@ -1,0 +1,5 @@
+Types: deb
+URIs: https://ppa.launchpadcontent.net/bamboo-engine/ibus-bamboo/ubuntu
+Suites: resolute
+Components: main
+Signed-By: /etc/apt/keyrings/ibus-bamboo.asc
