@@ -1,0 +1,142 @@
+From: Codex <codex@openai.com>
+Date: Sat, 12 Sep 2026 16:30:00 +0000
+Subject: [PATCH] drm: bridge: dw-hdmi-qp: retrain on FRL lane-lock loss
+
+Some displays keep HPD asserted and do not raise FLT_UPDATE when switching
+away from their HDMI input.  The four FRL lane-lock bits in SCDC
+STATUS_FLAGS_0 do drop, however.  When switching back, the sink waits for a
+new training sequence while the source still believes that the stale FRL
+link is up, leaving the display at "no signal".
+
+Poll and debounce the four lane-lock bits in the existing FRL supervisor.
+On lock loss, restart the complete LTS1-through-LTSP sequence.  Continue
+retrying with a two-second backoff after the normal burst of attempts so an
+input that remains deselected for longer can recover when selected again.
+
+Signed-off-by: Codex <codex@openai.com>
+---
+ drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.c | 46 +++++++++++++++++---
+ 1 file changed, 40 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.c b/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.c
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.c
+@@ -187,6 +187,7 @@
+ 	u8 frl_rate_per_lane;
+ 	bool frl_up;
+ 	unsigned int frl_attempts;
++	unsigned int frl_lock_lost_samples;
+ 	struct delayed_work frl_work;
+ 	/* Serialises the supervisor against enable/disable */
+ 	struct mutex frl_lock;
+@@ -963,10 +964,15 @@
+ /* Attempts before giving up on bringing the link back. */
+ #define FRL_TRAIN_ATTEMPTS		5
+ #define FRL_RETRY_DELAY_MS		500
++#define FRL_RETRY_BACKOFF_MS		2000
+ 
+ /* How often to ask the sink whether the link still needs attention. */
+ #define FRL_SUPERVISE_INTERVAL_MS	200
+ 
++/* STATUS_FLAGS_0 bits 1..4 report lock for the four FRL lanes. */
++#define SCDC_SINK_STATUS_FLAGS_0_FRL_LOCK_MASK	GENMASK(4, 1)
++#define FRL_LOCK_LOST_SAMPLES		3
++
+ #define FFE_PRE_SHOOT_ENABLE		BIT(0)
+ #define FFE_DE_EMPHASIS_ENABLE		BIT(1)
+ #define FFE_BOTH_ENABLE			(FFE_PRE_SHOOT_ENABLE | FFE_DE_EMPHASIS_ENABLE)
+@@ -1365,7 +1371,8 @@
+ {
+ 	struct dw_hdmi_qp *hdmi = container_of(to_delayed_work(work),
+ 					       struct dw_hdmi_qp, frl_work);
+-	u8 upd = 0;
++	unsigned int retry_delay_ms = FRL_RETRY_DELAY_MS;
++	u8 status = 0, upd = 0;
+ 
+ 	/*
+ 	 * Everything below touches controller registers and the DDC, so it must
+@@ -1382,11 +1389,12 @@
+ 
+ 	if (!hdmi->frl_up) {
+ 		if (hdmi->frl_attempts >= FRL_TRAIN_ATTEMPTS) {
+-			dev_err(hdmi->dev,
+-				"FRL: link stayed down after %u attempts\n",
++			dev_warn_ratelimited(hdmi->dev,
++				"FRL: link stayed down after %u attempts; continuing with backoff\n",
+ 				hdmi->frl_attempts);
+-			mutex_unlock(&hdmi->frl_lock);
+-			return;
++			hdmi->frl_attempts = 0;
++			retry_delay_ms = FRL_RETRY_BACKOFF_MS;
++			goto reschedule;
+ 		}
+ 
+ 		hdmi->frl_attempts++;
+@@ -1396,12 +1404,39 @@
+ 				 hdmi->frl_attempts);
+ 
+ 		if (!dw_hdmi_qp_frl_train(hdmi, hdmi->frl_lanes,
+-					  hdmi->frl_rate_per_lane))
++					  hdmi->frl_rate_per_lane)) {
+ 			hdmi->frl_up = true;
++			hdmi->frl_lock_lost_samples = 0;
++		}
+ 
+ 		goto reschedule;
+ 	}
+ 
++	/*
++	 * Some displays keep HPD asserted and never raise FLT_UPDATE while the
++	 * user selects another input.  Their FRL lane-lock bits still drop.  If
++	 * the input is later selected again, the sink waits for a fresh training
++	 * sequence while the source incorrectly believes the old link is alive.
++	 * Debounce the lane-lock state, then hand recovery to the full LTS1-LTSP
++	 * path.  Full training is required here; an LTS3-only retry cannot wake a
++	 * sink whose input pipeline has been reset.
++	 */
++	if (dw_hdmi_qp_scdc_read(hdmi, SCDC_STATUS_FLAGS_0, &status) >= 0) {
++		if ((status & SCDC_SINK_STATUS_FLAGS_0_FRL_LOCK_MASK) ==
++		    SCDC_SINK_STATUS_FLAGS_0_FRL_LOCK_MASK) {
++			hdmi->frl_lock_lost_samples = 0;
++		} else if (++hdmi->frl_lock_lost_samples >=
++			   FRL_LOCK_LOST_SAMPLES) {
++			dev_info(hdmi->dev,
++				 "FRL: lane lock lost (SCDC 0x40 = 0x%02x), restarting training\n",
++				 status);
++			hdmi->frl_up = false;
++			hdmi->frl_attempts = 0;
++			hdmi->frl_lock_lost_samples = 0;
++			goto reschedule;
++		}
++	}
++
+ 	if (dw_hdmi_qp_scdc_read(hdmi, SCDC_UPDATE_0, &upd) >= 0 &&
+ 	    (upd & SCDC_SINK_UPDATE_0_FLT_UPDATE)) {
+ 		dev_info(hdmi->dev,
+@@ -1426,7 +1461,7 @@
+ 		schedule_delayed_work(&hdmi->frl_work,
+ 				      msecs_to_jiffies(hdmi->frl_up ?
+ 						       FRL_SUPERVISE_INTERVAL_MS :
+-						       FRL_RETRY_DELAY_MS));
++						       retry_delay_ms));
+ 
+ 	mutex_unlock(&hdmi->frl_lock);
+ }
+@@ -1565,6 +1600,7 @@
+ 		hdmi->frl_lanes = frl_lanes;
+ 		hdmi->frl_rate_per_lane = frl_rate_per_lane;
+ 		hdmi->frl_attempts = 0;
++		hdmi->frl_lock_lost_samples = 0;
+ 		hdmi->frl_up = false;
+ 
+ 		/*
+@@ -1593,6 +1629,7 @@
+ 	mutex_lock(&hdmi->frl_lock);
+ 	hdmi->frl_lanes = 0;
+ 	hdmi->frl_up = false;
++	hdmi->frl_lock_lost_samples = 0;
+ 	mutex_unlock(&hdmi->frl_lock);
+ 	cancel_delayed_work_sync(&hdmi->frl_work);
+ 
+-- 
+2.43.0

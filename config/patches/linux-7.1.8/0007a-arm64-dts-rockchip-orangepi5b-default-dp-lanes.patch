@@ -1,0 +1,36 @@
+From: Codex <codex@openai.com>
+Date: Sat, 12 Sep 2026 07:20:00 +0000
+Subject: [PATCH] arm64: dts: rockchip: give Orange Pi 5B a default DP lane map
+
+The combo PHY can be powered by the built-in XHCI driver before the Type-C
+orientation and mode switches have reported their state.  Without a default
+DP lane map that first power-on configures the analog block for USB only.
+Later selecting pin assignment D updates the software lane map, but does not
+necessarily rebuild the already running analog block, leaving AUX requests to
+time out despite asserted HPD.
+
+Use the normal-orientation two-lane mapping used by the upstream IndieDroid
+Nova USB-C DP description.  The Type-C orientation switch still replaces this
+mapping when a cable is inserted in the reverse orientation.
+
+This is an experimental Orange Pi 5B enablement workaround.  Drop it once the
+upstream board DTS provides a working USB-C DP topology and initial lane map.
+
+Signed-off-by: Codex <codex@openai.com>
+---
+ arch/arm64/boot/dts/rockchip/rk3588s-orangepi-5.dtsi | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/arch/arm64/boot/dts/rockchip/rk3588s-orangepi-5.dtsi b/arch/arm64/boot/dts/rockchip/rk3588s-orangepi-5.dtsi
+--- a/arch/arm64/boot/dts/rockchip/rk3588s-orangepi-5.dtsi
++++ b/arch/arm64/boot/dts/rockchip/rk3588s-orangepi-5.dtsi
+@@ -865,6 +865,7 @@
+ 
+ &usbdp_phy0 {
+ 	mode-switch;
++	rockchip,dp-lane-mux = <2 3>;
+ 	orientation-switch;
+ 	sbu1-dc-gpios = <&gpio4 RK_PA5 GPIO_ACTIVE_HIGH>;
+ 	sbu2-dc-gpios = <&gpio4 RK_PA7 GPIO_ACTIVE_HIGH>;
+-- 
+2.51.0

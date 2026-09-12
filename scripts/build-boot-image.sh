@@ -11,7 +11,7 @@ JOBS=${JOBS:-8}
 KREL=7.1.8-orangepi5b
 R="$ROOT/build/rootfs"
 K="$ROOT/sources/linux-7.1.8"
-for c in aarch64-linux-gnu-gcc make flex bison bc openssl dtc qemu-aarch64-static parted mkfs.ext4 xz gpgv curl patch git depmod; do
+for c in aarch64-linux-gnu-gcc make flex bison bc openssl dtc fdtput qemu-aarch64-static parted mkfs.ext4 xz gpgv curl patch git depmod; do
  command -v "$c" >/dev/null || { echo "Missing: $c"; exit 1; }
 done
 mkdir -p output/logs output/images build
@@ -173,12 +173,16 @@ disable_enabled_group PHY_ \
  --module RTC_DRV_RK808 \
  --enable DRM \
  --module DRM_ROCKCHIP \
+ --enable ROCKCHIP_DW_DP \
  --module DRM_DW_HDMI_QP \
  --module DRM_DISPLAY_CONNECTOR \
  --module DRM_PANTHOR \
  --module VIDEO_HANTRO \
  --module VIDEO_ROCKCHIP_RGA \
  --module PHY_ROCKCHIP_SAMSUNG_HDPTX \
+ --module PHY_ROCKCHIP_USBDP \
+ --module TYPEC_FUSB302 \
+ --module TYPEC_DP_ALTMODE \
  --enable FW_LOADER_COMPRESS \
  --enable FW_LOADER_COMPRESS_ZSTD \
  --enable DEBUG_INFO_NONE \
@@ -195,7 +199,7 @@ rm -f "$K/include/config/kernel.release"
 for symbol in STMMAC_ETH MOTORCOMM_PHY FRAMEBUFFER_CONSOLE; do
  grep -qx "CONFIG_${symbol}=y" "$K/.config" || { echo "Required built-in missing: $symbol"; exit 1; }
 done
-for symbol in DWMAC_ROCKCHIP DRM_ROCKCHIP DRM_DW_HDMI_QP PHY_ROCKCHIP_SAMSUNG_HDPTX; do
+for symbol in DWMAC_ROCKCHIP DRM_ROCKCHIP ROCKCHIP_DW_DP DRM_DW_HDMI_QP PHY_ROCKCHIP_SAMSUNG_HDPTX PHY_ROCKCHIP_USBDP TYPEC_FUSB302 TYPEC_DP_ALTMODE; do
  grep -Eq "^CONFIG_${symbol}=[ym]$" "$K/.config" || { echo "Required display driver missing: $symbol"; exit 1; }
 done
 for symbol in DRM_PANTHOR VIDEO_HANTRO VIDEO_ROCKCHIP_RGA VIDEO_ROCKCHIP_VDEC VIDEO_ROCKCHIP_RKVENC; do
@@ -281,10 +285,12 @@ depmod -b "$R" "$KREL"
 mkdir -p "$R/boot/extlinux" "$R/boot/dtb" "$R/etc/netplan"
 cp "$K/arch/arm64/boot/Image" "$R/boot/vmlinuz-$KREL"
 cp "$K/arch/arm64/boot/dts/rockchip/rk3588s-orangepi-5b.dtb" "$R/boot/dtb/rk3588s-orangepi-5b.dtb"
+cp "$K/arch/arm64/boot/dts/rockchip/rk3588s-orangepi-5b.dtb" "$R/boot/dtb/rk3588s-orangepi-5b-hdmi-safe.dtb"
+fdtput -t s "$R/boot/dtb/rk3588s-orangepi-5b-hdmi-safe.dtb" /dp@fde50000 status disabled
 cp "$K/.config" "$R/boot/config-$KREL"
 if [[ -s "$K/System.map" ]]; then cp "$K/System.map" "$R/boot/System.map-$KREL"; fi
 printf 'RESUME=none\n' > "$R/etc/initramfs-tools/conf.d/resume"
-printf 'phy_rockchip_samsung_hdptx\ndw_hdmi_qp\nrockchipdrm\n' > "$R/etc/initramfs-tools/modules"
+printf 'phy_rockchip_usbdp\nphy_rockchip_samsung_hdptx\ndw_hdmi_qp\nrockchipdrm\ntypec_displayport\nfusb302\n' > "$R/etc/initramfs-tools/modules"
 if [[ -f "$R/boot/initrd.img-$KREL" ]]; then
  chroot "$R" update-initramfs -u -k "$KREL"
 else
@@ -292,12 +298,18 @@ else
 fi
 cat > "$R/boot/extlinux/extlinux.conf" <<CFG
 DEFAULT ubuntu
-TIMEOUT 1
+TIMEOUT 30
 LABEL ubuntu
- MENU LABEL Ubuntu 26.04 desktop stable RK3588S
+ MENU LABEL Ubuntu 26.04 desktop RK3588S USB-C DP
  LINUX /boot/vmlinuz-$KREL
  INITRD /boot/initrd.img-$KREL
  FDT /boot/dtb/rk3588s-orangepi-5b.dtb
+ APPEND root=LABEL=opi5b-root rootwait rw rootfstype=ext4 console=ttyS2,1500000n8 quiet splash cma=512M consoleblank=0
+LABEL hdmi-safe
+ MENU LABEL Ubuntu 26.04 kernel 7.1.8 HDMI safe DTB
+ LINUX /boot/vmlinuz-$KREL
+ INITRD /boot/initrd.img-$KREL
+ FDT /boot/dtb/rk3588s-orangepi-5b-hdmi-safe.dtb
  APPEND root=LABEL=opi5b-root rootwait rw rootfstype=ext4 console=ttyS2,1500000n8 quiet splash cma=512M consoleblank=0
 CFG
 printf 'LABEL=opi5b-root / ext4 defaults,noatime 0 1\n' > "$R/etc/fstab"

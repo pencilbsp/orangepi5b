@@ -1,0 +1,152 @@
+From: Codex <codex@openai.com>
+Date: Sat, 12 Sep 2026 05:10:00 +0000
+Subject: [PATCH] arm64: dts: rockchip: wire Orange Pi 5B USB-C DisplayPort
+
+The Orange Pi 5B description already contains the FUSB302, Type-C
+connector, VBUS regulator and RK3588 USB/DP PHY, but DP0 is disabled and
+there is no complete graph between the DP controller, combo PHY, XHCI and
+the Type-C connector.
+
+Wire the graph using the topology used by the working Rockchip BSP, while
+using the current upstream Type-C graph binding. Route DP0 through VP2,
+matching the Orange Pi BSP instead of sharing the HDMI VP0 path.
+
+This is an experimental hardware-enablement patch. Drop it once upstream
+rk3588s-orangepi-5 support describes and enables the USB-C DP output.
+
+Signed-off-by: Codex <codex@openai.com>
+---
+ .../boot/dts/rockchip/rk3588s-orangepi-5.dtsi | 71 +++++++++++++++++--
+ 1 file changed, 62 insertions(+), 9 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/rockchip/rk3588s-orangepi-5.dtsi b/arch/arm64/boot/dts/rockchip/rk3588s-orangepi-5.dtsi
+--- a/arch/arm64/boot/dts/rockchip/rk3588s-orangepi-5.dtsi
++++ b/arch/arm64/boot/dts/rockchip/rk3588s-orangepi-5.dtsi
+@@ -180,6 +180,22 @@
+ 	status = "okay";
+ };
+ 
++&dp0 {
++	status = "okay";
++};
++
++&dp0_in {
++	dp0_in_vp2: endpoint {
++		remote-endpoint = <&vp2_out_dp0>;
++	};
++};
++
++&dp0_out {
++	dp0_out_con: endpoint {
++		remote-endpoint = <&usbdp_phy0_dp_in>;
++	};
++};
++
+ &hdmi0 {
+ 	status = "okay";
+ };
+@@ -307,6 +325,13 @@
+ 				<PDO_FIXED(5000, 3000, PDO_FIXED_USB_COMM)>;
+-			try-power-role = "source";
++			try-power-role = "sink";
+ 
++			altmodes {
++				displayport {
++					svid = /bits/ 16 <0xff01>;
++					vdo = <0xffffffff>;
++				};
++			};
++
+ 			ports {
+ 				#address-cells = <1>;
+ 				#size-cells = <0>;
+@@ -314,21 +339,21 @@
+ 				port@0 {
+ 					reg = <0>;
+ 					usbc0_hs: endpoint {
+-						remote-endpoint = <&usb_host0_xhci_drd_sw>;
++						remote-endpoint = <&usb_host0_xhci_hs>;
+ 					};
+ 				};
+ 
+ 				port@1 {
+ 					reg = <1>;
+ 					usbc0_ss: endpoint {
+-						remote-endpoint = <&usbdp_phy0_typec_ss>;
++						remote-endpoint = <&usbdp_phy0_ss_out>;
+ 					};
+ 				};
+ 
+ 				port@2 {
+ 					reg = <2>;
+ 					usbc0_sbu: endpoint {
+-						remote-endpoint = <&usbdp_phy0_typec_sbu>;
++						remote-endpoint = <&usbdp_phy0_dp_out>;
+ 					};
+ 				};
+ 			};
+@@ -851,13 +876,23 @@
+ 		#address-cells = <1>;
+ 		#size-cells = <0>;
+ 
+-		usbdp_phy0_typec_ss: endpoint@0 {
++		usbdp_phy0_ss_out: endpoint@0 {
+ 			reg = <0>;
+ 			remote-endpoint = <&usbc0_ss>;
+ 		};
+ 
+-		usbdp_phy0_typec_sbu: endpoint@1 {
++		usbdp_phy0_ss_in: endpoint@1 {
+ 			reg = <1>;
++			remote-endpoint = <&usb_host0_xhci_ss>;
++		};
++
++		usbdp_phy0_dp_in: endpoint@2 {
++			reg = <2>;
++			remote-endpoint = <&dp0_out_con>;
++		};
++
++		usbdp_phy0_dp_out: endpoint@3 {
++			reg = <3>;
+ 			remote-endpoint = <&usbc0_sbu>;
+ 		};
+ 	};
+@@ -875,9 +910,22 @@
+ 	usb-role-switch;
+ 	status = "okay";
+ 
+-	port {
+-		usb_host0_xhci_drd_sw: endpoint {
+-			remote-endpoint = <&usbc0_hs>;
++	ports {
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		port@0 {
++			reg = <0>;
++			usb_host0_xhci_hs: endpoint {
++				remote-endpoint = <&usbc0_hs>;
++			};
++		};
++
++		port@1 {
++			reg = <1>;
++			usb_host0_xhci_ss: endpoint {
++				remote-endpoint = <&usbdp_phy0_ss_in>;
++			};
+ 		};
+ 	};
+ };
+@@ -913,3 +959,10 @@
+ 		remote-endpoint = <&hdmi0_in_vp0>;
+ 	};
+ };
++
++&vp2 {
++	vp2_out_dp0: endpoint@a {
++		reg = <ROCKCHIP_VOP2_EP_DP0>;
++		remote-endpoint = <&dp0_in_vp2>;
++	};
++};
+-- 
+2.51.0
