@@ -126,13 +126,18 @@ disable_enabled_group PHY_ \
 
 "$K/scripts/config" --file "$K/.config" \
  --enable WIREGUARD \
+ --enable NF_CONNTRACK \
  --enable NF_NAT \
  --enable NF_TABLES \
  --enable NFT_MASQ \
  --enable NFT_CT \
  --enable NETFILTER_XTABLES \
+ --enable NETFILTER_XTABLES_LEGACY \
+ --enable IP_NF_IPTABLES_LEGACY \
  --enable IP_NF_IPTABLES \
  --enable IP_NF_NAT \
+ --enable NETFILTER_XT_TARGET_MASQUERADE \
+ --enable IP_NF_TARGET_MASQUERADE \
  --enable NETFILTER_XT_MATCH_CONNTRACK \
  --enable IP_NF_FILTER \
  --enable TUN
@@ -208,7 +213,7 @@ done
 for symbol in DMABUF_HEAPS DMABUF_HEAPS_CMA; do
  grep -qx "CONFIG_${symbol}=y" "$K/.config" || { echo "Required dma-buf heap missing: $symbol"; exit 1; }
 done
-for symbol in WIREGUARD NF_NAT NF_TABLES NFT_MASQ NFT_CT NETFILTER_XTABLES IP_NF_IPTABLES IP_NF_NAT NETFILTER_XT_MATCH_CONNTRACK IP_NF_FILTER TUN; do
+for symbol in WIREGUARD NF_CONNTRACK NF_NAT NF_NAT_MASQUERADE NF_TABLES NFT_MASQ NFT_CT NETFILTER_XTABLES NETFILTER_XTABLES_LEGACY IP_NF_IPTABLES_LEGACY IP_NF_IPTABLES IP_NF_NAT NETFILTER_XT_TARGET_MASQUERADE IP_NF_TARGET_MASQUERADE NETFILTER_XT_MATCH_CONNTRACK IP_NF_FILTER TUN; do
  grep -qx "CONFIG_${symbol}=y" "$K/.config" || { echo "Required WireGuard/netfilter support missing: $symbol"; exit 1; }
 done
 for symbol in CFG80211 MAC80211 RFKILL BRCMFMAC BT BT_BCM BT_HCIUART BT_RFCOMM BT_BNEP BT_HIDP; do
