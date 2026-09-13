@@ -10,11 +10,15 @@ lines.
 Keep the requested source size beside the aligned surface size, set the
 H.264 crop offsets when the aligned surface is larger, and make the local
 NAL writer emit those offsets instead of asserting that cropping is never
-used.
+used. H.264 4:2:0 crop units are two pixels wide and high, so an odd source
+dimension cannot be represented exactly in the SPS. In that case crop to the
+next even visible size and let the RDP surface clip the single extra row or
+column. Validate invalid/overflowed dimensions with a recoverable error rather
+than aborting the handover daemon.
 ---
- src/grd-encode-session-vaapi.c | 20 ++++++++++++++++++++
+ src/grd-encode-session-vaapi.c | 33 +++++++++++++++++++++++++++++++++
  src/grd-nal-writer.c           | 12 +++++++++++-
- 2 files changed, 31 insertions(+), 1 deletion(-)
+ 2 files changed, 44 insertions(+), 1 deletion(-)
 
 diff --git a/src/grd-encode-session-vaapi.c b/src/grd-encode-session-vaapi.c
 index 5fae6aa..8ef76fb 100644
@@ -23,7 +27,7 @@ index 5fae6aa..8ef76fb 100644
 @@ -129,6 +129,8 @@ struct _GrdEncodeSessionVaapi
    VAConfigID va_config;
    VAContextID va_context;
- 
+
 +  uint32_t source_width;
 +  uint32_t source_height;
    uint32_t surface_width;
@@ -38,17 +42,16 @@ index 5fae6aa..8ef76fb 100644
  
    g_assert (surface_width % 16 == 0);
    g_assert (surface_height % 16 == 0);
-@@ -650,6 +654,18 @@ fill_avc_sequence (GrdEncodeSessionVaapi            *encode_session_vaapi,
+@@ -648,6 +652,17 @@ fill_avc_sequence (GrdEncodeSessionVaapi            *encode_session_vaapi,
    sequence_param->picture_width_in_mbs = surface_width / 16;
    sequence_param->picture_height_in_mbs = surface_height / 16;
  
 +  crop_right = surface_width - encode_session_vaapi->source_width;
 +  crop_bottom = surface_height - encode_session_vaapi->source_height;
++  crop_right &= ~1U;
++  crop_bottom &= ~1U;
 +  if (crop_right || crop_bottom)
 +    {
-+      g_assert (crop_right % 2 == 0);
-+      g_assert (crop_bottom % 2 == 0);
-+
 +      sequence_param->frame_cropping_flag = 1;
 +      sequence_param->frame_crop_right_offset = crop_right / 2;
 +      sequence_param->frame_crop_bottom_offset = crop_bottom / 2;
@@ -57,17 +60,33 @@ index 5fae6aa..8ef76fb 100644
    sequence_param->seq_fields.value = 0;
    sequence_param->seq_fields.bits.chroma_format_idc = 1;
    sequence_param->seq_fields.bits.frame_mbs_only_flag = 1;
-@@ -1806,6 +1822,10 @@ grd_encode_session_vaapi_new (GrdVkDevice   *vk_device,
+@@ -1806,8 +1821,26 @@ grd_encode_session_vaapi_new (GrdVkDevice   *vk_device,
    encode_session_vaapi->va_display = va_display;
    encode_session_vaapi->supports_quality_level = supports_quality_level;
  
-+  g_assert (source_width <= grd_get_aligned_size (source_width, 32));
-+  g_assert (source_height <= grd_get_aligned_size (source_height, 16));
++  if (source_width == 0 || source_height == 0)
++    {
++      g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
++                   "Invalid zero-sized VAAPI encode surface");
++      return NULL;
++    }
++
 +  encode_session_vaapi->source_width = source_width;
 +  encode_session_vaapi->source_height = source_height;
    encode_session_vaapi->surface_width = grd_get_aligned_size (source_width, 32);
    encode_session_vaapi->surface_height = grd_get_aligned_size (source_height, 16);
++
++  if (encode_session_vaapi->surface_width < source_width ||
++      encode_session_vaapi->surface_height < source_height)
++    {
++      g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
++                   "VAAPI encode surface dimensions overflow alignment");
++      return NULL;
++    }
++
    encode_session_vaapi->refresh_rate = refresh_rate;
+ 
+   if (!create_avc420_encode_session (encode_session_vaapi, va_entrypoint,
 diff --git a/src/grd-nal-writer.c b/src/grd-nal-writer.c
 index 6e512c1..414271e 100644
 --- a/src/grd-nal-writer.c

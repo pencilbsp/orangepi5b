@@ -15,7 +15,7 @@ source "$ROOT/scripts/lib/arm64-cross.sh"
 C="$ROOT/build/cross-chroot"
 PATCH_DIR="$ROOT/config/patches/gnome-remote-desktop-50.2"
 UPSTREAM_VERSION="50.2-0ubuntu0.1"
-PACKAGE_VERSION="${GRD_PACKAGE_VERSION:-${UPSTREAM_VERSION}+orangepi5b2}"
+PACKAGE_VERSION="${GRD_PACKAGE_VERSION:-${UPSTREAM_VERSION}+orangepi5b3}"
 JOBS="${GRD_BUILD_JOBS:-$(nproc)}"
 SRC="/build/gnome-remote-desktop-50.2"
 

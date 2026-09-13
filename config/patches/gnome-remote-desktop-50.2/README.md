@@ -62,6 +62,12 @@ set `frame_cropping_flag` khi aligned surface lớn hơn source, và để NAL w
 ghi bốn crop offset vào SPS. Vì H.264 4:2:0 tính crop theo chroma sample, 8 dòng
 padding tương ứng `frame_crop_bottom_offset = 4`.
 
+Kích thước desktop do client gửi có thể lẻ, đặc biệt khi Windows App trên macOS
+đổi kích thước động. SPS 4:2:0 không biểu diễn được crop một pixel, nên patch
+crop tới kích thước chẵn kế tiếp và để RDP surface clip hàng/cột dư. Kích thước
+không hợp lệ hoặc tràn khi align trả lỗi để GRD fallback thay vì `g_assert()`
+làm chết handover daemon.
+
 **Điều kiện bỏ patch này:** GRD upstream tự ghi H.264 frame cropping khi VA-API
 encode surface được align lớn hơn kích thước desktop/source.
 
@@ -103,7 +109,7 @@ remote greeter bằng một `dbus-run-session` riêng, không kích hoạt
 Ubuntu 26.04 có GDM 50.1 và **đã ship sẵn** `gnome-remote-desktop-handover.service`
 trong `/usr/lib/systemd/user/` (đã kiểm tra trong `build/rootfs`). Nên hack này
 không cần nữa. Đã verify bằng phiên RDP thật với package
-`50.2-0ubuntu0.1+orangepi5b2`: handover daemon nạp
+`50.2-0ubuntu0.1+orangepi5b3`: handover daemon nạp
 `v4l2_request_drv_video.so`, giữ `/dev/video5`, và desktop vẫn trình bày đúng
 1920x1080 trong khi coded surface của RKVENC là 1920x1088.
 
