@@ -1,0 +1,262 @@
+From: Codex <codex@openai.com>
+Date: Sat, 12 Sep 2026 16:05:00 +0000
+Subject: [PATCH] drm: dw-dp: add HDR10 output signalling
+
+Expose DP colorspace and HDR output metadata properties on the Rockchip
+DisplayPort connector.  Carry the selected colorimetry in bridge state and
+use a VSC SDP when BT.2020 signalling requires it.
+
+At 4K120 an HBR3x4 link selects YCbCr 4:2:2 instead of RGB.  Program the
+Rockchip VOP CSC for BT.2020 in that case and advertise BT.2020 YCC in the
+VSC SDP, rather than copying userspace's BT.2020 RGB request onto YCbCr
+pixels.
+
+Convert the userspace HDR_OUTPUT_METADATA blob to a CTA Dynamic Range and
+Mastering InfoFrame and transport it as a DP 1.4a non-audio InfoFrame SDP.
+Force a stream modeset whenever colorspace or HDR metadata changes so the
+new SDP state reaches the sink while retaining the already trained link.
+Only advertise the BT.2020 RGB/YCC variants implemented by the Rockchip CSC,
+and reject non-default colorimetry when the sink cannot consume a VSC SDP.
+If SDP programming fails after starting the stream, disable video before
+powering the link down so no stale packet state survives the failed commit.
+
+Signed-off-by: Codex <codex@openai.com>
+---
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-dp.c b/drivers/gpu/drm/bridge/synopsys/dw-dp.c
+--- a/drivers/gpu/drm/bridge/synopsys/dw-dp.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-dp.c
+@@ -8,6 +8,7 @@
+  */
+ #include <linux/bitfield.h>
+ #include <linux/clk.h>
++#include <linux/hdmi.h>
+ #include <linux/iopoll.h>
+ #include <linux/irq.h>
+ #include <linux/media-bus-format.h>
+@@ -23,6 +24,7 @@
+ #include <drm/drm_bridge.h>
+ #include <drm/drm_bridge_connector.h>
+ #include <drm/display/drm_dp_helper.h>
++#include <drm/display/drm_hdmi_helper.h>
+ #include <drm/drm_edid.h>
+ #include <drm/drm_of.h>
+ #include <drm/drm_print.h>
+@@ -290,6 +292,7 @@
+ struct dw_dp_bridge_state {
+ 	struct drm_bridge_state base;
+ 	struct drm_display_mode mode;
++	enum drm_colorspace colorspace;
+ 	u8 video_mapping;
+ 	u8 color_format;
+ 	u8 bpc;
+@@ -1107,19 +1110,68 @@
+ 		break;
+ 	}
+ 
+-	if (state->color_format == DRM_OUTPUT_COLOR_FORMAT_RGB444) {
+-		vsc.colorimetry = DP_COLORIMETRY_DEFAULT;
+-		vsc.dynamic_range = DP_DYNAMIC_RANGE_VESA;
+-	} else {
+-		vsc.colorimetry = DP_COLORIMETRY_BT709_YCC;
+-		vsc.dynamic_range = DP_DYNAMIC_RANGE_CTA;
+-	}
++	switch (state->colorspace) {
++	case DRM_MODE_COLORIMETRY_BT2020_RGB:
++	case DRM_MODE_COLORIMETRY_BT2020_YCC:
++		if (state->color_format == DRM_OUTPUT_COLOR_FORMAT_RGB444)
++			vsc.colorimetry = DP_COLORIMETRY_BT2020_RGB;
++		else
++			vsc.colorimetry = DP_COLORIMETRY_BT2020_YCC;
++		break;
++	default:
++		if (state->color_format == DRM_OUTPUT_COLOR_FORMAT_RGB444)
++			vsc.colorimetry = DP_COLORIMETRY_DEFAULT;
++		else
++			vsc.colorimetry = DP_COLORIMETRY_BT709_YCC;
++		break;
++	}
+ 
++	if (state->color_format == DRM_OUTPUT_COLOR_FORMAT_RGB444)
++		vsc.dynamic_range = DP_DYNAMIC_RANGE_VESA;
++	else
++		vsc.dynamic_range = DP_DYNAMIC_RANGE_CTA;
++
+ 	drm_dp_vsc_sdp_pack(&vsc, &sdp.base);
+ 
+ 	return dw_dp_send_sdp(dp, &sdp);
+ }
+ 
++static int dw_dp_send_hdr_metadata_sdp(struct dw_dp *dp,
++				       const struct drm_connector_state *conn_state)
++{
++	struct hdmi_drm_infoframe frame = {};
++	struct dw_dp_sdp sdp = {
++		.flags = DW_DP_SDP_VERTICAL_INTERVAL,
++	};
++	u8 buf[HDMI_INFOFRAME_HEADER_SIZE + HDMI_DRM_INFOFRAME_SIZE];
++	ssize_t len;
++	int ret;
++
++	if (!conn_state->hdr_output_metadata)
++		return 0;
++
++	ret = drm_hdmi_infoframe_set_hdr_metadata(&frame, conn_state);
++	if (ret)
++		return ret;
++
++	len = hdmi_drm_infoframe_pack_only(&frame, buf, sizeof(buf));
++	if (len != sizeof(buf))
++		return len < 0 ? len : -EINVAL;
++
++	/* DP 1.4a, Tables 2-100 and 2-101: HDR Static Metadata SDP. */
++	sdp.base.sdp_header.HB0 = 0;
++	sdp.base.sdp_header.HB1 = frame.type;
++	sdp.base.sdp_header.HB2 = 0x1d;
++	sdp.base.sdp_header.HB3 = 0x13 << 2;
++	sdp.base.db[0] = frame.version;
++	sdp.base.db[1] = frame.length;
++	BUILD_BUG_ON(sizeof(sdp.base.db) < HDMI_DRM_INFOFRAME_SIZE + 2);
++	memcpy(&sdp.base.db[2], &buf[HDMI_INFOFRAME_HEADER_SIZE],
++	       HDMI_DRM_INFOFRAME_SIZE);
++
++	return dw_dp_send_sdp(dp, &sdp);
++}
++
+ static int dw_dp_video_set_pixel_mode(struct dw_dp *dp)
+ {
+ 	switch (dp->pixel_mode) {
+@@ -1152,6 +1204,10 @@
+ 	if (state->color_format == DRM_OUTPUT_COLOR_FORMAT_YCBCR420)
+ 		return true;
+ 
++	if (state->colorspace == DRM_MODE_COLORIMETRY_BT2020_RGB ||
++	    state->colorspace == DRM_MODE_COLORIMETRY_BT2020_YCC)
++		return true;
++
+ 	return false;
+ }
+ 
+@@ -1218,7 +1274,8 @@
+ 			   GENMASK(SDP_REG_BANK_SIZE + 1, 2), 0);
+ }
+ 
+-static int dw_dp_video_enable(struct dw_dp *dp)
++static int dw_dp_video_enable(struct dw_dp *dp,
++			      const struct drm_connector_state *conn_state)
+ {
+ 	struct dw_dp_link *link = &dp->link;
+ 	struct dw_dp_bridge_state *state;
+@@ -1390,8 +1447,15 @@
+ 	regmap_update_bits(dp->regmap, DW_DP_VSAMPLE_CTRL, VIDEO_STREAM_ENABLE,
+ 			   FIELD_PREP(VIDEO_STREAM_ENABLE, 1));
+ 
+-	if (dw_dp_video_need_vsc_sdp(dp))
+-		dw_dp_send_vsc_sdp(dp);
++	if (dw_dp_video_need_vsc_sdp(dp)) {
++		ret = dw_dp_send_vsc_sdp(dp);
++		if (ret)
++			return ret;
++	}
++
++	ret = dw_dp_send_hdr_metadata_sdp(dp, conn_state);
++	if (ret)
++		return ret;
+ 
+ 	return 0;
+ }
+@@ -1533,6 +1597,7 @@
+ 				     struct drm_connector_state *conn_state)
+ {
+ 	struct drm_display_mode *adjusted_mode = &crtc_state->adjusted_mode;
++	struct drm_connector_state *old_conn_state;
+ 	struct dw_dp *dp = bridge_to_dp(bridge);
+ 	struct dw_dp_bridge_state *state;
+ 	const struct dw_dp_output_format *fmt;
+@@ -1542,6 +1607,16 @@
+ 
+ 	state = to_dw_dp_bridge_state(bridge_state);
+ 	mode = &state->mode;
++	old_conn_state = drm_atomic_get_old_connector_state(conn_state->state,
++							 conn_state->connector);
++	if (conn_state->colorspace != DRM_MODE_COLORIMETRY_DEFAULT &&
++	    !dp->link.vsc_sdp_supported)
++		return -EINVAL;
++
++	if (old_conn_state &&
++	    (old_conn_state->colorspace != conn_state->colorspace ||
++	     !drm_connector_atomic_hdr_metadata_equal(old_conn_state, conn_state)))
++		crtc_state->mode_changed = true;
+ 
+ 	fmt = dw_dp_get_output_format(bridge_state->output_bus_cfg.format);
+ 	if (!fmt)
+@@ -1549,6 +1624,7 @@
+ 
+ 	state->video_mapping = fmt->video_mapping;
+ 	state->color_format = fmt->color_format;
++	state->colorspace = conn_state->colorspace;
+ 	state->bpc = fmt->bpc;
+ 	state->bpp = fmt->bpp;
+ 
+@@ -1715,11 +1791,14 @@
+ 	dp_state = dw_dp_get_bridge_state(dp);
+ 	if (dp_state)
+ 		dev_info(dp->dev,
+-			 "enabling %s, bpc %u, format %u, %u lanes at %u kHz\n",
++			 "enabling %s, bpc %u, format %u, colorspace %u, HDR %u, %u lanes at %u kHz\n",
+ 			 dp_state->mode.name, dp_state->bpc,
+-			 dp_state->color_format, dp->link.lanes, dp->link.rate);
++			 dp_state->color_format, dp_state->colorspace,
++			 !!conn_state->hdr_output_metadata,
++			 dp->link.lanes, dp->link.rate);
+ 
+-	ret = dw_dp_video_enable(dp);
++	ret = dw_dp_video_enable(dp, conn_state);
+ 	if (ret < 0) {
+ 		dev_err(dp->dev, "failed to enable video: %d\n", ret);
++		dw_dp_video_disable(dp);
+ 		dw_dp_link_disable(dp);
+diff --git a/drivers/gpu/drm/rockchip/dw_dp-rockchip.c b/drivers/gpu/drm/rockchip/dw_dp-rockchip.c
+--- a/drivers/gpu/drm/rockchip/dw_dp-rockchip.c
++++ b/drivers/gpu/drm/rockchip/dw_dp-rockchip.c
+@@ -64,7 +64,15 @@
+ 	s->output_type = DRM_MODE_CONNECTOR_DisplayPort;
+ 	s->bus_format = bus_format;
+ 	s->bus_flags = di->bus_flags;
+-	s->color_space = V4L2_COLORSPACE_DEFAULT;
++	switch (conn_state->colorspace) {
++	case DRM_MODE_COLORIMETRY_BT2020_RGB:
++	case DRM_MODE_COLORIMETRY_BT2020_YCC:
++		s->color_space = V4L2_COLORSPACE_BT2020;
++		break;
++	default:
++		s->color_space = V4L2_COLORSPACE_DEFAULT;
++		break;
++	}
+ 
+ 	return 0;
+ }
+@@ -115,7 +123,22 @@
+ 		return dev_err_probe(dev, ret, "Failed to init bridge connector");
+ 	}
+ 
++	/* The DP bridge can transport BT.2020 plus HDR static metadata. */
++	ret = drm_mode_create_dp_colorspace_property(connector,
++			BIT(DRM_MODE_COLORIMETRY_BT2020_RGB) |
++			BIT(DRM_MODE_COLORIMETRY_BT2020_YCC));
++	if (ret)
++		return ret;
++
++	ret = drm_connector_attach_colorspace_property(connector);
++	if (ret)
++		return ret;
++
++	ret = drm_connector_attach_hdr_output_metadata_property(connector);
++	if (ret)
++		return ret;
++
+ 	drm_connector_attach_encoder(connector, encoder);
+ 
+ 	return 0;
+ }
+-- 
+2.51.0

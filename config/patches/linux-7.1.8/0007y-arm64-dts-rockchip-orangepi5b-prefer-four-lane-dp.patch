@@ -1,0 +1,38 @@
+From: Codex <codex@openai.com>
+Date: Sat, 12 Sep 2026 18:30:00 +0000
+Subject: [PATCH] arm64: dts: rockchip: prefer four-lane DP on Orange Pi 5B
+
+The Type-C monitor advertises both the four-lane DisplayPort-only pin
+assignments C/E and the two-lane multi-function assignment D.  Advertising
+all capabilities from the Orange Pi side lets the sink's multi-function
+preference select D, limiting the link to two HBR3 lanes and forcing the
+3840x2160p60 stream down to RGB888.
+
+Describe the source capabilities explicitly and omit assignment D.  This
+causes DisplayPort Alt Mode to select assignment C (or E where appropriate),
+making all four SuperSpeed pairs available to DisplayPort.  USB 2.0 remains
+available, but USB 3.x is intentionally unavailable while DP Alt Mode is
+active.
+
+The VDO describes a receptacle acting as DFP_D, HBR3 signalling, and pin
+assignments C/E.
+
+Signed-off-by: Codex <codex@openai.com>
+---
+ arch/arm64/boot/dts/rockchip/rk3588s-orangepi-5.dtsi | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/arch/arm64/boot/dts/rockchip/rk3588s-orangepi-5.dtsi b/arch/arm64/boot/dts/rockchip/rk3588s-orangepi-5.dtsi
+--- a/arch/arm64/boot/dts/rockchip/rk3588s-orangepi-5.dtsi
++++ b/arch/arm64/boot/dts/rockchip/rk3588s-orangepi-5.dtsi
+@@ -324,7 +324,7 @@
+ 			altmodes {
+ 				displayport {
+ 					svid = /bits/ 16 <0xff01>;
+-					vdo = <0xffffffff>;
++					vdo = <0x00001446>;
+ 				};
+ 			};
+ 
+-- 
+2.51.0

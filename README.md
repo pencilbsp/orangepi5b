@@ -158,6 +158,21 @@ Firmware Broadcom bắt buộc nằm trong `config/firmware/brcm`. Ubuntu 26.04
 board này, nên image tự copy firmware riêng và tạo alias `xunlong,orangepi-5b`.
 
 
+## HDR10 qua USB-C DisplayPort
+
+Đã chạy trên Dell U2725QE (2026-09-12) qua USB-C DP Alt Mode: HBR3 8,1 Gbit/s
+x4, 10 bpc, HDR10/PQ ở cả 3840x2160p60 và 3840x2160p120. 4K60 dùng RGB 10-bit;
+4K120 dùng YCbCr 4:2:2 10-bit vì DP 1.4 HBR3x4 chỉ có 25,92 Gbit/s payload,
+thấp hơn khoảng 35,64 Gbit/s của mode RGB10 nhưng đủ cho khoảng 23,76 Gbit/s
+của 4:2:2 10-bit.
+
+Patch `0007zb` attach `Colorspace` và `HDR_OUTPUT_METADATA`, gửi VSC SDP
+BT.2020 cùng HDR Static Metadata SDP. Khi link chọn 4:2:2, glue Rockchip cũng
+đổi VOP2 sang ma trận RGB→YCbCr BT.2020 và driver phát colorimetry BT.2020 YCC.
+Nếu chỉ đổi packet mà VOP2 vẫn dùng CSC BT.709, hoặc phát BT.2020 RGB trên dữ
+liệu YCbCr, 4K120 HDR vẫn có hình nhưng toàn màn hình bị nhợt màu.
+
+
 ## FRL spike
 
 `spike/frl-lock/` chứa một thí nghiệm một ngày, không nằm trong patch queue và

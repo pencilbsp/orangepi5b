@@ -7,5 +7,6 @@ export LIBVA_DRIVER_NAME=v4l2_request
 exec /usr/bin/google-chrome-stable \
 	--ozone-platform=wayland \
 	--enable-features=AcceleratedVideoDecodeLinuxGL,AcceleratedVideoDecodeLinuxZeroCopyGL,VaapiIgnoreDriverChecks \
+	--disable-features=WaylandWpColorManagerV1 \
 	--ignore-gpu-blocklist \
 	"$@"

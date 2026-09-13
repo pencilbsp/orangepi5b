@@ -43,6 +43,10 @@
 0007u35-phy-rockchip-usbdp-upstream-v13.patch
 0007v-phy-rockchip-usbdp-legacy-hpd-compat.patch
 0007a-arm64-dts-rockchip-orangepi5b-default-dp-lanes.patch
+0007y-arm64-dts-rockchip-orangepi5b-prefer-four-lane-dp.patch
+0007z-drm-dw-dp-keep-link-across-modesets.patch
+0007za-drm-rockchip-vop2-recognize-yuyv10-output.patch
+0007zb-drm-dw-dp-add-hdr10-output.patch
 0007w-arm64-dts-rockchip-orangepi5b-disable-emmc-cqe.patch
 0007x-drm-dw-hdmi-qp-retrain-on-frl-lane-lock-loss.patch
 0008-media-rockchip-rkvdec-allow-stateless-request-format-controls.patch

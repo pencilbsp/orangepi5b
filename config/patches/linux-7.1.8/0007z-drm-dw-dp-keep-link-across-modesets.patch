@@ -1,0 +1,153 @@
+From: Codex <codex@openai.com>
+Date: Sat, 12 Sep 2026 14:10:00 +0000
+Subject: [PATCH] drm: dw-dp: keep an active link across stream modesets
+
+Changing only the display timing currently powers the sink down to D3,
+turns the PHY off, and performs full link training again.  On the RK3588
+USB-C DisplayPort path this can leave AUX stuck while reading lane status
+at DPCD 0x102, followed by an unrecoverable modeset failure.
+
+Keep an already trained link powered when the encoder remains attached to
+an active CRTC, and only reprogram the video stream.  Track link ownership
+so failed power-up or training is unwound exactly once.  Also clear the
+hardware SDP enable bits between streams to avoid retaining stale VSC
+metadata when the output format changes.
+
+Signed-off-by: Codex <codex@openai.com>
+---
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-dp.c b/drivers/gpu/drm/bridge/synopsys/dw-dp.c
+--- a/drivers/gpu/drm/bridge/synopsys/dw-dp.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-dp.c
+@@ -317,6 +317,7 @@
+ 	struct clk *hdcp_clk;
+ 	struct reset_control *rstc;
+ 	struct completion complete;
++	bool link_powered;
+ 	int irq;
+ 	struct work_struct hpd_work;
+ 	struct dw_dp_hotplug hotplug;
+@@ -1211,6 +1212,10 @@
+ {
+ 	regmap_update_bits(dp->regmap, DW_DP_VSAMPLE_CTRL, VIDEO_STREAM_ENABLE,
+ 			   FIELD_PREP(VIDEO_STREAM_ENABLE, 0));
++	regmap_update_bits(dp->regmap, DW_DP_SDP_VERTICAL_CTRL,
++			   GENMASK(SDP_REG_BANK_SIZE + 1, 2), 0);
++	regmap_update_bits(dp->regmap, DW_DP_SDP_HORIZONTAL_CTRL,
++			   GENMASK(SDP_REG_BANK_SIZE + 1, 2), 0);
+ }
+ 
+ static int dw_dp_video_enable(struct dw_dp *dp)
+@@ -1615,13 +1620,18 @@
+ {
+ 	struct dw_dp_link *link = &dp->link;
+ 
++	if (!dp->link_powered)
++		goto invalidate_link;
++
+ 	if (dw_dp_hpd_detect(dp))
+ 		drm_dp_link_power_down(&dp->aux, dp->link.revision);
+ 
+ 	dw_dp_phy_xmit_enable(dp, 0);
+ 
+ 	phy_power_off(dp->phy);
++	dp->link_powered = false;
+ 
++invalidate_link:
+ 	link->train.clock_recovered = false;
+ 	link->train.channel_equalized = false;
+ }
+@@ -1633,20 +1643,43 @@
+ 	ret = phy_power_on(dp->phy);
+ 	if (ret)
+ 		return ret;
++	dp->link_powered = true;
+ 
+ 	ret = drm_dp_link_power_up(&dp->aux, dp->link.revision);
+ 	if (ret < 0)
+-		return ret;
++		goto err_disable_link;
+ 
+ 	ret = dw_dp_link_train(dp);
++	if (ret < 0)
++		goto err_disable_link;
+ 
++	return 0;
++
++err_disable_link:
++	dw_dp_link_disable(dp);
+ 	return ret;
+ }
+ 
++static bool dw_dp_bridge_keeps_link(struct drm_bridge *bridge,
++				    struct drm_atomic_state *state)
++{
++	struct drm_crtc_state *crtc_state;
++	struct drm_crtc *crtc;
++
++	crtc = drm_atomic_get_new_crtc_for_encoder(state, bridge->encoder);
++	if (!crtc)
++		return false;
++
++	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
++
++	return crtc_state && crtc_state->active;
++}
++
+ static void dw_dp_bridge_atomic_enable(struct drm_bridge *bridge,
+ 				       struct drm_atomic_state *state)
+ {
+ 	struct dw_dp *dp = bridge_to_dp(bridge);
++	struct dw_dp_bridge_state *dp_state;
+ 	struct drm_connector *connector;
+ 	struct drm_connector_state *conn_state;
+ 	int ret;
+@@ -1665,15 +1698,32 @@
+ 
+ 	set_bit(0, dp->sdp_reg_bank);
+ 
+-	ret = dw_dp_link_enable(dp);
++	if (!dp->link_powered)
++		ret = dw_dp_link_enable(dp);
++	else if (!dw_dp_link_train_valid(&dp->link.train))
++		ret = dw_dp_link_train(dp);
++	else
++		ret = 0;
++
+ 	if (ret < 0) {
+ 		dev_err(dp->dev, "failed to enable link: %d\n", ret);
++		dw_dp_link_disable(dp);
++		bitmap_zero(dp->sdp_reg_bank, SDP_REG_BANK_SIZE);
+ 		return;
+ 	}
+ 
++	dp_state = dw_dp_get_bridge_state(dp);
++	if (dp_state)
++		dev_info(dp->dev,
++			 "enabling %s, bpc %u, format %u, %u lanes at %u kHz\n",
++			 dp_state->mode.name, dp_state->bpc,
++			 dp_state->color_format, dp->link.lanes, dp->link.rate);
++
+ 	ret = dw_dp_video_enable(dp);
+ 	if (ret < 0) {
+ 		dev_err(dp->dev, "failed to enable video: %d\n", ret);
++		dw_dp_link_disable(dp);
++		bitmap_zero(dp->sdp_reg_bank, SDP_REG_BANK_SIZE);
+ 		return;
+ 	}
+ }
+@@ -1702,8 +1752,12 @@
+ 	struct dw_dp *dp = bridge_to_dp(bridge);
+ 
+ 	dw_dp_video_disable(dp);
+-	dw_dp_link_disable(dp);
+ 	bitmap_zero(dp->sdp_reg_bank, SDP_REG_BANK_SIZE);
++
++	if (dw_dp_bridge_keeps_link(bridge, state))
++		return;
++
++	dw_dp_link_disable(dp);
+ 	dw_dp_reset(dp);
+ }
+ 
+-- 
+2.51.0
