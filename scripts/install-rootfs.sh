@@ -89,6 +89,51 @@ else
   echo "Missing VA driver package: run scripts/build-va-driver-package.sh first" >&2
   exit 1
 fi
+
+# Remote GDM sessions have no physical seat, therefore logind does not grant
+# their desktop user the uaccess ACL attached to V4L2/media devices. The VA
+# package carries narrow udev rules which expose only RK3588 codec nodes and
+# the two media DMA heaps to the standard `users` group. Refuse to build an
+# image where that policy or its target group is missing: Chrome or GRD would
+# silently fall back to software.
+chroot "$R" getent group users >/dev/null || {
+  echo "Required desktop group is missing: users" >&2
+  exit 1
+}
+dma_heap_rules="$R/usr/lib/udev/rules.d/99-orangepi5b-dma-heap.rules"
+[[ -s "$dma_heap_rules" ]] || {
+  echo "VA driver package lacks remote-session DMA-heap policy" >&2
+  exit 1
+}
+grep -Fq 'KERNEL=="system", GROUP="users", MODE="0660"' \
+  "$dma_heap_rules" || {
+  echo "VA driver package lacks the system DMA-heap remote-session rule" >&2
+  exit 1
+}
+grep -Fq 'KERNEL=="default_cma_region", GROUP="users", MODE="0660"' \
+  "$dma_heap_rules" || {
+  echo "VA driver package lacks the CMA DMA-heap remote-session rule" >&2
+  exit 1
+}
+[[ -s "$R/usr/lib/udev/rules.d/99-orangepi5b-media-accelerators.rules" ]] || {
+  echo "VA driver package lacks remote-session media-device policy" >&2
+  exit 1
+}
+grep -Fq 'ATTR{name}=="rkvdec", GROUP="users", MODE="0660"' \
+  "$R/usr/lib/udev/rules.d/99-orangepi5b-media-accelerators.rules" || {
+  echo "VA driver package lacks the rkvdec remote-session rule" >&2
+  exit 1
+}
+grep -Fq 'ATTR{name}=="rockchip,rk3588-av1-vpu-dec", GROUP="users", MODE="0660"' \
+  "$R/usr/lib/udev/rules.d/99-orangepi5b-media-accelerators.rules" || {
+  echo "VA driver package lacks the AV1 remote-session rule" >&2
+  exit 1
+}
+grep -Fq 'ATTR{name}=="rockchip-rkvenc", GROUP="users", MODE="0660"' \
+  "$R/usr/lib/udev/rules.d/99-orangepi5b-media-accelerators.rules" || {
+  echo "VA driver package lacks the RKVENC remote-session rule" >&2
+  exit 1
+}
 mapfile -t purge_packages < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$ROOT/config/boot.purge-packages")
 if ((${#purge_packages[@]})); then
   chroot "$R" apt-get -y purge "${purge_packages[@]}"

@@ -1,2 +1,5 @@
-SUBSYSTEM=="dma_heap", KERNEL=="system", GROUP="video", MODE="0660"
-SUBSYSTEM=="dma_heap", KERNEL=="default_cma_region", GROUP="video", MODE="0660"
+# Remote Login handover sessions have no local seat, so logind cannot grant
+# their desktop user a uaccess ACL.  Match the narrow media-node policy and
+# let standard desktop users allocate the heaps backing exported VA surfaces.
+SUBSYSTEM=="dma_heap", KERNEL=="system", GROUP="users", MODE="0660"
+SUBSYSTEM=="dma_heap", KERNEL=="default_cma_region", GROUP="users", MODE="0660"

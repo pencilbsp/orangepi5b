@@ -425,6 +425,36 @@ initial decode error".
 Chrome phải chạy trong phiên Wayland đang chạy (`--ozone-platform=wayland`).
 Headless vô dụng: GPU process không chạy VA probe trước sandbox.
 
+### GNOME Remote Desktop: remote session không có seat
+
+`TAG+="uaccess"` chỉ cấp ACL V4L2/media cho user giữ seat vật lý. Một phiên
+Remote Login của GNOME là Wayland session hợp lệ nhưng không có seat; trong khi
+`seat0` vẫn thuộc GDM greeter. Kết quả là remote user mở được render node nhờ
+`xaccess-render`, nhưng nhận `EACCES` với rkvdec/Hantro:
+
+```text
+v4l2-request: device: no V4L2 stateless H.264/HEVC/VP9 decoder found
+libva error: v4l2_request_drv_video.so init failed
+vaInitialize failed: operation failed
+```
+
+Chrome khi đó dùng `FFmpegVideoDecoder`; user-instance GRD cũng không dùng được
+VAAPI. Thêm account hệ thống `gnome-remote-desktop` vào `video,render` không xử
+lý đường handover, vì daemon handover và Chrome chạy bằng account desktop được
+tạo sau first boot.
+
+Package `orangepi5b-va-driver` vì vậy cài udev rule cấp group `users` cho đúng
+các accelerator RK3588: rkvdec, Hantro AV1 và rkvenc. Hai DMA heap
+`system`/`default_cma_region` dùng để export VA surface cũng phải theo policy
+này; nếu chúng còn là `root:video 0660`, handover daemon tạo được RKVENC
+context nhưng không cấp được DMA-BUF, `vaExportSurfaceHandle` trả
+`VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE` và GRD lặng lẽ fallback sang RFX
+Progressive. Rule codec match tên/driver sysfs, không phụ thuộc `/dev/videoN`,
+và không đổi quyền camera hay V4L2 node khác. Postinst reload rồi trigger
+`dma_heap`/`video4linux`/`media`, còn image builder từ chối package thiếu rule
+codec hoặc DMA heap. User do GNOME Initial Setup tạo thuộc group chuẩn `users`,
+nên cả local và remote session dùng codec mà không cần biết trước username.
+
 Image cài `/usr/local/bin/google-chrome-orangepi5b` làm browser alternative và
 ghi đè desktop entry bằng cùng application ID trong `/usr/local/share`. Wrapper
 đặt `LIBVA_DRIVER_NAME=v4l2_request`, bật

@@ -18,7 +18,7 @@ source "$ROOT/scripts/lib/arm64-cross.sh"
 C="$ROOT/build/cross-chroot"
 SRC_DIR="$ROOT/va-driver"
 TEMPLATE="$ROOT/packages/orangepi5b-va-driver"
-PACKAGE_VERSION="${VA_DRIVER_VERSION:-0.1.0}"
+PACKAGE_VERSION="${VA_DRIVER_VERSION:-0.1.2}"
 DRIVER_REL="usr/lib/aarch64-linux-gnu/dri/v4l2_request_drv_video.so"
 
 require_cross_prereqs
@@ -96,6 +96,8 @@ install -m 0644 "$TEMPLATE/data/10-gnome-remote-desktop-vaapi.conf" \
  "$STAGE/usr/lib/systemd/user/gnome-remote-desktop-handover.service.d/10-vaapi.conf"
 install -m 0644 "$TEMPLATE/data/99-orangepi5b-dma-heap.rules" \
  "$STAGE/usr/lib/udev/rules.d/99-orangepi5b-dma-heap.rules"
+install -m 0644 "$TEMPLATE/data/99-orangepi5b-media-accelerators.rules" \
+ "$STAGE/usr/lib/udev/rules.d/99-orangepi5b-media-accelerators.rules"
 install -m 0755 "$TEMPLATE/DEBIAN/postinst" "$STAGE/DEBIAN/postinst"
 sed -e "s/@PACKAGE_VERSION@/${PACKAGE_VERSION}/g" \
     -e "s/@LIBVA_VERSION@/${libva_version%.*}/g" \

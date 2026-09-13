@@ -1,0 +1,12 @@
+# A GNOME Remote Desktop login has no local seat, so systemd-logind does not
+# grant its desktop user the uaccess ACL that local GDM sessions receive.
+# Give ordinary desktop users access only to the RK3588 media accelerators;
+# camera and unrelated V4L2 nodes keep the distro's group=video policy.
+SUBSYSTEM=="video4linux", ATTR{name}=="rkvdec", GROUP="users", MODE="0660"
+SUBSYSTEM=="media", DRIVERS=="rkvdec", GROUP="users", MODE="0660"
+
+SUBSYSTEM=="video4linux", ATTR{name}=="rockchip,rk3588-av1-vpu-dec", GROUP="users", MODE="0660"
+SUBSYSTEM=="media", DRIVERS=="hantro-vpu", KERNELS=="fdc70000.video-codec", GROUP="users", MODE="0660"
+
+# GNOME Remote Desktop's handover daemon runs as the logged-in desktop user.
+SUBSYSTEM=="video4linux", ATTR{name}=="rockchip-rkvenc", GROUP="users", MODE="0660"
