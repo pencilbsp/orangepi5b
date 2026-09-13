@@ -172,6 +172,11 @@ BT.2020 cùng HDR Static Metadata SDP. Khi link chọn 4:2:2, glue Rockchip cũn
 Nếu chỉ đổi packet mà VOP2 vẫn dùng CSC BT.709, hoặc phát BT.2020 RGB trên dữ
 liệu YCbCr, 4K120 HDR vẫn có hình nhưng toàn màn hình bị nhợt màu.
 
+`0007c-drm-dw-dp-report-aux-detect-errors.patch` là patch chẩn đoán tùy chọn,
+cố ý không nằm trong `series` và không được ship trong image production. Chỉ
+áp dụng thủ công khi cần phân biệt lỗi detect do PHY power-on, AUX timeout hay
+DPCD/link parsing; bỏ patch sau khi điều tra để tránh làm log kernel ồn.
+
 
 ## FRL spike
 

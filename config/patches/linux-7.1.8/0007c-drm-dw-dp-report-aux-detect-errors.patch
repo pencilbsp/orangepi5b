@@ -1,0 +1,54 @@
+From: Codex <codex@openai.com>
+Date: Sat, 12 Sep 2026 07:30:00 +0000
+Subject: [PATCH] drm: dw-dp: report AUX and connector detection failures
+
+The connector currently becomes disconnected without a useful message when
+the DesignWare AUX status register reports a hardware timeout.  Emit
+rate-limited diagnostics for that condition and for PHY/link detection
+failures so USB-C DP bring-up can distinguish HPD, PHY and DPCD failures.
+
+This diagnostic can be dropped once the Orange Pi 5B USB-C DP path is stable
+or upstream provides equivalent error reporting.
+
+Signed-off-by: Codex <codex@openai.com>
+---
+ drivers/gpu/drm/bridge/synopsys/dw-dp.c | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-dp.c b/drivers/gpu/drm/bridge/synopsys/dw-dp.c
+--- a/drivers/gpu/drm/bridge/synopsys/dw-dp.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-dp.c
+@@ -1495,8 +1495,12 @@ static ssize_t dw_dp_aux_transfer(struct drm_dp_aux *aux,
+ 	}
+ 
+ 	regmap_read(dp->regmap, DW_DP_AUX_STATUS, &value);
+-	if (value & AUX_TIMEOUT)
++	if (value & AUX_TIMEOUT) {
++		dev_err_ratelimited(dp->dev,
++				    "AUX hardware timeout: request %#x address %#x size %zu status %#x\n",
++				    msg->request, msg->address, msg->size, value);
+ 		return -ETIMEDOUT;
++	}
+ 
+ 	msg->reply = FIELD_GET(AUX_STATUS, value);
+ 
+@@ -1712,10 +1716,15 @@ static bool dw_dp_hpd_detect_link(struct dw_dp *dp, struct drm_connector *connect
+ 
+ 	ret = phy_power_on(dp->phy);
+-	if (ret < 0)
+-		return false;
++	if (ret < 0) {
++		dev_err_ratelimited(dp->dev, "failed to power on DP PHY: %d\n", ret);
++		return false;
++	}
+ 	ret = dw_dp_link_parse(dp, connector);
+ 	phy_power_off(dp->phy);
+ 
++	if (ret < 0)
++		dev_err_ratelimited(dp->dev, "failed to detect DP sink over AUX: %d\n", ret);
++
+ 	return !ret;
+ }
+ 
+-- 
+2.51.0
