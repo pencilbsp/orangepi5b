@@ -1,0 +1,16 @@
+diff --git a/drivers/gpu/drm/rockchip/dw_hdmi-rockchip.c b/drivers/gpu/drm/rockchip/dw_hdmi-rockchip.c
+index b9aa5a657..f8b4386cb 100644
+--- a/drivers/gpu/drm/rockchip/dw_hdmi-rockchip.c
++++ b/drivers/gpu/drm/rockchip/dw_hdmi-rockchip.c
+@@ -2603,11 +2603,6 @@ dw_hdmi_rockchip_encoder_atomic_check(struct drm_encoder *encoder,
+ 		hdmi_select_link_config(hdmi, crtc_state, tmdsclk);
+ 
+ 		if (hdmi->link_cfg.frl_mode) {
+-			/* in the current version, support max 40G frl */
+-			if (hdmi->link_cfg.rate_per_lane >= 10) {
+-				hdmi->link_cfg.frl_lanes = 4;
+-				hdmi->link_cfg.rate_per_lane = 10;
+-			}
+ 			bus_width = hdmi->link_cfg.frl_lanes *
+ 				hdmi->link_cfg.rate_per_lane * 1000000;
+ 			/* 10 bit color depth and frl mode */

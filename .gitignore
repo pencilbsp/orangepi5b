@@ -8,16 +8,27 @@
 /output/**/*.img
 /output/**/*.img.xz
 
-# Local reference material, not required by build scripts
-/*.pdf
-
 # Local editor/OS noise
 .DS_Store
 *.swp
 *~
+__pycache__/
+*.py[cod]
 
 # Spike build products, not part of the image
 /spike/**/out/
+/spike/**/*capture*/
+/spike/**/*snapshot*/
+/spike/**/remote-watch*/
+/spike/**/analysis-*.txt
+/spike/**/*-pull-*.txt
+/spike/**/*.log
+/spike/v4l2-probe/v4l2-formats
+# Incomplete legacy experiment; its source patch was not preserved.
+/spike/frl-debug/
+
+# External kernel clones used by BSP comparison builds
+/worktrees/
 
 # Board connection details, contains credentials
 /target.json

@@ -1,0 +1,252 @@
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.c b/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.c
+index f494af5f4..76f32959c 100644
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi-qp.c
+@@ -19,6 +19,7 @@
+ #include <linux/pinctrl/consumer.h>
+ #include <linux/regmap.h>
+ #include <linux/spinlock.h>
++#include <linux/workqueue.h>
+ 
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_helper.h>
+@@ -76,6 +77,14 @@ static const unsigned int dw_hdmi_cable[] = {
+ 	EXTCON_NONE,
+ };
+ 
++static bool dw_hdmi_qp_frl_debug = true;
++module_param_named(frl_debug, dw_hdmi_qp_frl_debug, bool, 0644);
++MODULE_PARM_DESC(frl_debug, "Enable HDMI FRL SCDC/CED debug sampling");
++
++static unsigned int dw_hdmi_qp_frl_debug_interval_ms = 500;
++module_param_named(frl_debug_interval_ms, dw_hdmi_qp_frl_debug_interval_ms, uint, 0644);
++MODULE_PARM_DESC(frl_debug_interval_ms, "HDMI FRL debug sampling interval in milliseconds");
++
+ /*
+  * Recommended N and Expected CTS Values in FRL Mode in chapter 9.2.2
+  * of HDMI Specification 2.1.
+@@ -339,6 +348,9 @@ struct dw_hdmi_qp {
+ 	bool logo_plug_out;             /* hdmi is plug out when kernel logo */
+ 	struct completion flt_cmp;
+ 	struct completion earc_cmp;
++	struct delayed_work frl_debug_work;
++	u32 frl_debug_sample;
++	bool frl_debug_active;
+ 
+ 	struct cec_notifier *cec_notifier;
+ 	struct cec_adapter *cec_adap;
+@@ -1941,6 +1953,164 @@ static int hdmi_start_flt(struct dw_hdmi_qp *hdmi, u8 rate)
+ 	return 0;
+ }
+ 
++static unsigned int dw_hdmi_qp_frl_debug_interval(void)
++{
++	unsigned int interval = dw_hdmi_qp_frl_debug_interval_ms;
++
++	if (interval < 100)
++		interval = 100;
++	if (interval > 60000)
++		interval = 60000;
++
++	return interval;
++}
++
++static u16 dw_hdmi_qp_frl_debug_ced_counter(const u8 *raw, unsigned int offset)
++{
++	return ((raw[offset + 1] & 0x7f) << 8) | raw[offset];
++}
++
++static void dw_hdmi_qp_frl_debug_work(struct work_struct *work)
++{
++	struct delayed_work *dwork = to_delayed_work(work);
++	struct dw_hdmi_qp *hdmi = container_of(dwork, struct dw_hdmi_qp,
++					       frl_debug_work);
++	u8 upd0 = 0, upd1 = 0, cfg0 = 0, sink_cfg1 = 0;
++	u8 status0 = 0, ltp01 = 0, ltp23 = 0;
++	u8 ced[11] = {};
++	u32 link, flt0, flt1, flt2, flt_ctrl;
++	u32 scdc_cfg, scdc_ctrl, scdc_status;
++	u32 rsfec_cfg, rsfec_status;
++	u32 pktz_cfg, pktz_ctrl0, pktz_ctrl1, pktz_status1;
++	u32 swdisable, pkten, main_irq, avp1_irq, avp3_irq;
++	u32 video_if_status, video_mon_status;
++	u32 sample;
++	int hpd = -1;
++	int ret;
++
++	if (!READ_ONCE(dw_hdmi_qp_frl_debug) ||
++	    !READ_ONCE(hdmi->frl_debug_active))
++		return;
++
++	if (!mutex_trylock(&hdmi->mutex))
++		goto requeue;
++
++	link = hdmi_readl(hdmi, LINK_CONFIG0);
++	if (!hdmi->curr_conn || hdmi->disabled || !hdmi->ddc ||
++	    !(link & OPMODE_FRL)) {
++		WRITE_ONCE(hdmi->frl_debug_active, false);
++		mutex_unlock(&hdmi->mutex);
++		return;
++	}
++
++	sample = ++hdmi->frl_debug_sample;
++
++	flt0 = hdmi_readl(hdmi, FLT_CONFIG0);
++	flt1 = hdmi_readl(hdmi, FLT_CONFIG1);
++	flt2 = hdmi_readl(hdmi, FLT_CONFIG2);
++	flt_ctrl = hdmi_readl(hdmi, FLT_CONTROL0);
++	scdc_cfg = hdmi_readl(hdmi, SCDC_CONFIG0);
++	scdc_ctrl = hdmi_readl(hdmi, SCDC_CONTROL0);
++	scdc_status = hdmi_readl(hdmi, SCDC_STATUS0);
++	rsfec_cfg = hdmi_readl(hdmi, FRL_RSFEC_CONFIG0);
++	rsfec_status = hdmi_readl(hdmi, FRL_RSFEC_STATUS0);
++	pktz_cfg = hdmi_readl(hdmi, FRL_PKTZ_CONFIG0);
++	pktz_ctrl0 = hdmi_readl(hdmi, FRL_PKTZ_CONTROL0);
++	pktz_ctrl1 = hdmi_readl(hdmi, FRL_PKTZ_CONTROL1);
++	pktz_status1 = hdmi_readl(hdmi, FRL_PKTZ_STATUS1);
++	swdisable = hdmi_readl(hdmi, GLOBAL_SWDISABLE);
++	pkten = hdmi_readl(hdmi, PKTSCHED_PKT_EN);
++	main_irq = hdmi_readl(hdmi, MAINUNIT_1_INT_STATUS);
++	avp1_irq = hdmi_readl(hdmi, AVP_1_INT_STATUS);
++	avp3_irq = hdmi_readl(hdmi, AVP_3_INT_STATUS);
++	video_if_status = hdmi_readl(hdmi, VIDEO_INTERFACE_STATUS0);
++	video_mon_status = hdmi_readl(hdmi, VIDEO_MONITOR_STATUS0);
++
++	if (hdmi->phy.ops->read_hpd)
++		hpd = hdmi->phy.ops->read_hpd(hdmi, hdmi->phy.data) ==
++		      connector_status_connected;
++
++	ret = drm_scdc_readb(hdmi->ddc, SCDC_UPDATE_0, &upd0);
++	if (!ret)
++		ret = drm_scdc_readb(hdmi->ddc, SCDC_UPDATE_1, &upd1);
++	if (!ret)
++		ret = drm_scdc_readb(hdmi->ddc, SCDC_CONFIG_0, &cfg0);
++	if (!ret)
++		ret = drm_scdc_readb(hdmi->ddc, 0x31, &sink_cfg1);
++	if (!ret)
++		ret = drm_scdc_readb(hdmi->ddc, SCDC_STATUS_FLAGS_0,
++				     &status0);
++	if (!ret)
++		ret = drm_scdc_readb(hdmi->ddc, 0x41, &ltp01);
++	if (!ret)
++		ret = drm_scdc_readb(hdmi->ddc, 0x42, &ltp23);
++	if (!ret)
++		ret = drm_scdc_read(hdmi->ddc, 0x50, ced, sizeof(ced));
++
++	if (ret) {
++		dev_info(hdmi->dev,
++			 "FRLDBG_BSP sample=%u scdc_read_err=%d link=%08x scdc=%08x/%08x/%08x main_irq=%08x avp_irq=%08x/%08x hpd=%d\n",
++			 sample, ret, link, scdc_cfg, scdc_ctrl, scdc_status,
++			 main_irq, avp1_irq, avp3_irq, hpd);
++	} else {
++		dev_info(hdmi->dev,
++			 "FRLDBG_BSP sample=%u upd=%02x/%02x cfg=%02x sink=%02x ffe=%u status=%02x ltp=%02x/%02x hpd=%d link=%08x flt=%08x/%08x/%08x/%08x scdc=%08x/%08x/%08x rsfec=%08x/%08x pktz=%08x/%08x/%08x/%08x swdisable=%08x pkten=%08x irq=%08x/%08x/%08x video=%08x/%08x\n",
++			 sample, upd0, upd1, cfg0, sink_cfg1, sink_cfg1 >> 4,
++			 status0, ltp01, ltp23, hpd, link, flt0, flt1, flt2,
++			 flt_ctrl, scdc_cfg, scdc_ctrl, scdc_status, rsfec_cfg,
++			 rsfec_status, pktz_cfg, pktz_ctrl0, pktz_ctrl1,
++			 pktz_status1, swdisable, pkten, main_irq, avp1_irq,
++			 avp3_irq, video_if_status, video_mon_status);
++		dev_info(hdmi->dev,
++			 "FRLDBG_BSP decoded CED_checksum=%s lanes=[%u,%u,%u,%u] RS_corrections_snapshot=%u raw50_5a=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
++			 ced[8] & 0x80 ? "ok" : "bad",
++			 dw_hdmi_qp_frl_debug_ced_counter(ced, 0),
++			 dw_hdmi_qp_frl_debug_ced_counter(ced, 2),
++			 dw_hdmi_qp_frl_debug_ced_counter(ced, 4),
++			 dw_hdmi_qp_frl_debug_ced_counter(ced, 6),
++			 dw_hdmi_qp_frl_debug_ced_counter(ced, 9),
++			 ced[0], ced[1], ced[2], ced[3], ced[4], ced[5],
++			 ced[6], ced[7], ced[8], ced[9], ced[10]);
++	}
++
++	mutex_unlock(&hdmi->mutex);
++
++requeue:
++	if (READ_ONCE(dw_hdmi_qp_frl_debug) &&
++	    READ_ONCE(hdmi->frl_debug_active))
++		mod_delayed_work(system_wq, &hdmi->frl_debug_work,
++				 msecs_to_jiffies(dw_hdmi_qp_frl_debug_interval()));
++}
++
++static void dw_hdmi_qp_frl_debug_start(struct dw_hdmi_qp *hdmi)
++{
++	u32 link;
++
++	if (!READ_ONCE(dw_hdmi_qp_frl_debug))
++		return;
++
++	link = hdmi_readl(hdmi, LINK_CONFIG0);
++	if (!(link & OPMODE_FRL))
++		return;
++
++	cancel_delayed_work_sync(&hdmi->frl_debug_work);
++	hdmi->frl_debug_sample = 0;
++	WRITE_ONCE(hdmi->frl_debug_active, true);
++	dev_info(hdmi->dev,
++		 "FRLDBG_BSP v1 enable interval_ms=%u link=%08x\n",
++		 dw_hdmi_qp_frl_debug_interval(), link);
++	mod_delayed_work(system_wq, &hdmi->frl_debug_work, 0);
++}
++
++static void dw_hdmi_qp_frl_debug_stop(struct dw_hdmi_qp *hdmi,
++				      const char *reason)
++{
++	WRITE_ONCE(hdmi->frl_debug_active, false);
++	if (cancel_delayed_work_sync(&hdmi->frl_debug_work))
++		dev_info(hdmi->dev, "FRLDBG_BSP disable reason=%s samples=%u\n",
++			 reason, hdmi->frl_debug_sample);
++}
++
+ #define HDMI_MODE_FRL_MASK     BIT(30)
+ 
+ static int hdmi_set_op_mode(struct dw_hdmi_qp *hdmi,
+@@ -3088,6 +3258,8 @@ static void dw_hdmi_qp_bridge_atomic_disable(struct drm_bridge *bridge,
+ 	void *data = hdmi->plat_data->phy_data;
+ 	const struct drm_connector_state *conn_state = hdmi->curr_conn->state;
+ 
++	dw_hdmi_qp_frl_debug_stop(hdmi, "atomic_disable");
++
+ 	if (hdmi->panel)
+ 		drm_panel_disable(hdmi->panel);
+ 
+@@ -3150,6 +3322,7 @@ static void dw_hdmi_qp_bridge_atomic_enable(struct drm_bridge *bridge,
+ 	hdmi_writel(hdmi, 2, PKTSCHED_PKT_CONTROL0);
+ 	hdmi_modb(hdmi, PKTSCHED_GCP_TX_EN, PKTSCHED_GCP_TX_EN, PKTSCHED_PKT_EN);
+ 	mutex_unlock(&hdmi->mutex);
++	dw_hdmi_qp_frl_debug_start(hdmi);
+ 
+ 	if (!hdmi->dclk_en) {
+ 		mutex_lock(&hdmi->audio_mutex);
+@@ -3208,6 +3381,15 @@ static irqreturn_t dw_hdmi_qp_main_hardirq(int irq, void *dev_id)
+ 				 FLT_EXIT_TO_LTS4_IRQ |
+ 				 FLT_EXIT_TO_LTSL_IRQ);
+ 
++	if (hdmi->scdc_intr || hdmi->flt_intr)
++		dev_info(hdmi->dev,
++			 "FRLDBG_BSP irq main=%08x scdc_intr=%08x flt_intr=%08x scdc_status=%08x link=%08x flt=%08x/%08x\n",
++			 stat, hdmi->scdc_intr, hdmi->flt_intr,
++			 hdmi_readl(hdmi, SCDC_STATUS0),
++			 hdmi_readl(hdmi, LINK_CONFIG0),
++			 hdmi_readl(hdmi, FLT_CONFIG0),
++			 hdmi_readl(hdmi, FLT_CONFIG1));
++
+ 	dev_dbg(hdmi->dev, "i2c main unit irq:%#x\n", stat);
+ 	if (i2c->stat) {
+ 		hdmi_writel(hdmi, i2c->stat, MAINUNIT_1_INT_CLEAR);
+@@ -3938,6 +4120,7 @@ static struct dw_hdmi_qp *dw_hdmi_qp_probe(struct platform_device *pdev,
+ 	mutex_init(&hdmi->mutex);
+ 	mutex_init(&hdmi->audio_mutex);
+ 	mutex_init(&hdmi->cec_notifier_mutex);
++	INIT_DELAYED_WORK(&hdmi->frl_debug_work, dw_hdmi_qp_frl_debug_work);
+ 
+ 	ddc_node = of_parse_phandle(np, "ddc-i2c-bus", 0);
+ 	if (ddc_node) {
+@@ -4143,6 +4326,8 @@ static struct dw_hdmi_qp *dw_hdmi_qp_probe(struct platform_device *pdev,
+ 
+ static void dw_hdmi_qp_remove(struct dw_hdmi_qp *hdmi)
+ {
++	dw_hdmi_qp_frl_debug_stop(hdmi, "remove");
++
+ 	if (hdmi->avp_irq)
+ 		disable_irq(hdmi->avp_irq);
+ 
