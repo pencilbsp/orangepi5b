@@ -74,6 +74,18 @@ else
   exit 1
 fi
 
+gnome_session_debs=( "$ROOT"/output/debs/gnome-session-bin_*+orangepi5b*.deb )
+if ((${#gnome_session_debs[@]})); then
+  mapfile -t gnome_session_debs < <(printf '%s\n' "${gnome_session_debs[@]}" | sort -V)
+  gnome_session_deb=${gnome_session_debs[-1]}
+  install -m 0644 "$gnome_session_deb" "$R/tmp/$(basename "$gnome_session_deb")"
+  chroot "$R" apt-get -y --no-install-recommends install "/tmp/$(basename "$gnome_session_deb")"
+  rm -f "$R/tmp/$(basename "$gnome_session_deb")"
+else
+  echo "Missing patched GNOME Session package: run scripts/build-gnome-session-package.sh first" >&2
+  exit 1
+fi
+
 # The VA-API driver for rkvdec. Without it libva finds no backend, Chrome
 # silently drops to FFmpegVideoDecoder and nothing in the log says why -- the
 # fallback is reported to MediaLog, not stderr. Fail loudly instead: an image

@@ -1,0 +1,73 @@
+From: Orange Pi 5B Builder <pencil.bsp@gmail.com>
+Date: Sun, 13 Sep 2026 22:20:00 +0000
+Subject: [PATCH] ctl: keep D-Bus while other user sessions exist
+
+The user D-Bus is shared by every session belonging to the same UID.  Do not
+stop it as part of one GNOME session's teardown if logind still knows about
+another session for that user.
+
+This matters for GDM remote login's conflicting-session handoff.  GDM opens
+the authenticated remote session before asking whether the existing local
+graphical session should be stopped.  When the local session then exits,
+gnome-session-restart-dbus.service currently tears down the shared bus and
+causes that pending remote session to fail with "Session never registered".
+
+Ignore logind's synthetic manager and manager-early sessions: one of those
+normally exists for the systemd user manager itself and is not an independent
+login.  Preserve the old behaviour if logind cannot be queried.  A missing or
+broken logind installation should not silently change the long-standing
+logout cleanup semantics.
+---
+ tools/gnome-session-ctl.c | 29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/tools/gnome-session-ctl.c b/tools/gnome-session-ctl.c
+index 31cb520..9d3a60e 100644
+--- a/tools/gnome-session-ctl.c
++++ b/tools/gnome-session-ctl.c
+@@ -29,6 +29,7 @@
+ #include <sys/stat.h>
+ #include <fcntl.h>
+ #include <systemd/sd-daemon.h>
++#include <systemd/sd-login.h>
+
+ #include <glib.h>
+ #include <glib-unix.h>
+@@ -115,9 +116,37 @@ static void
+ static void
+ do_restart_dbus (void)
+ {
++        g_auto(GStrv) sessions = NULL;
+         g_autoptr(GDBusConnection) connection = NULL;
+         g_autoptr(GVariant) reply = NULL;
+         g_autoptr(GError) error = NULL;
++        int n_sessions;
++
++        n_sessions = sd_uid_get_sessions (getuid (), 0, &sessions);
++        if (n_sessions < 0) {
++                g_warning ("Could not enumerate sessions for user %u: %s",
++                           getuid (), g_strerror (-n_sessions));
++        } else {
++                for (int i = 0; i < n_sessions; i++) {
++                        g_autofree char *session_class = NULL;
++                        int res;
++
++                        res = sd_session_get_class (sessions[i], &session_class);
++                        if (res < 0) {
++                                g_warning ("Could not get class of session '%s': %s",
++                                           sessions[i], g_strerror (-res));
++                                return;
++                        }
++
++                        if (g_str_equal (session_class, "manager") ||
++                            g_str_equal (session_class, "manager-early"))
++                                continue;
++
++                        g_message ("Not restarting DBus: session '%s' (%s) still exists for user %u",
++                                   sessions[i], session_class, getuid ());
++                        return;
++                }
++        }
+
+         connection = get_session_bus ();
+         if (connection == NULL)
