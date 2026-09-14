@@ -154,9 +154,17 @@ Nó cần cài đè package, sửa unit, bật RDP, mở khoá màn hình — qu
 trên board để đóng thành script chạy một phát như hai script `measure-*.sh`.
 Các bước đã ghi ở trên, làm tay khi cần.
 
-## Vẫn chưa ship được
+## Đã ship, và `0001` của GRD đã rút khỏi `series`
 
-Đo xong không có nghĩa bỏ được `0001` ngay. Source package mesa của Ubuntu vẫn
-chưa cross-build được (nút libclang/llvm ở đầu `build.sh`), nên chưa có đường
-đưa Mesa đã vá vào ảnh. Chừng nào chưa gỡ nút đó, `0001` của GRD vẫn phải ở
-lại — giờ thì biết chắc nó là thứ tạm, không phải thứ cần.
+Kết luận ở trên về sau được xác nhận bằng chính gói sẽ ship. Nút cross-build
+(libclang/llvm ở đầu `build.sh`) không được gỡ mà được **đi vòng**: mesa dựng
+native trên arm64 bằng `scripts/build-mesa-package.sh`, nơi apt universe chỉ có
+một kiến trúc nên không có xung đột nào để gỡ. Chi tiết và số đo end-to-end:
+`config/patches/mesa-26.0.8/README.md`.
+
+Ảnh giờ cài Mesa đã vá, và `0001` của GRD đã rút khỏi
+`config/patches/gnome-remote-desktop-50.2/series` — đúng như đo ở đây dự đoán.
+
+Hai script `measure-*.sh` trong thư mục này vẫn chạy bằng bản panfrost tối giản
+của `build.sh`, không phải bằng `.deb`. Chúng vẫn dùng được để cô lập từng
+patch; muốn kiểm bản sẽ ship thì đo qua ảnh.

@@ -62,6 +62,51 @@ if ((${#resources_debs[@]})); then
   rm -f "$R/tmp/$(basename "$resources_deb")"
 fi
 
+# Patched Mesa. Two fixes the board cannot do without:
+#   - panvk answers the v2 DRM format modifier query, so gnome-remote-desktop
+#     finds a physical device at all. Without it GRD acquires none and encodes
+#     H.264 on the CPU, saying nothing in the log about the hardware encoder it
+#     passed over.
+#   - EGL reports a failed dmabuf export instead of returning EGL_TRUE with an
+#     unwritten fd, so GTK4 falls back to glReadPixels rather than reading
+#     uninitialised memory into every texture it downloads.
+# See config/patches/mesa-26.0.8/README.md.
+#
+# The six binaries are pinned to each other through
+# mesa-libgallium (= ${binary:Version}), so they go in as one set or not at all.
+# Built natively on arm64, not cross-compiled -- the .deb files are committed to
+# output/debs because this script runs on the x86 host and cannot produce them.
+mesa_gallium_debs=( "$ROOT"/output/debs/mesa-libgallium_*+orangepi5b*_arm64.deb )
+if ((${#mesa_gallium_debs[@]})); then
+  mapfile -t mesa_gallium_debs < <(printf '%s\n' "${mesa_gallium_debs[@]}" | sort -V)
+  mesa_version=$(basename "${mesa_gallium_debs[-1]}")
+  mesa_version=${mesa_version#mesa-libgallium_}
+  mesa_version=${mesa_version%_arm64.deb}
+  mesa_set=()
+  for mesa_pkg in libegl-mesa0 libgbm1 libgl1-mesa-dri libglx-mesa0 \
+                  mesa-libgallium mesa-vulkan-drivers; do
+    mesa_deb="$ROOT/output/debs/${mesa_pkg}_${mesa_version}_arm64.deb"
+    if [[ ! -s "$mesa_deb" ]]; then
+      echo "Mesa $mesa_version is missing $mesa_pkg: the six packages must come" >&2
+      echo "from one build. Rebuild with scripts/build-mesa-package.sh." >&2
+      exit 1
+    fi
+    install -m 0644 "$mesa_deb" "$R/tmp/$(basename "$mesa_deb")"
+    mesa_set+=( "/tmp/$(basename "$mesa_deb")" )
+  done
+  chroot "$R" apt-get -y --no-install-recommends install "${mesa_set[@]}"
+  for mesa_tmp in "${mesa_set[@]}"; do rm -f "$R$mesa_tmp"; done
+  # An image whose panvk cannot be loaded is an image without hardware encode,
+  # and nothing downstream says so out loud. Check here instead.
+  [[ -s "$R/usr/lib/aarch64-linux-gnu/libvulkan_panfrost.so" ]] || {
+    echo "Patched Mesa installed but panvk is missing from the rootfs" >&2
+    exit 1; }
+else
+  echo "Missing patched Mesa packages: run scripts/build-mesa-package.sh on an" >&2
+  echo "Apple Silicon Mac and commit the .deb files to output/debs." >&2
+  exit 1
+fi
+
 grd_debs=( "$ROOT"/output/debs/gnome-remote-desktop_*+orangepi5b*.deb )
 if ((${#grd_debs[@]})); then
   mapfile -t grd_debs < <(printf '%s\n' "${grd_debs[@]}" | sort -V)

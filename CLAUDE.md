@@ -1,6 +1,7 @@
 # ubuntu-orangepi5b
 
-Ảnh Ubuntu 26.04 arm64 cho Orange Pi 5B (RK3588S). Build trên máy x86.
+Ảnh Ubuntu 26.04 arm64 cho Orange Pi 5B (RK3588S). Build trên máy x86 —
+trừ mesa, xem ngoại lệ ở dưới.
 
 ## Quy tắc bắt buộc: cross-compile, không emulate
 
@@ -38,6 +39,46 @@ Cho việc **không phải compile**:
 
 Và cho **ngoại lệ đã kiểm chứng dưới đây**. Ngoài hai trường hợp đó, nếu thấy
 mình đang chờ `cc1`/`cc1plus` chạy dưới qemu thì đã đi sai đường.
+
+### Ngoại lệ: build native trên máy arm64 thật (mesa)
+
+Quy tắc trên cấm **emulation**, không cấm "không-cross". Lý do của nó là "không
+có lý do gì phải emulate chính compiler". Trên một máy arm64 thật — Apple
+Silicon — compiler *là* binary arm64 và sinh mã arm64: không có emulation nào
+cả, nên lối này thoả đúng nguyên tắc dù không phải cross-build.
+
+Chỉ **mesa** đi đường này, và vì một lý do cụ thể: build-dep arm64 của nó không
+giải được trong một apt universe có hai kiến trúc.
+
+```text
+llvm-21-dev:arm64 → llvm-21-tools:arm64 → python3-yaml:arm64 → python3:arm64
+```
+
+mà `python3:amd64 Conflicts python3:arm64`, nên kéo LLVM cho target sẽ hất văng
+chính thông dịch viên native mà script sinh mã của mesa chạy trên đó. Nút nằm
+trong packaging của `llvm-21-tools` và `python3-yaml`, không phải của mesa, nên
+thêm `:native` vào `debian/control` của mesa không gỡ được. Và không bỏ LLVM đi
+được: ảnh cần llvmpipe. Dẫn giải đầy đủ:
+`config/patches/mesa-26.0.8/README.md`.
+
+Trên host arm64 chỉ có **một** kiến trúc trong apt universe, nên
+`apt-get build-dep mesa` giải bình thường, `debian/` của Ubuntu giữ nguyên
+không phải vá gì. Đây đúng là cách buildd của Ubuntu build mesa.
+
+```bash
+brew install container            # container CLI của Apple
+container system kernel set --recommended
+bash scripts/build-mesa-package.sh
+```
+
+`scripts/build-mesa-package.sh` chạy **trên macOS**, không chạy trên host x86 —
+mọi script khác trong `scripts/` thì ngược lại. Nó từ chối chạy nếu guest không
+phải `aarch64`/`arm64`: amd64 dưới Rosetta **là** emulation, đúng thứ quy tắc
+này cấm.
+
+Đây không phải giấy phép chung để bỏ cross-build. Gói nào cross-build được thì
+vẫn phải cross-build; ngoại lệ này chỉ dành cho gói chứng minh được là bế tắc
+multiarch, và phải ghi lại bế tắc đó như mesa đã ghi.
 
 ### Cạm bẫy cross-build: build profile
 
@@ -105,6 +146,7 @@ trong khi `renderD128` vẫn dùng được — bình thường, không phải l
 
 - `config/patches/linux-7.1.8/` — queue patch kernel, áp theo `series`
 - `config/patches/gnome-remote-desktop-50.2/` — ba patch để tới được RKVENC và giữ visible size đúng
+- `config/patches/mesa-26.0.8/` — hai patch EGL/panvk, build native arm64 chứ không cross
 - `scripts/lib/arm64-chroot.sh` — helper chroot dùng chung
 - `docs/GRD-VAAPI-ENCODE-PLAN.md` — kế hoạch hardware encode/decode
 - `spike/` — điều tra, không thuộc ảnh

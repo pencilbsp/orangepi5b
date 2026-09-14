@@ -72,7 +72,7 @@ core chứ không phải trong panvk, và nó làm hỏng dữ liệu một các
 cho ra avatar đúng và rẻ hơn khi rebase — nếu chi phí rebuild Mesa là vấn đề
 thì đó là lựa chọn thay thế hợp lệ.
 
-## Chưa build được bằng source package của Ubuntu
+## Vì sao không cross-build được
 
 Đã truy tới tận gốc. **Nút thắt không nằm ở packaging của mesa** — nó nằm ở
 LLVM và python3-yaml.
@@ -111,56 +111,16 @@ Xung đột `bindgen:amd64` ↔ `libclang-21-dev:arm64` nêu trước đây là 
 nhưng chỉ là lớp ngoài: nó biến mất nếu bỏ rusticl/NVK, còn nút python3 thì
 không, vì llvmpipe — thứ ảnh thật sự cần — bắt buộc phải có LLVM cho arm64.
 
-### Đường đi khả dĩ, chưa làm
+### Đường đi khả dĩ, đã bỏ
 
-Không cài `llvm-21-dev:arm64` bằng apt mà **giải nén** nó vào chroot bằng
-`dpkg-deb -x` (đúng kỹ thuật repo vẫn dùng cho sysroot arm64), để không kéo
-theo `llvm-21-tools:arm64`. Mesa tìm LLVM qua cả `cmake` lẫn `config-tool`
-(`meson.build:1880`, `1941`), nên có thể trỏ vào file CMake — vốn là text,
-không phải binary arm64 phải chạy được.
+Có thể không cài `llvm-21-dev:arm64` bằng apt mà **giải nén** nó vào chroot
+bằng `dpkg-deb -x`, để không kéo theo `llvm-21-tools:arm64`; cộng thêm stage
+build native riêng cho `mesa_clc` / `vtn_bindgen2` / `panfrost_compile` rồi
+patch `debian/rules`.
 
-Cộng thêm: stage build native riêng cho `mesa_clc` / `vtn_bindgen2` /
-`panfrost_compile` (đã chứng minh chạy được trong `spike/mesa-patches/build.sh`),
-rồi patch `debian/rules` thêm `-Dmesa-clc=system -Dprecomp-compiler=system`.
-
-Đây là một dự án build-system nhiều bước, chưa làm.
-
-## Ghi chú: quyết định này ngược với lần trước
-
-`config/patches/gnome-remote-desktop-50.2/README.md` đã từng ghi rõ **chọn
-không ship bản Mesa vá**, vì compile Mesa tốn kém mỗi lần rebase còn patch
-phía consumer thì rẻ hơn nhiều. Lần này khác ở chỗ lỗi nằm ngay trong EGL
-core chứ không phải trong panvk, và nó làm hỏng dữ liệu một cách im lặng cho
-*mọi* consumer EGL, không riêng một app. Một patch 2 dòng phía GTK
-(`gdk/gdkglcontext.c`: khởi tạo `fds[]` bằng -1 rồi từ chối `fds[0] < 0`) cũng
-cho ra avatar đúng và rẻ hơn khi rebase — nếu chi phí rebuild Mesa là vấn đề
-thì đó là lựa chọn thay thế hợp lệ.
-
-## Chưa build được bằng source package của Ubuntu
-
-`apt-get build-dep -a arm64 -P nocheck mesa` không giải được, và không phải vì
-build profile như trường hợp `gnome-remote-desktop`. `debian/control` của mesa
-không đánh dấu `:native` cho host tool nào, nên apt đòi cài bản arm64 của
-chúng. Hai xung đột cứng, không lách được từ bên ngoài packaging:
-
-```text
-bindgen:amd64 → libclang-21-dev:amd64, mà nó Conflicts libclang-21-dev:arm64
-llvm-21-dev:arm64 → llvm-21-tools:arm64 → python3-yaml:arm64,
-  mà nó Conflicts python3-yaml bản native — thứ script của chính mesa cần
-```
-
-Cả hai đều không liên quan gì tới patch: code được vá nằm trong
-`libEGL_mesa.so` (EGL core), không dính llvm, rusticl hay driver nào.
-
-Nên việc kiểm chứng đi qua `spike/mesa-patches/build.sh`: cross-build một
-bản Mesa tối giản chỉ có panfrost + EGL, **hai lần** — một bản gốc, một bản đã
-vá — rồi chạy A/B trên board bằng `LD_LIBRARY_PATH`, không đụng gì vào Mesa của
-board.
-
-Muốn thực sự ship patch này trong ảnh thì vẫn còn việc phải làm: sửa
-`debian/control` để cross-build được (thêm `:native`), hoặc build mesa native
-trên máy arm64 khác. Đó là lý do patch phía GTK nêu ở trên đáng cân nhắc —
-`gtk4` cross-build được bằng source package của Ubuntu.
+Đã bỏ hướng này. Nó là một dự án build-system nhiều bước, và phải sửa
+`debian/` của Ubuntu — trong khi build native trên arm64 không phải sửa gì và
+mất chưa tới 9 phút. Xem mục dưới.
 
 ## `0002` — panvk trả lời truy vấn DRM format modifier bản v2
 
@@ -194,52 +154,124 @@ v1 và loại bỏ LINEAR (`gdk/gdkvulkancontext.c:2166`), nên `0002` không đ
 chọn renderer và không sửa lỗi avatar. Ngược lại `0001` cũng không mở đường
 encode của GRD.
 
-## Bước kế tiếp: build native trên arm64, không cross
+## Đã build được: native trên arm64, không cross
 
-Quyết định: dựng gói này trong **container Linux arm64 trên máy Apple Silicon**,
-không cross-build nữa. Nút thắt ở trên là hệ quả của multiarch — một apt
-universe có cả amd64 lẫn arm64. Trên máy arm64 chỉ có một kiến trúc, nên
-`apt-get build-dep mesa` giải bình thường: không cần `:native`, không xung đột
-libclang, không ai hất văng `python3`. `debian/` của Ubuntu giữ nguyên, không
-phải vá. Đây đúng là cách buildd của Ubuntu build mesa.
+Gói này dựng trong **container Linux arm64 trên máy Apple Silicon**, không
+cross-build. Nút thắt ở trên là hệ quả của multiarch — một apt universe có cả
+amd64 lẫn arm64. Trên máy arm64 chỉ có một kiến trúc, nên `apt-get build-dep
+mesa` giải bình thường: không cần `:native`, không xung đột libclang, không ai
+hất văng `python3`. `debian/` của Ubuntu giữ nguyên, không phải vá. Đây đúng là
+cách buildd của Ubuntu build mesa.
 
 Quy tắc trong `CLAUDE.md` cấm **emulation**, với lý do "không có lý do gì phải
 emulate chính compiler". Trên Apple Silicon compiler chạy native arm64 và sinh
-mã arm64 — thoả đúng nguyên tắc đó. Nhưng câu chữ hiện tại ("Mọi thứ phải build
-bằng cross-compilation trên host x86") không phủ trường hợp này, **cần sửa
-CLAUDE.md** kẻo phiên sau đọc thành cấm.
-
-Các bước, chạy trong container:
+mã arm64 — thoả đúng nguyên tắc đó. `CLAUDE.md` đã được sửa để nói rõ điều này
+("Ngoại lệ: build native trên máy arm64 thật").
 
 ```bash
-# Phải là arm64 THẬT, không phải amd64 dưới Rosetta -- Rosetta là emulation,
-# đúng cái quy tắc cấm. Kiểm tra trước khi làm gì khác:
-docker run --platform linux/arm64 -it --rm -v "$PWD/out:/out" ubuntu:26.04 bash
-uname -m            # phải ra aarch64
-dpkg --print-architecture   # phải ra arm64
-
-apt-get update && apt-get install -y devscripts dpkg-dev
-sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
-apt-get update
-apt-get build-dep -y mesa
-apt-get source mesa=26.0.8-1ubuntu0.3
-cd mesa-26.0.8
-# nối hai patch vào CUỐI series của Ubuntu, không thay
-cp /path/to/config/patches/mesa-26.0.8/000*.patch debian/patches/
-cat /path/to/config/patches/mesa-26.0.8/series >> debian/patches/series
-dch --local +orangepi5b 'egl/dri2 + panvk fixes for RK3588.'
-DEB_BUILD_OPTIONS="parallel=$(nproc) nocheck" DEB_BUILD_PROFILES=nocheck \
-  dpkg-buildpackage -b -uc -us
-cp ../*.deb /out/
+brew install container            # container CLI của Apple
+container system kernel set --recommended
+bash scripts/build-mesa-package.sh
 ```
 
-Mang về **cả sáu** gói, không lấy lẻ được vì chúng ràng buộc nhau bằng
-`mesa-libgallium (= ${binary:Version})`:
+Script chạy **trên macOS**, không chạy trên host x86, và từ chối chạy nếu guest
+không phải `aarch64`/`arm64` — amd64 dưới Rosetta là emulation, đúng thứ quy
+tắc cấm.
+
+### Đo được
+
+**8 phút 50 giây** tổng cộng trên M-series 12 nhân (build dùng 10), tính cả tải
+44MB source và tải + cài toàn bộ build-dep. Đó là cây mesa **đầy đủ** — mọi
+gallium driver, LLVM, rusticl, NVK — chứ không phải bản panfrost tối giản của
+`spike/mesa-patches/build.sh`. So với con số `CLAUDE.md` ghi cho chroot arm64
+dưới qemu (**~80 phút** cho cùng cây Mesa), đường này nhanh hơn gần một bậc độ
+lớn mà vẫn không vá gì trong `debian/`.
+
+apt archive và tarball nằm lại ở `cache/mesa-arm64/` (438MB), nên chạy lại
+không tải lại.
+
+Patch áp đúng thứ tự, năm patch của Ubuntu trước, hai patch của repo sau:
+
+```text
+dpkg-source: info: applying path_max.diff
+dpkg-source: info: applying src_glx_dri_common.h.diff
+dpkg-source: info: applying egl-gbm-Do-not-destroy-BO-of-current-front-buffer.patch
+dpkg-source: info: applying egl-gbm-Ignore-buffers-with-no-BO-for-destroying-exc.patch
+dpkg-source: info: applying egl-gbm-Ignore-current-front-buffer-in-get_back_bo.patch
+dpkg-source: info: applying 0001-egl-dri2-fail-dmabuf-export-when-the-fd-query-fails.patch
+dpkg-source: info: applying 0002-panvk-answer-the-v2-drm-format-modifier-query.patch
+```
+
+Ra `mesa_26.0.8-1ubuntu0.3+orangepi5b1`. Script mang về **cả sáu** gói, không
+lấy lẻ được vì chúng ràng buộc nhau bằng `mesa-libgallium (= ${binary:Version})`:
 
 ```
 libegl-mesa0  libgbm1  libgl1-mesa-dri  libglx-mesa0  mesa-libgallium
 mesa-vulkan-drivers
 ```
 
-`scripts/install-rootfs.sh` gom `.deb` theo từng họ gói (dòng 56–93 cho
-resources / grd / va-driver); mesa cần thêm một block tương tự.
+Script kiểm lại nội dung gói trước khi nhận: `mesa-libgallium` phải có
+`libgallium-*.so` và `mesa-vulkan-drivers` phải có `libvulkan_panfrost.so`. Một
+bản mesa thiếu hai thứ đó vẫn cài sạch và vẫn để board rơi xuống llvmpipe mà
+không nói gì — hai patch này thành vô nghĩa, nên phải chặn ngay ở đây thay vì
+phát hiện trên board.
+
+### Đã vào ảnh
+
+`scripts/install-rootfs.sh` có block cài cả sáu gói một lượt, và từ chối dựng
+ảnh nếu thiếu bất kỳ gói nào của cùng một version, hoặc nếu `libvulkan_panfrost.so`
+không có mặt trong rootfs sau khi cài. Một ảnh đáng lẽ encode phần cứng mà lại
+rơi xuống llvmpipe thì không nói gì cả — phải chặn lúc dựng.
+
+Vì `scripts/build-mesa-package.sh` chạy trên macOS còn `install-rootfs.sh` chạy
+trên host x86, sáu file `.deb` được **commit vào `output/debs/`**. Host x86
+không tự dựng lại được chúng.
+
+## Đo end-to-end bằng chính gói sẽ ship
+
+Cài sáu gói lên board, cùng một binary GRD dựng từ queue rút gọn (chỉ `0002` +
+`0003`, **không** có `0001`), rồi kết nối RDP thật. Chỉ khác nhau ở bản Mesa:
+
+| Mesa | log của daemon phiên |
+|---|---|
+| `26.0.8-1ubuntu0.3` gốc | `[HWAccel.Vulkan] Could not acquire Vulkan physical device: Could not find proper device` |
+| `+orangepi5b1` đã vá | *không còn dòng đó* — đi tiếp tới VAAPI |
+
+Đối chứng lặp 2/2 lần, bản vá 3/3 lần. Qua GNOME Remote Login, trong phiên thật
+của người dùng (uid 1000):
+
+```text
+v4l2-request: device: encoder at /dev/video4
+v4l2-request: device: using /dev/video3 with /dev/media1
+v4l2-request: device: using /dev/video6 with /dev/media3
+[HWAccel.VAAPI] Successfully initialized VAAPI 1.23 with vendor: v4l2-request
+v4l2-request: encode: /dev/video4 1920x1088, 4 raw buffers, 4 coded buffers
+```
+
+Phiên chạy liên tục 8 phút, daemon giữ `/dev/video4`, CPU 0.4%. Đây là điều
+`spike/mesa-patches/README.md` đã đo bằng bản panfrost tối giản với
+`LD_LIBRARY_PATH`; giờ khớp lại bằng gói thật, cài thật, qua đường mà ảnh thật
+sự dùng.
+
+Kết quả: patch `0002` **thay thế hoàn toàn** patch `0001` của GRD, và patch đó
+đã rút khỏi `config/patches/gnome-remote-desktop-50.2/series`.
+
+### Cái bẫy khi đọc log
+
+"Remote Login" chạy hai daemon nối tiếp. Giai đoạn đầu là màn hình đăng nhập GDM
+từ xa, daemon chạy bằng user tạm của GDM (uid 6058x, nhóm `gdm`), không có ACL
+`uaccess` cho node codec, nên nó **luôn** in:
+
+```text
+v4l2-request: device: no V4L2 stateless H.264/HEVC/VP9 decoder found
+```
+
+Đó không phải lỗi và không liên quan Mesa. Phiên thật chỉ bắt đầu sau handover,
+dưới uid của người dùng. Đọc log phải nhìn uid của tiến trình.
+
+### Chưa làm
+
+Chưa chạy lại hai script đo trong `spike/mesa-patches/` bằng bản gói này — số đo
+ở đó vẫn là của bản panfrost tối giản. Riêng patch `0001` (avatar EGL) chưa đo
+lại bằng `.deb`; code được vá là một, nhưng muốn chắc thì chạy
+`spike/mesa-patches/measure-avatar.sh`.

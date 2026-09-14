@@ -3,11 +3,16 @@
 Áp lên source package Ubuntu `gnome-remote-desktop_50.2-0ubuntu0.1`, **thêm**
 vào `debian/patches/series` của Ubuntu chứ không thay.
 
-Ba patch, đều là workaround cho lệch pha giữa GRD, Mesa/panvk và encoder
-stateful của Rockchip, **không phải** tính năng riêng của board. Mỗi patch ghi
-rõ điều kiện để bỏ đi.
+Hai patch, đều là workaround cho lệch pha giữa GRD và encoder stateful của
+Rockchip, **không phải** tính năng riêng của board. Mỗi patch ghi rõ điều kiện
+để bỏ đi.
 
-## Vì sao chỉ có ba
+Có patch thứ ba trong thư mục này,
+`0001-hwaccel-vulkan-fall-back-to-v1-modifier-query.patch`, nhưng nó **không
+nằm trong `series`** nên không được áp. `queue_patches()` chỉ đọc `series`, nên
+file cứ để đó là đủ. Lý do và số đo: mục cuối file.
+
+## Vì sao chỉ có hai
 
 Project tham chiếu (`/root/orangepi5b`) mang **chín** patch cho GRD 50.2, vì nó
 chạy trên Ubuntu 24.04. Bảy trong số đó là shim cho dependency cũ — PipeWire
@@ -18,19 +23,6 @@ GDM 50.1, nên **sáu patch thành thừa** (`0001`, `0002`, `0003`, `0005`, `00
 Đặc biệt: patch `0005`/`0006` của reference tồn tại vì PipeWire 1.0.5 không có
 syncobj timeline, mà GRD lại **bắt buộc** có explicit sync mới tạo phiên encode.
 Trên 26.04 điều kiện đó thoả sẵn — đây là thứ mở khoá cả đường encode.
-
-## `0001` — fallback truy vấn DRM format modifier bản v1
-
-**Nguyên nhân nằm ở Mesa, không phải ở GRD.**
-`panvk_GetPhysicalDeviceFormatProperties2()` không hề điền
-`VkDrmFormatModifierPropertiesList2EXT`. GRD 50 chỉ hỏi kiểu bản 2, nên nó kết
-luận GPU không hỗ trợ modifier nào, bỏ qua GPU, bỏ qua llvmpipe vì thiếu
-extension, **không lấy được physical device nào**, và lặng lẽ encode H.264 bằng
-CPU — không một dòng log nào nói encoder phần cứng đã có mặt và bị bỏ qua.
-
-Đo trên Mali-G610, Mesa 26.0.8: cả sáu format GRD quan tâm đều trả v1=1, v2=0.
-
-**Điều kiện bỏ patch này:** bản sửa panvk merge vào Mesa và về tới Ubuntu. **Đã chọn không ship bản Mesa vá** vì compile Mesa tốn kém mỗi lần rebase, trong khi patch GRD này rẻ hơn nhiều.
 
 ## `0002` — không đòi `HOST_CACHED` cho state buffer
 
@@ -123,3 +115,64 @@ Dựng chroot arm64 từ chính tarball `ubuntu-base-26.04.1` mà `install-rootf
 dùng, nên daemon link đúng thư viện image ship. Script từ chối package mà
 daemon không có `vaCreateConfig`/`vaExportSurfaceHandle`/`vaBeginPicture` —
 tức là build ra bản không có đường VA-API.
+
+## `0001` đã rút khỏi `series` — nguyên nhân gốc đã sửa ở Mesa
+
+Patch này làm GRD hỏi DRM format modifier bằng bản v1 khi bản v2 trả về rỗng,
+vì `panvk_GetPhysicalDeviceFormatProperties2()` không điền
+`VkDrmFormatModifierPropertiesList2EXT`. Đó là workaround phía consumer cho một
+bug nằm trong Mesa.
+
+Bug đó giờ được sửa đúng chỗ: `config/patches/mesa-26.0.8/`, patch `0002`. Và
+kể từ khi `scripts/build-mesa-package.sh` dựng được gói Mesa đã vá (build native
+arm64, xem `CLAUDE.md`), ảnh ship chính bản Mesa đó — nên workaround không còn
+lý do tồn tại.
+
+**File vẫn giữ lại, chỉ rút khỏi `series`.** Nếu vì lý do gì đó ảnh phải quay
+về Mesa gốc của Ubuntu, thêm lại một dòng vào `series` là đủ để có hardware
+encode trở lại — không phải đi tìm lại patch trong lịch sử git.
+
+Ghi chú cũ ở đây từng viết **"đã chọn không ship bản Mesa vá"** vì compile Mesa
+tốn kém. Điều kiện đó đã đổi: build mất **8 phút 50 giây** và không phải vá
+`debian/` của Ubuntu.
+
+### Đo trên board trước khi gỡ
+
+GRD build với queue rút gọn (chỉ `0002` + `0003`, **không** có `0001`), cài lên
+board, đo hai lần chỉ khác nhau ở bản Mesa:
+
+| Mesa | log của daemon phiên |
+|---|---|
+| `26.0.8-1ubuntu0.3` gốc | `[HWAccel.Vulkan] Could not acquire Vulkan physical device: Could not find proper device` |
+| `+orangepi5b1` đã vá | *không còn dòng đó* — đi tiếp tới VAAPI |
+
+Đối chứng lặp 2/2 lần, bản vá 3/3 lần. Rồi chạy trọn end-to-end qua GNOME
+Remote Login, phiên thật của người dùng (uid 1000):
+
+```text
+v4l2-request: device: encoder at /dev/video4
+v4l2-request: device: using /dev/video3 with /dev/media1
+v4l2-request: device: using /dev/video6 with /dev/media3
+[HWAccel.VAAPI] Successfully initialized VAAPI 1.23 with vendor: v4l2-request
+v4l2-request: encode: /dev/video4 1920x1088, 4 raw buffers, 4 coded buffers
+```
+
+Khớp đúng những dòng mà header của patch `0001` từng ghi là kết quả sau khi vá
+GRD. Patch Mesa thay được hoàn toàn. Phiên chạy liên tục 8 phút, daemon giữ
+`/dev/video4`, CPU 0.4%.
+
+`1920x1088` ở dòng cuối là lý do `0003` vẫn phải ở lại: 1080 bị pad lên 1088.
+
+### Một cái bẫy khi đo lại
+
+"Remote Login" của GNOME chạy hai daemon. Giai đoạn đầu là màn hình đăng nhập
+GDM từ xa, daemon chạy bằng **user tạm của GDM** (uid 6058x, nhóm `gdm`), không
+có ACL `uaccess` cho node codec, nên nó luôn báo:
+
+```text
+v4l2-request: device: no V4L2 stateless H.264/HEVC/VP9 decoder found
+```
+
+Đó **không** phải lỗi. Phiên thật chỉ bắt đầu sau handover, dưới uid của người
+dùng, và ở đó encoder mở được. Đọc log phải nhìn uid của tiến trình, nếu không
+sẽ kết luận nhầm là hardware encode hỏng.

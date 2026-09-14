@@ -1,8 +1,15 @@
 # Build artifacts and generated images
 /build/
 /cache/
-/output/
 /sources/
+
+# Images stay out; built .deb packages are tracked. build-mesa-package.sh runs
+# on macOS while install-rootfs.sh runs on the x86 host, so the host cannot
+# rebuild mesa for itself -- the six .deb files have to travel through git.
+/output/*
+!/output/debs/
+/output/debs/*
+!/output/debs/*.deb
 /*.log
 /*.log.*
 /output/**/*.img
@@ -30,5 +37,6 @@ __pycache__/
 # External kernel clones used by BSP comparison builds
 /worktrees/
 
-# Board connection details, contains credentials
+# Board and build-host connection details, contain credentials
 /target.json
+/server.json

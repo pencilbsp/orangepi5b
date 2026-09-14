@@ -1,3 +1,2 @@
-0001-hwaccel-vulkan-fall-back-to-v1-modifier-query.patch
 0002-vulkan-do-not-require-host-cached-memory.patch
 0003-vaapi-crop-avc-stream-to-visible-size.patch
