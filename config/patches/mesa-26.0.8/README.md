@@ -269,9 +269,37 @@ v4l2-request: device: no V4L2 stateless H.264/HEVC/VP9 decoder found
 Đó không phải lỗi và không liên quan Mesa. Phiên thật chỉ bắt đầu sau handover,
 dưới uid của người dùng. Đọc log phải nhìn uid của tiến trình.
 
-### Chưa làm
+### Cả hai patch đã đo lại bằng chính `.deb`
 
-Chưa chạy lại hai script đo trong `spike/mesa-patches/` bằng bản gói này — số đo
-ở đó vẫn là của bản panfrost tối giản. Riêng patch `0001` (avatar EGL) chưa đo
-lại bằng `.deb`; code được vá là một, nhưng muốn chắc thì chạy
-`spike/mesa-patches/measure-avatar.sh`.
+`spike/mesa-patches/stage-from-debs.sh` dựng `build/mesa-patches/{stock,patched}`
+từ gói thay vì từ `build.sh`, nên hai script `measure-*.sh` chạy nguyên xi mà
+vẫn đo đúng thư viện sẽ ship. `stock` lấy từ archive Ubuntu, `patched` lấy từ
+`output/debs` — cả hai đều là build đầy đủ, không phải bản panfrost tối giản.
+
+`measure-avatar.sh` — patch `0001`:
+
+| | kích thước PNG | log |
+|---|---|---|
+| stock | 124027 B | `Gdk-CRITICAL: Failed to download 512x512 dmabuf texture` |
+| patched | **13968 B** | không có `Gdk-CRITICAL` |
+
+13968 byte là **đúng con số** năm lần chạy bằng bản tối giản đã cho. Ảnh xem
+được: bản gốc là ô nhiễu, bản vá là hình tròn gradient kèm chữ cái đầu.
+
+`measure-modifiers.sh` — patch `0002`, năm format GRD quan tâm:
+
+```text
+===== stock                              ===== patched
+  B8G8R8A8_UNORM  v1=1 [0x0] v2=0 []       B8G8R8A8_UNORM  v1=1 [0x0] v2=1 [0x0]
+  R8G8B8A8_UNORM  v1=1 [0x0] v2=0 []       R8G8B8A8_UNORM  v1=1 [0x0] v2=1 [0x0]
+  A2B10G10R10     v1=1 [0x0] v2=0 []       A2B10G10R10     v1=1 [0x0] v2=1 [0x0]
+  A2R10G10B10     v1=1 [0x0] v2=0 []       A2R10G10B10     v1=1 [0x0] v2=1 [0x0]
+  NV12            v1=1 [0x0] v2=0 []       NV12            v1=1 [0x0] v2=1 [0x0]
+```
+
+Trùng khít số đo cũ. Cả hai patch tái hiện nguyên vẹn khi đi qua source package
+đầy đủ của Ubuntu — có LLVM, rusticl, NVK — chứ không riêng cây tối giản.
+
+Cả hai đều in `drmPrimeHandleToFD() failed (err=22)` ở cả hai bản: đó là panthor
+từ chối export BO nằm trong exclusive VM, patch không định sửa. Khác biệt nằm ở
+chỗ tiếp theo — bản vá trả `EGL_FALSE` nên GTK rơi xuống `glReadPixels`.

@@ -4,6 +4,7 @@
 
 ```bash
 bash spike/mesa-patches/build.sh              # cross-build stock + patched
+bash spike/mesa-patches/stage-from-debs.sh    # hoặc lấy cả hai từ .deb
 bash spike/mesa-patches/measure-avatar.sh     # patch 0001
 bash spike/mesa-patches/measure-modifiers.sh  # patch 0002
 ```
@@ -165,6 +166,14 @@ một kiến trúc nên không có xung đột nào để gỡ. Chi tiết và s
 Ảnh giờ cài Mesa đã vá, và `0001` của GRD đã rút khỏi
 `config/patches/gnome-remote-desktop-50.2/series` — đúng như đo ở đây dự đoán.
 
-Hai script `measure-*.sh` trong thư mục này vẫn chạy bằng bản panfrost tối giản
-của `build.sh`, không phải bằng `.deb`. Chúng vẫn dùng được để cô lập từng
-patch; muốn kiểm bản sẽ ship thì đo qua ảnh.
+Hai script `measure-*.sh` chạy được bằng **cả hai** nguồn thư viện:
+
+```bash
+bash spike/mesa-patches/build.sh             # cây panfrost tối giản, cross-build
+bash spike/mesa-patches/stage-from-debs.sh   # hoặc: chính .deb sẽ ship
+```
+
+Cả hai đều ghi vào `build/mesa-patches/{stock,patched}` nên hai script đo không
+phải đổi gì. Đã chạy bằng `.deb` và kết quả trùng khít bảng ở trên — avatar ra
+đúng 13968 byte, v2 trả `1 [0x0]` cho cả năm format. Số đo đầy đủ:
+`config/patches/mesa-26.0.8/README.md`.
