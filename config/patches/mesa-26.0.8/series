@@ -1,0 +1,2 @@
+0001-egl-dri2-fail-dmabuf-export-when-the-fd-query-fails.patch
+0002-panvk-answer-the-v2-drm-format-modifier-query.patch

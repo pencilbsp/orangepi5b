@@ -1,0 +1,155 @@
+From: Orange Pi 5B Builder <pencil.bsp@gmail.com>
+Date: Mon, 14 Sep 2026 20:30:00 +0700
+Subject: panvk: answer the v2 DRM format modifier query
+
+panvk_GetPhysicalDeviceFormatProperties2() fills
+VkDrmFormatModifierPropertiesListEXT but ignores
+VkDrmFormatModifierPropertiesList2EXT, so the 2 form always comes back with a
+count of zero. panvk advertises VK_KHR_format_feature_flags2, which is what
+makes the 2 form valid to ask for, so a caller has every reason to use it.
+
+Six other Mesa Vulkan drivers -- radv, anv, v3dv, nvk, hk -- answer both.
+
+A caller that asks only the 2 way concludes the GPU supports no modifiers at
+all. gnome-remote-desktop 50 does exactly that: it skips the GPU with "No DRM
+format modifiers available for DRM format 875713112", skips the software
+rasterizer for want of the extension, acquires no physical device, and quietly
+encodes H.264 on the CPU with nothing in the log to say the hardware encoder
+was passed over.
+
+The two queries differ only in the width of the feature mask -- v1 carries
+VkFormatFeatureFlags, v2 carries VkFormatFeatureFlags2 -- so enumerate the
+modifiers once and let each list copy what it can hold. v1 keeps its 32-bit
+truncation, which is what it has always done.
+
+Forwarded: not-yet
+Last-Update: 2026-09-14
+---
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -877,13 +877,60 @@
+    return features;
+ }
+ 
++/* The two DRM format modifier queries differ only in the width of the feature
++ * mask, so enumerate once and let each list copy what it can hold.
++ */
++#define PANVK_MAX_FORMAT_MODIFIERS 32
++
++struct panvk_format_modifier {
++   uint64_t modifier;
++   uint32_t plane_count;
++   VkFormatFeatureFlags2 features;
++};
++
++static uint32_t
++collect_format_modifiers(const struct panvk_physical_device *physical_device,
++                         VkFormat format, VkFormatFeatureFlags2 tex,
++                         struct panvk_format_modifier *mods)
++{
++   PAN_SUPPORTED_MODIFIERS(supported);
++   const unsigned arch = pan_arch(physical_device->kmod.dev->props.gpu_id);
++   uint32_t n_mods = 0;
++
++   if (!tex)
++      return 0;
++
++   assert(ARRAY_SIZE(supported) + 1 <= PANVK_MAX_FORMAT_MODIFIERS);
++
++   if (PANVK_DEBUG(WSI_AFBC)) {
++      for (int mi = 0; mi < ARRAY_SIZE(supported); mi++) {
++         if (drm_is_afbc(supported[mi]) &&
++             pan_afbc_supports_format(arch, vk_format_to_pipe_format(format)))
++         {
++            mods[n_mods++] = (struct panvk_format_modifier){
++               .modifier = supported[mi],
++               .plane_count = 1,
++               .features = tex,
++            };
++         }
++      }
++   }
++
++   mods[n_mods++] = (struct panvk_format_modifier){
++      .modifier = DRM_FORMAT_MOD_LINEAR,
++      .plane_count = 1,
++      .features = tex,
++   };
++
++   return n_mods;
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ panvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
+                                          VkFormat format,
+                                          VkFormatProperties2 *pFormatProperties)
+ {
+    VK_FROM_HANDLE(panvk_physical_device, physical_device, physicalDevice);
+-   const unsigned arch = pan_arch(physical_device->kmod.dev->props.gpu_id);
+ 
+    VkFormatFeatureFlags2 tex =
+       get_image_format_features(physical_device, format);
+@@ -906,37 +953,41 @@
+ 
+    VkDrmFormatModifierPropertiesListEXT *list = vk_find_struct(
+       pFormatProperties->pNext, DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT);
++   VkDrmFormatModifierPropertiesList2EXT *list2 = vk_find_struct(
++      pFormatProperties->pNext, DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT);
++   struct panvk_format_modifier mods[PANVK_MAX_FORMAT_MODIFIERS];
++   uint32_t n_mods = 0;
++
++   if (list || list2)
++      n_mods = collect_format_modifiers(physical_device, format, tex, mods);
++
+    if (list) {
+       VK_OUTARRAY_MAKE_TYPED(VkDrmFormatModifierPropertiesEXT, out,
+                              list->pDrmFormatModifierProperties,
+                              &list->drmFormatModifierCount);
+-      if (pFormatProperties->formatProperties.optimalTilingFeatures &&
+-          PANVK_DEBUG(WSI_AFBC))
+-      {
+-         PAN_SUPPORTED_MODIFIERS(supported);
+-         for (int mi = 0; mi < ARRAY_SIZE(supported); mi++) {
+-            if (drm_is_afbc(supported[mi]) &&
+-                pan_afbc_supports_format(arch, vk_format_to_pipe_format(format)))
+-            {
+-               vk_outarray_append_typed(VkDrmFormatModifierPropertiesEXT, &out, mod_props)
+-               {
+-                  mod_props->drmFormatModifier = supported[mi];
+-                  mod_props->drmFormatModifierPlaneCount = 1;
+-                  mod_props->drmFormatModifierTilingFeatures =
+-                     pFormatProperties->formatProperties.optimalTilingFeatures;
+-               }
+-            }
++      for (uint32_t i = 0; i < n_mods; i++) {
++         vk_outarray_append_typed(VkDrmFormatModifierPropertiesEXT, &out,
++                                  mod_props)
++         {
++            mod_props->drmFormatModifier = mods[i].modifier;
++            mod_props->drmFormatModifierPlaneCount = mods[i].plane_count;
++            mod_props->drmFormatModifierTilingFeatures =
++               (VkFormatFeatureFlags)mods[i].features;
+          }
+       }
++   }
+ 
+-      if (pFormatProperties->formatProperties.linearTilingFeatures) {
+-         vk_outarray_append_typed(VkDrmFormatModifierPropertiesEXT, &out,
++   if (list2) {
++      VK_OUTARRAY_MAKE_TYPED(VkDrmFormatModifierProperties2EXT, out,
++                             list2->pDrmFormatModifierProperties,
++                             &list2->drmFormatModifierCount);
++      for (uint32_t i = 0; i < n_mods; i++) {
++         vk_outarray_append_typed(VkDrmFormatModifierProperties2EXT, &out,
+                                   mod_props)
+          {
+-            mod_props->drmFormatModifier = DRM_FORMAT_MOD_LINEAR;
+-            mod_props->drmFormatModifierPlaneCount = 1;
+-            mod_props->drmFormatModifierTilingFeatures =
+-               pFormatProperties->formatProperties.linearTilingFeatures;
++            mod_props->drmFormatModifier = mods[i].modifier;
++            mod_props->drmFormatModifierPlaneCount = mods[i].plane_count;
++            mod_props->drmFormatModifierTilingFeatures = mods[i].features;
+          }
+       }
+    }

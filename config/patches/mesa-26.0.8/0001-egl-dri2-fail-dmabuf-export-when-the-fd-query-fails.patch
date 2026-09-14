@@ -1,0 +1,65 @@
+From: Orange Pi 5B Builder <pencil.bsp@gmail.com>
+Date: Mon, 14 Sep 2026 12:00:00 +0700
+Subject: egl/dri2: fail dmabuf export when the fd query fails
+
+dri2_export_dma_buf_image_mesa() checks the return value of every
+__DRI_IMAGE_ATTRIB query except the one that matters most: it ignores
+whether __DRI_IMAGE_ATTRIB_FD succeeded, and returns EGL_TRUE regardless.
+When the query fails, fds[i] is never written, so the caller gets back an
+uninitialised stack slot as a file descriptor and is told the export
+worked.
+
+On RK3588 this is not theoretical. panfrost allocates offscreen render
+targets from the device's exclusive VM, and panthor_gem_prime_export()
+refuses to export those:
+
+    /* We can't export GEMs that have an exclusive VM. */
+    if (to_panthor_bo(obj)->exclusive_vm_root_gem)
+            return ERR_PTR(-EINVAL);
+
+so drmPrimeHandleToFD() returns EINVAL for every such buffer. GTK4's GL
+renderer calls eglExportDMABUFImageMESA() to turn a rendered texture into
+a GdkDmabufTexture, is told it succeeded, and then reads the result
+through a garbage descriptor. Every download path fails, GDK logs a
+warning, and the caller keeps the uninitialised pixel buffer. Visibly,
+gnome-initial-setup saves the generated user avatar as random memory and
+the login screen shows noise.
+
+Report the failure instead, closing any descriptor already exported. EGL
+consumers already handle a refused export: GTK falls back to reading the
+texture back with glReadPixels, which works fine on this hardware.
+
+Forwarded: not-yet
+Last-Update: 2026-09-14
+---
+--- a/src/egl/drivers/dri2/egl_dri2.c
++++ b/src/egl/drivers/dri2/egl_dri2.c
+@@ -2591,10 +2591,25 @@
+           *    "If the number of fds is less than the number of planes, then
+           *    subsequent fd slots should contain -1."
+           */
+-         if (i == 0 || is_disjoint)
+-            dri2_query_image(image, __DRI_IMAGE_ATTRIB_FD, &fds[i]);
+-         else
++         if (i == 0 || is_disjoint) {
++            if (!dri2_query_image(image, __DRI_IMAGE_ATTRIB_FD, &fds[i])) {
++               /* The driver refused to export this buffer -- panthor returns
++                * -EINVAL for any BO bound to an exclusive VM, which is what
++                * panfrost allocates offscreen render targets from. Reporting
++                * success here leaves fds[i] holding whatever the caller had
++                * on its stack, and every consumer then reads from a bogus fd.
++                */
++               for (int j = 0; j < i; j++)
++                  if (fds[j] >= 0)
++                     close(fds[j]);
++               if (i)
++                  dri2_destroy_image(image);
++               mtx_unlock(&dri2_dpy->lock);
++               return EGL_FALSE;
++            }
++         } else {
+             fds[i] = -1;
++         }
+       }
+ 
+       if (strides && !dri2_query_image(image, __DRI_IMAGE_ATTRIB_STRIDE, &strides[i]))

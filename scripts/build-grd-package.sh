@@ -13,7 +13,9 @@ cd "$ROOT"
 source "$ROOT/scripts/lib/arm64-cross.sh"
 
 C="$ROOT/build/cross-chroot"
-PATCH_DIR="$ROOT/config/patches/gnome-remote-desktop-50.2"
+# GRD_PATCH_DIR lets a spike build a reduced queue without editing the shipped
+# one -- see spike/mesa-patches/README.md for the drop-0001 experiment.
+PATCH_DIR="${GRD_PATCH_DIR:-$ROOT/config/patches/gnome-remote-desktop-50.2}"
 UPSTREAM_VERSION="50.2-0ubuntu0.1"
 PACKAGE_VERSION="${GRD_PACKAGE_VERSION:-${UPSTREAM_VERSION}+orangepi5b3}"
 JOBS="${GRD_BUILD_JOBS:-$(nproc)}"
